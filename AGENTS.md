@@ -1,6 +1,6 @@
 # Agent Entry Point
 
-Committeer is a local Git review tool. It has a Rust CLI/backend and a TanStack Start frontend.
+Peers is a local Git review tool. It has a Rust CLI/backend and a TanStack Start frontend.
 
 Start here:
 
@@ -14,4 +14,4 @@ Current shape:
 - Frontend source: `frontend/src/`
 - Frontend features: `frontend/src/features/`
 - TanStack routes: `frontend/src/routes/`
-- Review storage target: `.committeer/` inside reviewed repos
+- Review storage target: `.peers/` inside reviewed repos

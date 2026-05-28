@@ -1,5 +1,5 @@
 {
-  "name": "committeer",
+  "name": "peers",
   "private": true,
   "type": "module",
   "imports": {

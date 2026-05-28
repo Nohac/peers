@@ -360,8 +360,8 @@ pub async fn render_agent_context(
     let title = state
         .review_id
         .as_deref()
-        .map_or("Committeer Review", |review_id| review_id);
-    out.write_all(format!("# Committeer Review\n\nReview: {title}\n").as_bytes())
+        .map_or("Peers Review", |review_id| review_id);
+    out.write_all(format!("# Peers Review\n\nReview: {title}\n").as_bytes())
         .await?;
 
     if let Some(target) = &state.target {
@@ -413,7 +413,7 @@ pub async fn render_review_markdown(
     let title = state
         .review_id
         .as_deref()
-        .map_or("Committeer Review", |review_id| review_id);
+        .map_or("Peers Review", |review_id| review_id);
     out.write_all(format!("# {title}\n\n").as_bytes()).await?;
 
     if let Some(target) = &state.target {

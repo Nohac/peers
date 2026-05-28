@@ -1,6 +1,6 @@
-# Committeer
+# Peers
 
-Committeer is a local Git review tool for reviewing changes before committing or merging. It is intended to feel similar to a GitHub pull request review, but it runs locally and stores review comments inside the project so humans and AI agents can both work from the same feedback.
+Peers is a local Git review tool for reviewing changes before committing or merging. It is intended to feel similar to a GitHub pull request review, but it runs locally and stores review comments inside the project so humans and AI agents can both work from the same feedback.
 
 This project is in early development. See [spec.md](./spec.md) for the full implementation plan.
 
@@ -31,32 +31,32 @@ This project is in early development. See [spec.md](./spec.md) for the full impl
 Review current changes:
 
 ```bash
-committeer diff
-committeer diff --cached
-committeer diff --all
+peers diff
+peers diff --cached
+peers diff --all
 ```
 
 Review a branch against a base branch:
 
 ```bash
-committeer review
-committeer review --base main
-committeer review --base origin/main
+peers review
+peers review --base main
+peers review --base origin/main
 ```
 
 Create and manage comments:
 
 ```bash
-committeer comment add --path src/foo.rs --side new --lines 42:47 --body "This needs validation."
-committeer comment reply thr_123 --body "Fixed in the latest change."
-committeer comment resolve thr_123
+peers comment add --path src/foo.rs --side new --lines 42:47 --body "This needs validation."
+peers comment reply thr_123 --body "Fixed in the latest change."
+peers comment resolve thr_123
 ```
 
 Agent-oriented usage:
 
 ```bash
-committeer --agent comment add --path src/foo.rs --side new --lines 42:47 --body-file -
-committeer agent-context
+peers --agent comment add --path src/foo.rs --side new --lines 42:47 --body-file -
+peers agent-context
 ```
 
 ## Review Storage
@@ -64,7 +64,7 @@ committeer agent-context
 Reviews are planned to be stored in the reviewed repository:
 
 ```text
-.committeer/
+.peers/
   current
   reviews/
     rev_20260528_121530_a1b2c3/

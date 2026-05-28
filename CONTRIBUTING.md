@@ -77,7 +77,7 @@ Apply the same rule to Git access:
 
 ## Review Storage
 
-Canonical review data is append-only JSONL under `.committeer/reviews/<review-id>/events.jsonl`.
+Canonical review data is append-only JSONL under `.peers/reviews/<review-id>/events.jsonl`.
 
 Generated files such as `review.md` and `agent-context.md` are views over the event log, not canonical state.
 
@@ -263,4 +263,3 @@ cargo fmt
 cargo check
 cargo test
 ```
-

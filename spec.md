@@ -1,6 +1,6 @@
-# Committeer Spec
+# Peers Spec
 
-Committeer is a local Git review tool. It provides a GitHub-like review UI for local changes and branch reviews, while storing comments in the project so humans and AI agents can read, create, and respond to review feedback.
+Peers is a local Git review tool. It provides a GitHub-like review UI for local changes and branch reviews, while storing comments in the project so humans and AI agents can read, create, and respond to review feedback.
 
 ## Goals
 
@@ -49,7 +49,7 @@ The current frontend scaffold has TanStack Start SPA mode enabled. SSR mode and 
 Single Rust crate:
 
 ```text
-committeer/
+peers/
   Cargo.toml
   src/
     main.rs
@@ -115,85 +115,85 @@ Use Clap derive for CLI parsing.
 Primary commands:
 
 ```bash
-committeer diff
-committeer diff --cached
-committeer diff --all
-committeer review
-committeer review --base main
-committeer review --base origin/main
+peers diff
+peers diff --cached
+peers diff --all
+peers review
+peers review --base main
+peers review --base origin/main
 ```
 
 Review creation:
 
 ```bash
-committeer review create --kind working-tree
-committeer review create --kind cached
-committeer review create --base main --head HEAD
-committeer review list
-committeer review current
+peers review create --kind working-tree
+peers review create --kind cached
+peers review create --base main --head HEAD
+peers review list
+peers review current
 ```
 
 Comment commands:
 
 ```bash
-committeer comment add \
+peers comment add \
   --path src/foo.rs \
   --side new \
   --lines 42:47 \
   --body "This bypasses validation."
 
-committeer comment add \
+peers comment add \
   --path src/foo.rs \
   --side new \
   --lines 42:47 \
   --body-file -
 
-committeer comment reply thr_123 --body "I fixed this."
-committeer comment reply thr_123 --body-file -
-committeer comment edit cmt_123 --body "Updated comment."
-committeer comment delete cmt_123
-committeer comment resolve thr_123
-committeer comment reopen thr_123
+peers comment reply thr_123 --body "I fixed this."
+peers comment reply thr_123 --body-file -
+peers comment edit cmt_123 --body "Updated comment."
+peers comment delete cmt_123
+peers comment resolve thr_123
+peers comment reopen thr_123
 ```
 
 Agent support:
 
 ```bash
-committeer --agent comment add ...
-committeer --author-kind agent --author-name Codex comment reply ...
-committeer agent-context
-committeer agent-context --review rev_123
+peers --agent comment add ...
+peers --author-kind agent --author-name Codex comment reply ...
+peers agent-context
+peers agent-context --review rev_123
 ```
 
 Environment overrides:
 
 ```bash
-COMMITTEER_AUTHOR_KIND=agent
-COMMITTEER_AUTHOR_NAME=Codex
+PEERS_AUTHOR_KIND=agent
+PEERS_AUTHOR_NAME=Codex
 ```
 
 ## Review Modes
 
-`committeer diff`:
+`peers diff`:
 
 - Reviews unstaged changes.
 - Equivalent intent to `git diff`.
 
-`committeer diff --cached`:
+`peers diff --cached`:
 
 - Reviews staged changes.
 - Equivalent intent to `git diff --cached`.
 
-`committeer diff --all`:
+`peers diff --all`:
 
 - Reviews all current changes from `HEAD` to working tree, including staged and unstaged changes.
 
-`committeer review`:
+`peers review`:
 
 - Reviews the current branch against `main` by default.
 - Uses merge-base of base branch and `HEAD`.
 
-`committeer review --base <rev>`:
+`peers review --base <rev>`:
 
 - Reviews merge-base of `<rev>` and `HEAD` to `HEAD`.
 
@@ -249,7 +249,7 @@ Identity is descriptive, not a security boundary. Edit/delete ownership is soft 
 Review data is stored inside the reviewed project:
 
 ```text
-.committeer/
+.peers/
   current
   reviews/
     rev_20260528_121530_a1b2c3/

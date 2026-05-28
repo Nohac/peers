@@ -38,9 +38,9 @@ pub struct AuthorOverride {
 
 impl AuthorOverride {
     pub fn into_author(self, repo: &gix::Repository) -> Author {
-        let env_kind = std::env::var("COMMITTEER_AUTHOR_KIND").ok();
-        let env_name = std::env::var("COMMITTEER_AUTHOR_NAME").ok();
-        let env_email = std::env::var("COMMITTEER_AUTHOR_EMAIL").ok();
+        let env_kind = std::env::var("PEERS_AUTHOR_KIND").ok();
+        let env_name = std::env::var("PEERS_AUTHOR_NAME").ok();
+        let env_email = std::env::var("PEERS_AUTHOR_EMAIL").ok();
 
         let kind = self
             .kind
@@ -103,7 +103,7 @@ pub struct ReviewPaths {
 }
 
 pub fn storage_root(repo_root: &Path) -> PathBuf {
-    repo_root.join(".committeer")
+    repo_root.join(".peers")
 }
 
 pub fn current_path(repo_root: &Path) -> PathBuf {
@@ -155,7 +155,7 @@ pub async fn write_current(repo_root: &Path, review_id: &str) -> Result<()> {
 pub async fn current_review_id(repo_root: &Path) -> Result<String> {
     let id = fs::read_to_string(current_path(repo_root))
         .await
-        .context("no current review exists; create one with `committeer review create`")?;
+        .context("no current review exists; create one with `peers review create`")?;
     let id = id.trim();
     if id.is_empty() {
         return Err(anyhow!("current review file is empty"));

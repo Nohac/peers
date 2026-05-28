@@ -12,7 +12,7 @@ use crate::review::{
 };
 
 #[derive(Parser)]
-#[command(name = "committeer")]
+#[command(name = "peers")]
 #[command(about = "Local Git review tool")]
 pub struct Cli {
     #[arg(long)]
@@ -195,7 +195,7 @@ pub async fn run() -> Result<()> {
             let review_id = create_review(&repo.root, repo.author, target.clone()).await?;
             println!("Created review `{review_id}` for {}.", target.label());
             println!(
-                "Diff UI is not wired yet; events are stored under `.committeer/reviews/{review_id}`."
+                "Diff UI is not wired yet; events are stored under `.peers/reviews/{review_id}`."
             );
         }
         Command::Review(args) => match args.command {
@@ -221,7 +221,7 @@ pub async fn run() -> Result<()> {
                 let review_id = create_review(&repo.root, repo.author, target.clone()).await?;
                 println!("Created review `{review_id}` for {}.", target.label());
                 println!(
-                    "Review UI is not wired yet; events are stored under `.committeer/reviews/{review_id}`."
+                    "Review UI is not wired yet; events are stored under `.peers/reviews/{review_id}`."
                 );
             }
         },
