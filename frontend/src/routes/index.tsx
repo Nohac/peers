@@ -1,14 +1,14 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { ReviewWorkspace } from "../features/review/ReviewWorkspace";
+import { reviewSearchSchema } from "../features/review/reviewSearch";
 
-export const Route = createFileRoute("/")({ component: Home });
+export const Route = createFileRoute("/")({
+  validateSearch: (search) => reviewSearchSchema.parse(search),
+  component: ReviewRoute,
+});
 
-function Home() {
-  return (
-    <div className="p-8">
-      <h1 className="text-4xl font-bold">Welcome to TanStack Start</h1>
-      <p className="mt-4 text-lg">
-        Edit <code>src/routes/index.tsx</code> to get started.
-      </p>
-    </div>
-  );
+function ReviewRoute() {
+  const search = Route.useSearch();
+
+  return <ReviewWorkspace activeCommentId={search.comment} allFiles={search.allFiles} />;
 }

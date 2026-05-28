@@ -3,6 +3,8 @@ import { TanStackRouterDevtoolsPanel } from "@tanstack/react-router-devtools";
 import { TanStackDevtools } from "@tanstack/react-devtools";
 
 import TanStackQueryDevtools from "../integrations/tanstack-query/devtools";
+import { ReviewShell } from "../features/review/ReviewShell";
+import { rootReviewSearchSchema } from "../features/review/reviewSearch";
 
 import appCss from "../styles.css?url";
 
@@ -13,6 +15,7 @@ interface MyRouterContext {
 }
 
 export const Route = createRootRouteWithContext<MyRouterContext>()({
+  validateSearch: (search) => rootReviewSearchSchema.parse(search),
   head: () => ({
     meta: [
       {
@@ -23,7 +26,7 @@ export const Route = createRootRouteWithContext<MyRouterContext>()({
         content: "width=device-width, initial-scale=1",
       },
       {
-        title: "TanStack Start Starter",
+        title: "Committeer",
       },
     ],
     links: [
@@ -33,6 +36,7 @@ export const Route = createRootRouteWithContext<MyRouterContext>()({
       },
     ],
   }),
+  component: ReviewShell,
   shellComponent: RootDocument,
 });
 
