@@ -1,0 +1,49 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Cargo local config
+/.cargo/config.toml
+
+# Frontend dependencies and build output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/dist-ssr/
+/frontend/.nitro/
+/frontend/.tanstack/
+/frontend/.vinxi/
+/frontend/.output/
+
+# Committeer local review data
+/.committeer/
+
+# Environment files
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+bun-debug.log*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Local agent/tooling scratch directories
+/.agents/
+/.codex/
