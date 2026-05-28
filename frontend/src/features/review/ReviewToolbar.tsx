@@ -1,5 +1,5 @@
 import { GitCompareArrows, RefreshCw, Search } from "lucide-react";
-import { useChangedFiles, useThreads } from "./reviewData";
+import { useChangedFiles, useReviewCommentActions, useThreads } from "./reviewData";
 
 type ReviewToolbarProps = {
   onQuickAccess: () => void;
@@ -8,6 +8,7 @@ type ReviewToolbarProps = {
 export function ReviewToolbar({ onQuickAccess }: ReviewToolbarProps) {
   const changedFiles = useChangedFiles();
   const threads = useThreads();
+  const { refreshDiff } = useReviewCommentActions();
   const unresolvedCount = threads.filter((thread) => !thread.resolved).length;
 
   return (
@@ -22,7 +23,11 @@ export function ReviewToolbar({ onQuickAccess }: ReviewToolbarProps) {
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <button className="inline-flex h-8 items-center gap-2 rounded-md border px-3 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+        <button
+          className="inline-flex h-8 items-center gap-2 rounded-md border px-3 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          onClick={refreshDiff}
+          type="button"
+        >
           <RefreshCw className="size-3.5" />
           Refresh
         </button>

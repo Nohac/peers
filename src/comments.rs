@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use facet::Facet;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::diff::{LineAnchor, ReviewTarget};
+use crate::diff::{CommentAnchor, ReviewTarget};
 
 #[derive(Clone, Debug, Facet, PartialEq)]
 #[repr(u8)]
@@ -61,7 +61,7 @@ pub enum ReviewEvent {
         comment_id: String,
         created_at: String,
         author: Author,
-        anchor: LineAnchor,
+        anchor: CommentAnchor,
         body: String,
     },
     CommentAdded {
@@ -82,6 +82,11 @@ pub enum ReviewEvent {
         deleted_at: String,
         author: Author,
     },
+    ThreadDeleted {
+        thread_id: String,
+        deleted_at: String,
+        author: Author,
+    },
     ThreadResolved {
         thread_id: String,
         resolved_at: String,
@@ -96,7 +101,7 @@ pub enum ReviewEvent {
         thread_id: String,
         anchored_at: String,
         author: Author,
-        anchor: LineAnchor,
+        anchor: CommentAnchor,
     },
     FileMarkedViewed {
         path: String,
@@ -136,7 +141,7 @@ impl Comment {
 #[derive(Clone, Debug, Facet, PartialEq)]
 pub struct CommentThread {
     pub id: String,
-    pub anchor: LineAnchor,
+    pub anchor: CommentAnchor,
     pub comments: Vec<Comment>,
     pub resolved: bool,
     pub created_at: String,
@@ -284,17 +289,49 @@ fn apply_event(state: &mut ReviewState, event: &ReviewEvent) -> Result<()> {
             body,
             ..
         } => {
-            let comment = find_comment_mut(state, comment_id)?;
+            let (thread_id, comment_index) = find_comment_location(state, comment_id)?;
+            let thread = state
+                .threads
+                .get_mut(&thread_id)
+                .ok_or_else(|| anyhow!("unknown thread `{thread_id}`"))?;
+            thread.comments.truncate(comment_index + 1);
+            let comment = thread
+                .comments
+                .get_mut(comment_index)
+                .ok_or_else(|| anyhow!("unknown comment `{comment_id}`"))?;
             comment.body = body.clone();
             comment.edited_at = Some(edited_at.clone());
+            thread.resolved = false;
+            thread.updated_at = edited_at.clone();
         }
         ReviewEvent::CommentDeleted {
             comment_id,
             deleted_at,
             ..
         } => {
-            let comment = find_comment_mut(state, comment_id)?;
-            comment.deleted_at = Some(deleted_at.clone());
+            let (thread_id, comment_index) = find_comment_location(state, comment_id)?;
+            let remove_thread = {
+                let thread = state
+                    .threads
+                    .get_mut(&thread_id)
+                    .ok_or_else(|| anyhow!("unknown thread `{thread_id}`"))?;
+                thread.comments.truncate(comment_index + 1);
+                if let Some(comment) = thread.comments.get_mut(comment_index) {
+                    comment.deleted_at = Some(deleted_at.clone());
+                }
+                thread
+                    .comments
+                    .retain(|comment| comment.deleted_at.is_none());
+                thread.resolved = false;
+                thread.updated_at = deleted_at.clone();
+                thread.comments.is_empty()
+            };
+            if remove_thread {
+                state.threads.remove(&thread_id);
+            }
+        }
+        ReviewEvent::ThreadDeleted { thread_id, .. } => {
+            state.threads.remove(thread_id);
         }
         ReviewEvent::ThreadResolved {
             thread_id,
@@ -344,12 +381,17 @@ fn apply_event(state: &mut ReviewState, event: &ReviewEvent) -> Result<()> {
     Ok(())
 }
 
-fn find_comment_mut<'a>(state: &'a mut ReviewState, comment_id: &str) -> Result<&'a mut Comment> {
+fn find_comment_location(state: &ReviewState, comment_id: &str) -> Result<(String, usize)> {
     state
         .threads
-        .values_mut()
-        .flat_map(|thread| thread.comments.iter_mut())
-        .find(|comment| comment.id == comment_id)
+        .iter()
+        .find_map(|(thread_id, thread)| {
+            thread
+                .comments
+                .iter()
+                .position(|comment| comment.id == comment_id)
+                .map(|index| (thread_id.clone(), index))
+        })
         .ok_or_else(|| anyhow!("unknown comment `{comment_id}`"))
 }
 
@@ -379,7 +421,7 @@ pub async fn render_agent_context(
     }
 
     for thread in unresolved {
-        out.write_all(format!("## {}\n\n", thread.anchor.line_label()).as_bytes())
+        out.write_all(format!("## {}\n\n", thread.anchor.label()).as_bytes())
             .await?;
         out.write_all(format!("Thread: `{}`\n\n", thread.id).as_bytes())
             .await?;
@@ -432,7 +474,7 @@ pub async fn render_review_markdown(
         out.write_all(
             format!(
                 "## {} ({status})\n\nThread: `{}`\n\n",
-                thread.anchor.line_label(),
+                thread.anchor.label(),
                 thread.id
             )
             .as_bytes(),
@@ -466,7 +508,7 @@ pub fn hash_text(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::FileSide;
+    use crate::diff::{FileSide, LineAnchor};
 
     fn author() -> Author {
         Author {
@@ -478,7 +520,9 @@ mod tests {
 
     #[tokio::test]
     async fn event_roundtrip_replays_thread_state() {
-        let anchor = LineAnchor::new("src/main.rs".to_string(), FileSide::New, 4, 6);
+        let anchor = CommentAnchor::Line {
+            line: LineAnchor::new("src/main.rs".to_string(), FileSide::New, 4, 6),
+        };
         let events = vec![
             ReviewEvent::ReviewCreated {
                 review_id: "rev_test".to_string(),

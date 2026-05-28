@@ -1,7 +1,8 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { MessageSquarePlus } from "lucide-react";
+import { CommentComposer } from "../comments/CommentComposer";
 import { InlineCommentThread } from "../comments/InlineCommentThread";
-import type { CommentThread } from "../review/reviewData";
+import { useReviewCommentActions, type CommentThread } from "../review/reviewData";
 
 export type FileLine = {
   lineNumber: number;
@@ -10,14 +11,17 @@ export type FileLine = {
 };
 
 type FileLineViewProps = {
+  filePath: string;
   lines: FileLine[];
   threads: CommentThread[];
   activeCommentId?: string;
 };
 
-export function FileLineView({ lines, threads, activeCommentId }: FileLineViewProps) {
+export function FileLineView({ filePath, lines, threads, activeCommentId }: FileLineViewProps) {
+  const { createThread } = useReviewCommentActions();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [contentWidth, setContentWidth] = useState<number>();
+  const [composerLine, setComposerLine] = useState<FileLine>();
 
   useLayoutEffect(() => {
     const measureContentWidth = () => {
@@ -50,7 +54,10 @@ export function FileLineView({ lines, threads, activeCommentId }: FileLineViewPr
     >
       <div className="min-w-full" style={contentWidth ? { width: `${contentWidth}px` } : undefined}>
         {lines.map((line) => {
-          const lineThreads = threads.filter((thread) => thread.anchor.endLine === line.lineNumber);
+          const side = line.tone === "deleted" ? "old" : "new";
+          const lineThreads = threads.filter(
+            (thread) => thread.anchor.side === side && thread.anchor.endLine === line.lineNumber,
+          );
 
           return (
             <div key={line.lineNumber}>
@@ -59,6 +66,7 @@ export function FileLineView({ lines, threads, activeCommentId }: FileLineViewPr
                   "group flex min-h-8 w-full items-stretch text-left hover:bg-accent/60",
                   lineToneClass(line.tone ?? "context"),
                 ].join(" ")}
+                onClick={() => setComposerLine((current) => (current === line ? undefined : line))}
                 type="button"
               >
                 <span className="flex w-12 shrink-0 items-center justify-end border-r px-2 text-muted-foreground">
@@ -69,6 +77,25 @@ export function FileLineView({ lines, threads, activeCommentId }: FileLineViewPr
                   <span className="whitespace-pre pl-4">{line.text}</span>
                 </span>
               </button>
+              {composerLine === line ? (
+                <div className="border-t bg-muted/30 p-3 pl-16 font-sans">
+                  <CommentComposer
+                    autoFocus
+                    onCancel={() => setComposerLine(undefined)}
+                    onSubmit={(body) => {
+                      createThread({
+                        body,
+                        path: filePath,
+                        scope: "line",
+                        side,
+                        startLine: line.lineNumber,
+                        endLine: line.lineNumber,
+                      });
+                      setComposerLine(undefined);
+                    }}
+                  />
+                </div>
+              ) : null}
               {lineThreads.length > 0 ? (
                 <div className="space-y-3 border-t bg-muted/30 p-3 pl-16 font-sans">
                   {lineThreads.map((thread) => (

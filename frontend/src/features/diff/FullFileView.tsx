@@ -12,6 +12,7 @@ export function FullFileView({ file, threads, lines, activeCommentId }: FullFile
   return (
     <FileLineView
       activeCommentId={activeCommentId}
+      filePath={file.path}
       lines={lines ?? fullFileLinesForPath(file.path)}
       threads={threads}
     />

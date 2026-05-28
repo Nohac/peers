@@ -14,7 +14,10 @@
 /frontend/.vinxi/
 /frontend/.output/
 
-# Committeer local review data
+# Peers local review data
+/.peers/
+
+# Legacy Committeer local review data
 /.committeer/
 
 # Environment files

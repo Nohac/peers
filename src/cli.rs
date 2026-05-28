@@ -192,16 +192,14 @@ pub async fn run() -> Result<()> {
             } else {
                 ReviewTarget::WorkingTree
             };
-            let review_id = create_review(&repo.root, repo.author, target.clone()).await?;
-            println!("Created review `{review_id}` for {}.", target.label());
-            println!(
-                "Diff UI is not wired yet; events are stored under `.peers/reviews/{review_id}`."
-            );
+            let review_id = create_review(&repo.root, repo.author.clone(), target.clone()).await?;
+            open_review_ui(&repo.root, &review_id, repo.author).await?;
         }
         Command::Review(args) => match args.command {
             Some(ReviewCommand::Create(create_args)) => {
                 let target = create_review_target(create_args);
-                let review_id = create_review(&repo.root, repo.author, target.clone()).await?;
+                let review_id =
+                    create_review(&repo.root, repo.author.clone(), target.clone()).await?;
                 println!("Created review `{review_id}` for {}.", target.label());
             }
             Some(ReviewCommand::List) => {
@@ -218,11 +216,9 @@ pub async fn run() -> Result<()> {
                     base: args.base,
                     head: args.head,
                 };
-                let review_id = create_review(&repo.root, repo.author, target.clone()).await?;
-                println!("Created review `{review_id}` for {}.", target.label());
-                println!(
-                    "Review UI is not wired yet; events are stored under `.peers/reviews/{review_id}`."
-                );
+                let review_id =
+                    create_review(&repo.root, repo.author.clone(), target.clone()).await?;
+                open_review_ui(&repo.root, &review_id, repo.author).await?;
             }
         },
         Command::Comment { command } => handle_comment(command, &repo.root, repo.author).await?,
@@ -237,6 +233,21 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn open_review_ui(
+    repo_root: &std::path::Path,
+    review_id: &str,
+    author: crate::comments::Author,
+) -> Result<()> {
+    let server =
+        crate::server::LocalServer::bind(repo_root.to_path_buf(), review_id.to_string(), author)
+            .await?;
+    println!("Vox RPC: {}", server.vox_url());
+    println!("Review UI: {}", server.frontend_url());
+    println!("Run `cd frontend && bun run dev` in another terminal, then open the Review UI URL.");
+    println!("Press Ctrl-C to stop the local Vox server.");
+    server.run_until_shutdown().await
 }
 
 fn create_review_target(args: CreateReviewArgs) -> ReviewTarget {
@@ -279,7 +290,7 @@ async fn handle_comment(
                     comment_id: comment_id.clone(),
                     created_at: now,
                     author,
-                    anchor,
+                    anchor: crate::diff::CommentAnchor::Line { line: anchor },
                     body,
                 },
             )

@@ -1,7 +1,13 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { MessageSquarePlus } from "lucide-react";
+import { CommentComposer } from "../comments/CommentComposer";
 import { InlineCommentThread } from "../comments/InlineCommentThread";
-import { diffRowsForPath, type CommentThread, type DiffRow } from "../review/reviewData";
+import {
+  diffRowsForPath,
+  useReviewCommentActions,
+  type CommentThread,
+  type DiffRow,
+} from "../review/reviewData";
 
 type SideBySideDiffProps = {
   path: string;
@@ -10,6 +16,7 @@ type SideBySideDiffProps = {
 };
 
 export function SideBySideDiff({ path, threads, activeCommentId }: SideBySideDiffProps) {
+  const { createThread } = useReviewCommentActions();
   const diffRows = diffRowsForPath(path);
   const oldPaneRef = useRef<HTMLDivElement>(null);
   const newPaneRef = useRef<HTMLDivElement>(null);
@@ -17,6 +24,7 @@ export function SideBySideDiff({ path, threads, activeCommentId }: SideBySideDif
   const newContentRef = useRef<HTMLDivElement>(null);
   const syncingScrollRef = useRef(false);
   const [sharedContentWidth, setSharedContentWidth] = useState<number>();
+  const [composer, setComposer] = useState<{ side: "old" | "new"; lineNumber: number }>();
 
   const syncPaneScroll = useCallback((source: "old" | "new") => {
     if (syncingScrollRef.current) {
@@ -84,6 +92,20 @@ export function SideBySideDiff({ path, threads, activeCommentId }: SideBySideDif
       <div className="grid w-full grid-cols-2">
         <DiffPane
           activeCommentId={activeCommentId}
+          composer={composer}
+          onCancelComposer={() => setComposer(undefined)}
+          onCreateThread={(body, lineNumber) => {
+            createThread({
+              body,
+              path,
+              scope: "line",
+              side: "old",
+              startLine: lineNumber,
+              endLine: lineNumber,
+            });
+            setComposer(undefined);
+          }}
+          onOpenComposer={(lineNumber) => setComposer({ lineNumber, side: "old" })}
           onScroll={() => syncPaneScroll("old")}
           contentRef={oldContentRef}
           contentWidth={sharedContentWidth}
@@ -94,6 +116,20 @@ export function SideBySideDiff({ path, threads, activeCommentId }: SideBySideDif
         />
         <DiffPane
           activeCommentId={activeCommentId}
+          composer={composer}
+          onCancelComposer={() => setComposer(undefined)}
+          onCreateThread={(body, lineNumber) => {
+            createThread({
+              body,
+              path,
+              scope: "line",
+              side: "new",
+              startLine: lineNumber,
+              endLine: lineNumber,
+            });
+            setComposer(undefined);
+          }}
+          onOpenComposer={(lineNumber) => setComposer({ lineNumber, side: "new" })}
           onScroll={() => syncPaneScroll("new")}
           contentRef={newContentRef}
           contentWidth={sharedContentWidth}
@@ -132,8 +168,12 @@ function diffPaneContentWidth({ pane, rows }: DiffPaneContentWidthInput) {
 
 type DiffPaneProps = {
   activeCommentId?: string;
+  composer?: { side: "old" | "new"; lineNumber: number };
   contentRef: React.RefObject<HTMLDivElement | null>;
   contentWidth?: number;
+  onCancelComposer: () => void;
+  onCreateThread: (body: string, lineNumber: number) => void;
+  onOpenComposer: (lineNumber: number) => void;
   onScroll: () => void;
   paneRef: React.RefObject<HTMLDivElement | null>;
   rows: DiffRow[];
@@ -143,8 +183,12 @@ type DiffPaneProps = {
 
 function DiffPane({
   activeCommentId,
+  composer,
   contentRef,
   contentWidth,
+  onCancelComposer,
+  onCreateThread,
+  onOpenComposer,
   onScroll,
   paneRef,
   rows,
@@ -177,7 +221,21 @@ function DiffPane({
 
           return (
             <div key={`${side}-${row.oldNumber}-${row.newNumber}-${index}`}>
-              <DiffCell lineNumber={lineNumber} text={text} tone={tone} />
+              <DiffCell
+                lineNumber={lineNumber}
+                onOpenComposer={onOpenComposer}
+                text={text}
+                tone={tone}
+              />
+              {composer?.side === side && composer.lineNumber === lineNumber ? (
+                <div className="border-r p-3 font-sans">
+                  <CommentComposer
+                    autoFocus
+                    onCancel={onCancelComposer}
+                    onSubmit={(body) => onCreateThread(body, composer.lineNumber)}
+                  />
+                </div>
+              ) : null}
               {lineThreads.length > 0 ? (
                 <InlineThreadStack activeCommentId={activeCommentId} threads={lineThreads} />
               ) : null}
@@ -210,17 +268,23 @@ function InlineThreadStack({ threads, activeCommentId }: InlineThreadStackProps)
 
 type DiffCellProps = {
   lineNumber?: number;
+  onOpenComposer: (lineNumber: number) => void;
   text?: string;
   tone: "context" | "added" | "deleted";
 };
 
-function DiffCell({ lineNumber, text, tone }: DiffCellProps) {
+function DiffCell({ lineNumber, onOpenComposer, text, tone }: DiffCellProps) {
   const toneClass =
     tone === "added" ? "bg-chart-2/10" : tone === "deleted" ? "bg-destructive/10" : "bg-background";
 
   return (
     <button
       className={`group flex min-h-8 w-full min-w-0 items-stretch border-r text-left hover:bg-accent/60 ${toneClass}`}
+      onClick={() => {
+        if (lineNumber !== undefined) {
+          onOpenComposer(lineNumber);
+        }
+      }}
       type="button"
     >
       <span className="flex w-12 shrink-0 items-center justify-end border-r px-2 text-muted-foreground">

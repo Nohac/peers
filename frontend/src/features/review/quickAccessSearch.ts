@@ -51,7 +51,12 @@ export function buildQuickAccessResults({
         ];
   });
   const commentResults = threads.flatMap((thread) => {
-    const file = filesByPath.get(thread.path);
+    if (!thread.path) {
+      return [];
+    }
+
+    const threadPath = thread.path;
+    const file = filesByPath.get(threadPath);
 
     if (!file) {
       return [];
@@ -72,7 +77,7 @@ export function buildQuickAccessResults({
               kind: "comment" as const,
               threadId: thread.id,
               commentId: comment.id,
-              path: thread.path,
+              path: threadPath,
               isChanged: file.isChanged,
               lineLabel: thread.lineLabel,
               authorName: comment.authorName,

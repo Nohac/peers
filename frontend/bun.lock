@@ -5,6 +5,8 @@
     "": {
       "name": "peers",
       "dependencies": {
+        "@bearcove/vox-core": "^0.8.2",
+        "@bearcove/vox-ws": "^0.8.2",
         "@fontsource-variable/geist": "^5.2.9",
         "@fontsource-variable/geist-mono": "^5.2.8",
         "@tailwindcss/vite": "^4.1.18",
@@ -99,6 +101,16 @@
     "@babel/traverse": ["@babel/traverse@7.29.0", "", { "dependencies": { "@babel/code-frame": "^7.29.0", "@babel/generator": "^7.29.0", "@babel/helper-globals": "^7.28.0", "@babel/parser": "^7.29.0", "@babel/template": "^7.28.6", "@babel/types": "^7.29.0", "debug": "^4.3.1" } }, "sha512-4HPiQr0X7+waHfyXPZpWPfWL/J7dcN1mx9gL6WdQVMbPnF3+ZhSMs8tCxN7oHddJE9fhNE7+lxdnlyemKfJRuA=="],
 
     "@babel/types": ["@babel/types@7.29.0", "", { "dependencies": { "@babel/helper-string-parser": "^7.27.1", "@babel/helper-validator-identifier": "^7.28.5" } }, "sha512-LwdZHpScM4Qz8Xw2iKSzS+cfglZzJGvofQICy7W7v4caru4EaAmyUuO6BGrbyQ2mYV11W0U8j5mBhd14dd3B0A=="],
+
+    "@bearcove/vox-core": ["@bearcove/vox-core@0.8.2", "", { "dependencies": { "@bearcove/vox-postcard": "0.8.2", "@bearcove/vox-wire": "0.8.2" } }, "sha512-mpzO2jRskCQbMM/3wRGA21DbOFvO53u/fjx/4z2V7rWEieF1DvKuhJIOToTd+6EisqGyHqvP4AJWAKsfMNekfQ=="],
+
+    "@bearcove/vox-postcard": ["@bearcove/vox-postcard@0.8.2", "", {}, "sha512-orsBQY2CLntBaQkSJRVm1SVce0cJ5tnFRkYdoNrMoF6zQt5swzfVSjidzJzciRnMwKH+ASoU3o5CJXG83z+ORQ=="],
+
+    "@bearcove/vox-tcp": ["@bearcove/vox-tcp@0.8.2", "", { "dependencies": { "@bearcove/vox-core": "0.8.2" } }, "sha512-Ez/I/oG8B5QTzATSN412xUKqYyqHwQm4JmS8CVA/B87wLwTTNw9jwdsjWdCHAFKVaHq7LA1cjindywDjohYnFw=="],
+
+    "@bearcove/vox-wire": ["@bearcove/vox-wire@0.8.2", "", { "dependencies": { "@bearcove/vox-postcard": "0.8.2" } }, "sha512-wjiZJnoMHFy1cp2XyuLG23Ikbn/Bi+vXhJC1IXME06esrry1eka6EeLsV8Z677Vycx3rHggOCOAjD7E+XnNX+g=="],
+
+    "@bearcove/vox-ws": ["@bearcove/vox-ws@0.8.2", "", { "dependencies": { "@bearcove/vox-core": "0.8.2", "@bearcove/vox-tcp": "0.8.2" } }, "sha512-6Pz3d1UAzyixqhQeI4gDTYlZ++LuKu02xPAN+wTxsgWnffNrT026WX+3zsTMLkSjoGrCWdOVNVptsCPr1mHqEw=="],
 
     "@bramus/specificity": ["@bramus/specificity@2.4.2", "", { "dependencies": { "css-tree": "^3.0.0" }, "bin": { "specificity": "bin/cli.js" } }, "sha512-ctxtJ/eA+t+6q2++vj5j7FYX3nRu311q1wfYH3xjlLOsczhlhxAg2FWNUXhpGvAw3BWo1xBcvOV6/YLc2r5FJw=="],
 

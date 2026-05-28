@@ -13,6 +13,7 @@ import {
   AlertDialogTrigger,
 } from "#/components/ui/alert-dialog.tsx";
 import { useReviewCommentActions, type CommentThread } from "../review/reviewData";
+import { CommentComposer } from "./CommentComposer";
 
 type InlineCommentThreadProps = {
   thread: CommentThread;
@@ -27,10 +28,11 @@ type PendingConfirmation = {
 };
 
 export function InlineCommentThread({ thread, active = false }: InlineCommentThreadProps) {
-  const { deleteComment, deleteThread, editComment, toggleThreadResolved } =
+  const { deleteComment, deleteThread, editComment, replyToThread, toggleThreadResolved } =
     useReviewCommentActions();
   const [editingCommentId, setEditingCommentId] = useState<string | null>(null);
   const [draftBody, setDraftBody] = useState("");
+  const [replying, setReplying] = useState(false);
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
 
   function beginEdit(commentId: string, body: string) {
@@ -54,6 +56,11 @@ export function InlineCommentThread({ thread, active = false }: InlineCommentThr
 
   function commitDeleteComment(commentId: string) {
     deleteComment(thread.id, commentId);
+  }
+
+  function commitReply(body: string) {
+    replyToThread(thread.id, body);
+    setReplying(false);
   }
 
   function removeThread(event: MouseEvent) {
@@ -233,9 +240,24 @@ export function InlineCommentThread({ thread, active = false }: InlineCommentThr
             );
           })}
         </div>
+        {replying ? (
+          <div className="border-t bg-muted/20 p-3">
+            <CommentComposer
+              autoFocus
+              onCancel={() => setReplying(false)}
+              onSubmit={commitReply}
+              placeholder="Reply to this thread"
+              submitLabel="Reply"
+            />
+          </div>
+        ) : null}
         <div className="flex items-center justify-between gap-2 border-t bg-muted/20 px-3 py-2">
           <div className="flex gap-2">
-            <button className="h-8 rounded-md border px-3 text-xs hover:bg-accent" type="button">
+            <button
+              className="h-8 rounded-md border px-3 text-xs hover:bg-accent"
+              onClick={() => setReplying((open) => !open)}
+              type="button"
+            >
               Reply
             </button>
             <button

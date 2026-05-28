@@ -3,6 +3,9 @@ name = "peers"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/peers-typescript"]
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive", "env"] }
@@ -10,4 +13,5 @@ facet = "0.46.5"
 facet-json = "0.46.1"
 gix = "0.84.0"
 time = { version = "0.3.47", features = ["formatting", "macros"] }
-tokio = { version = "1.52.3", features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal"] }
+vox = { version = "0.8.2", features = ["transport-websocket"] }

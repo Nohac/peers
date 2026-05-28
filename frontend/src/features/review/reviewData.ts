@@ -1,7 +1,15 @@
 import { useMemo } from "react";
-import { create } from "zustand";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  connectPeersReview,
+  type ApiCommentThread,
+  type ApiReviewPayload,
+  type DiffSection as WireDiffSection,
+  type FileStatus as WireFileStatus,
+  type PeersReviewClient,
+} from "./peersReviewClient.gen";
 
-export type FileStatus = "modified" | "added" | "deleted" | "renamed" | "unchanged";
+export type FileStatus = "modified" | "added" | "deleted" | "renamed" | "unchanged" | "binary";
 export type FileSide = "old" | "new";
 
 export type ReviewFile = {
@@ -62,6 +70,9 @@ export type FileContent = {
 };
 
 type ReviewPayload = {
+  reviewId: string;
+  targetLabel: string;
+  isBranchReview: boolean;
   files: ReviewFile[];
   fileContentsByPath: Record<string, FileContent>;
   fileDiffsByPath: Record<string, FileDiff>;
@@ -80,7 +91,8 @@ export type ReviewComment = {
 
 export type CommentThread = {
   id: string;
-  path: string;
+  scope: "line" | "file" | "review";
+  path?: string;
   lineLabel: string;
   anchor: {
     side: "old" | "new";
@@ -91,382 +103,15 @@ export type CommentThread = {
   comments: ReviewComment[];
 };
 
-function sourceLines(source: string) {
-  return source.replace(/^\n/, "").replace(/\n$/, "").split("\n");
-}
-
-const cliOldLines = sourceLines(`
-use std::path::PathBuf;
-
-use anyhow::{Result, anyhow};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use tokio::io::AsyncReadExt;
-
-use crate::comments::{AuthorKind, ReviewEvent, hash_text};
-use crate::diff::{FileSide, LineAnchor, ReviewTarget};
-use crate::review::{
-    AuthorOverride, append_review_event, create_review, current_review_id, discover_repo,
-    list_reviews, load_review_state, new_comment_id, new_thread_id, now_rfc3339, review_paths,
-};
-
-#[derive(Parser)]
-#[command(name = "peers")]
-#[command(about = "Local Git review tool")]
-pub struct Cli {
-    #[arg(long)]
-    agent: bool,
-    #[arg(long, value_enum)]
-    author_kind: Option<AuthorKindArg>,
-    #[arg(long)]
-    author_name: Option<String>,
-    #[arg(long)]
-    author_email: Option<String>,
-    #[command(subcommand)]
-    command: Command,
-}
-
-enum Command {
-    Diff(DiffArgs),
-    Review(ReviewArgs),
-    Comment {
-        #[command(subcommand)]
-        command: CommentCommand,
-    },
-}
-match command {
-  Comment::Add(args) => append_comment(args),
-}
-`);
-
-const cliNewLines = sourceLines(`
-use std::path::PathBuf;
-
-use anyhow::{Result, anyhow};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use tokio::io::AsyncReadExt;
-
-use crate::comments::{AuthorKind, ReviewEvent, hash_text};
-use crate::diff::{FileSide, LineAnchor, ReviewTarget};
-use crate::review::{
-    AuthorOverride, append_review_event, create_review, current_review_id, discover_repo,
-    list_reviews, load_review_state, new_comment_id, new_thread_id, now_rfc3339, review_paths,
-};
-
-#[derive(Parser)]
-#[command(name = "peers")]
-#[command(about = "Local Git review tool")]
-pub struct Cli {
-    #[arg(long)]
-    agent: bool,
-    #[arg(long, value_enum)]
-    author_kind: Option<AuthorKindArg>,
-    #[arg(long)]
-    author_name: Option<String>,
-    #[arg(long)]
-    author_email: Option<String>,
-    #[command(subcommand)]
-    command: Command,
-}
-
-enum Command {
-    Diff(DiffArgs),
-    Review(ReviewArgs),
-    Comment {
-        #[command(subcommand)]
-        command: CommentCommand,
-    },
-}
-match command {
-  Comment::Add(args) => create_thread(args).await?,
-  Comment::Reply(args) => reply_to_thread(args).await?,
-}
-`);
-
-const commentsLines = sourceLines(`
-use facet::Facet;
-
-#[derive(Clone, Debug, Facet, PartialEq)]
-pub struct CommentThread {
-  pub id: String,
-  pub resolved: bool,
-}
-`);
-
-const reviewOldLines = sourceLines(`
-use anyhow::Result;
-
-use crate::comments::CommentThread;
-use crate::diff::ReviewTarget;
-
-pub struct ReviewSession {
-    pub id: String,
-    pub target: ReviewTarget,
-    pub threads: Vec<CommentThread>,
-}
-
-pub async fn load_review_state(id: &str) -> Result<ReviewSession> {
-    read_review_file(id).await
-}
-`);
-
-const reviewNewLines = sourceLines(`
-use anyhow::Result;
-
-use crate::comments::CommentThread;
-use crate::diff::ReviewTarget;
-
-pub struct ReviewSession {
-    pub id: String,
-    pub target: ReviewTarget,
-    pub threads: Vec<CommentThread>,
-    pub changed_files: Vec<String>,
-}
-
-pub async fn load_review_state(id: &str) -> Result<ReviewSession> {
-    let mut session = read_review_file(id).await?;
-    session.changed_files.sort();
-    Ok(session)
-}
-`);
-
-const quickAccessLines = sourceLines(`
-import { Search } from "lucide-react";
-
-export function QuickAccess() {
-  return (
-    <div className="fixed inset-0 z-50 bg-background/70 backdrop-blur-sm">
-      <div className="fixed left-1/2 top-[12vh] w-[min(760px,calc(100vw-2rem))] -translate-x-1/2 rounded-lg border bg-background shadow-lg">
-        <div className="flex items-center gap-2 border-b p-3">
-          <Search className="size-4 text-muted-foreground" />
-          <input className="min-w-0 flex-1 bg-transparent outline-none" />
-        </div>
-      </div>
-    </div>
-  );
-}
-`);
-
-const specLines = sourceLines(`
-# Peers Spec
-
-Peers is a local Git review tool.
-
-Slogan:
-
-Local Git peer review for humans and agents.
-
-## Goals
-
-- Review unstaged, staged, full working tree, and branch-range diffs locally.
-`);
-
-const fileContentsByPath: Record<string, FileContent> = {
-  "src/cli.rs": {
-    old: cliOldLines,
-    new: cliNewLines,
-  },
-  "src/comments.rs": {
-    new: commentsLines,
-  },
-  "src/review.rs": {
-    old: reviewOldLines,
-    new: reviewNewLines,
-  },
-  "frontend/src/features/review/QuickAccess.tsx": {
-    new: quickAccessLines,
-  },
-  "spec.md": {
-    new: specLines,
-  },
-};
-
-const reviewFiles: ReviewFile[] = [
-  {
-    path: "src/cli.rs",
-    status: "modified",
-    isChanged: true,
-    viewed: false,
-    commentCount: 2,
-    addedLines: 2,
-    removedLines: 1,
-  },
-  {
-    path: "src/comments.rs",
-    status: "added",
-    isChanged: true,
-    viewed: false,
-    commentCount: 1,
-    addedLines: commentsLines.length,
-    removedLines: 0,
-  },
-  {
-    path: "src/review.rs",
-    status: "modified",
-    isChanged: true,
-    viewed: true,
-    commentCount: 0,
-    addedLines: 4,
-    removedLines: 1,
-  },
-  {
-    path: "frontend/src/features/review/QuickAccess.tsx",
-    status: "added",
-    isChanged: true,
-    viewed: false,
-    commentCount: 0,
-    addedLines: quickAccessLines.length,
-    removedLines: 0,
-  },
-  {
-    path: "spec.md",
-    status: "unchanged",
-    isChanged: false,
-    viewed: false,
-    commentCount: 1,
-    addedLines: 0,
-    removedLines: 0,
-  },
-];
-
-const commentThreads: CommentThread[] = [
-  {
-    id: "thr_validation",
-    path: "src/cli.rs",
-    lineLabel: "src/cli.rs:39-40",
-    anchor: {
-      side: "new",
-      startLine: 39,
-      endLine: 40,
-    },
-    resolved: false,
-    comments: [
-      {
-        id: "cmt_validation",
-        authorName: "Jonas",
-        authorKind: "human",
-        body: "This command should validate mutually exclusive body inputs before appending an event.",
-        createdAt: "2026-05-28T18:12:00Z",
-        canEdit: true,
-      },
-      {
-        id: "cmt_agent_reply",
-        authorName: "Codex",
-        authorKind: "agent",
-        body: "I can move this into a pure helper so the CLI branch stays small.",
-        createdAt: "2026-05-28T18:17:00Z",
-        canEdit: false,
-      },
-    ],
-  },
-  {
-    id: "thr_agent_context",
-    path: "src/comments.rs",
-    lineLabel: "src/comments.rs:4",
-    anchor: {
-      side: "new",
-      startLine: 4,
-      endLine: 4,
-    },
-    resolved: false,
-    comments: [
-      {
-        id: "cmt_context",
-        authorName: "Jonas",
-        authorKind: "human",
-        body: "Make sure unresolved comments are easy for agents to scan without the UI.",
-        createdAt: "2026-05-28T18:34:00Z",
-        canEdit: true,
-      },
-    ],
-  },
-  {
-    id: "thr_spec",
-    path: "spec.md",
-    lineLabel: "spec.md:4",
-    anchor: {
-      side: "new",
-      startLine: 4,
-      endLine: 4,
-    },
-    resolved: true,
-    comments: [
-      {
-        id: "cmt_spec",
-        authorName: "ai agent",
-        authorKind: "agent",
-        body: "The IO boundary rule is reflected in the storage API shape.",
-        createdAt: "2026-05-28T18:45:00Z",
-        canEdit: false,
-      },
-    ],
-  },
-];
-
-const fileDiffsByPath: Record<string, FileDiff> = {
-  "src/cli.rs": {
-    path: "src/cli.rs",
-    hunks: [
-      {
-        old: { start: 38, end: 40 },
-        new: { start: 38, end: 41 },
-        sections: [
-          { context: { old: { start: 38, end: 38 }, new: { start: 38, end: 38 } } },
-          { removed: { old: { start: 39, end: 39 } } },
-          { added: { new: { start: 39, end: 40 } } },
-          { context: { old: { start: 40, end: 40 }, new: { start: 41, end: 41 } } },
-        ],
-      },
-    ],
-  },
-  "src/comments.rs": {
-    path: "src/comments.rs",
-    hunks: [
-      {
-        new: { start: 1, end: commentsLines.length },
-        sections: [{ added: { new: { start: 1, end: commentsLines.length } } }],
-      },
-    ],
-  },
-  "src/review.rs": {
-    path: "src/review.rs",
-    hunks: [
-      {
-        old: { start: 6, end: 12 },
-        new: { start: 6, end: 15 },
-        sections: [
-          { context: { old: { start: 6, end: 9 }, new: { start: 6, end: 9 } } },
-          { added: { new: { start: 10, end: 10 } } },
-          { context: { old: { start: 10, end: 11 }, new: { start: 11, end: 12 } } },
-          { removed: { old: { start: 12, end: 12 } } },
-          { added: { new: { start: 13, end: 15 } } },
-        ],
-      },
-    ],
-  },
-  "frontend/src/features/review/QuickAccess.tsx": {
-    path: "frontend/src/features/review/QuickAccess.tsx",
-    hunks: [
-      {
-        new: { start: 1, end: quickAccessLines.length },
-        sections: [{ added: { new: { start: 1, end: quickAccessLines.length } } }],
-      },
-    ],
-  },
-};
-
-const reviewPayload: ReviewPayload = {
-  files: reviewFiles,
-  fileContentsByPath,
-  fileDiffsByPath,
-  threads: commentThreads,
-};
+let latestPayload: ReviewPayload = emptyReviewPayload();
+let clientPromise: Promise<PeersReviewClient> | undefined;
 
 export function diffForPath(path: string) {
-  return reviewPayload.fileDiffsByPath[path];
+  return latestPayload.fileDiffsByPath[path];
 }
 
 export function diffRowsForPath(path: string) {
-  const content = reviewPayload.fileContentsByPath[path];
+  const content = latestPayload.fileContentsByPath[path];
   const diff = diffForPath(path);
 
   if (!content || !diff) {
@@ -502,7 +147,7 @@ export function diffLinesForPath(path: string) {
 }
 
 export function fullFileLinesForPath(path: string, side: FileSide = "new") {
-  const content = reviewPayload.fileContentsByPath[path];
+  const content = latestPayload.fileContentsByPath[path];
   const lines = content?.[side] ?? content?.new ?? content?.old ?? [];
   const diffLineTones = fullFileDiffLineTones(path, side);
 
@@ -610,108 +255,36 @@ function setRangeTone(
   }
 }
 
-type ReviewDataState = {
-  files: ReviewFile[];
-  threads: CommentThread[];
-  deleteComment: (threadId: string, commentId: string) => void;
-  deleteThread: (threadId: string) => void;
-  editComment: (threadId: string, commentId: string, body: string) => void;
-  toggleThreadResolved: (threadId: string) => void;
-};
-
-const useReviewDataStore = create<ReviewDataState>((set) => ({
-  files: reviewPayload.files,
-  threads: reviewPayload.threads,
-  deleteComment: (threadId, commentId) => {
-    set((state) => ({
-      threads: state.threads.flatMap((thread) => {
-        if (thread.id !== threadId) {
-          return [thread];
-        }
-
-        const commentIndex = thread.comments.findIndex((comment) => comment.id === commentId);
-        if (commentIndex === -1 || !thread.comments[commentIndex]?.canEdit) {
-          return [thread];
-        }
-
-        const comments = thread.comments.slice(0, commentIndex);
-        return comments.length === 0 ? [] : [{ ...thread, comments, resolved: false }];
-      }),
-    }));
-  },
-  deleteThread: (threadId) => {
-    set((state) => ({
-      threads: state.threads.filter((thread) => thread.id !== threadId),
-    }));
-  },
-  editComment: (threadId, commentId, body) => {
-    const editedAt = new Date().toISOString();
-    set((state) => ({
-      threads: state.threads.map((thread) => {
-        if (thread.id !== threadId) {
-          return thread;
-        }
-
-        const commentIndex = thread.comments.findIndex((comment) => comment.id === commentId);
-        const comment = thread.comments[commentIndex];
-        if (!comment?.canEdit) {
-          return thread;
-        }
-
-        const comments = thread.comments.slice(0, commentIndex + 1);
-        comments[commentIndex] = {
-          ...comment,
-          body,
-          editedAt,
-        };
-
-        return {
-          ...thread,
-          comments,
-          resolved: false,
-        };
-      }),
-    }));
-  },
-  toggleThreadResolved: (threadId) => {
-    set((state) => ({
-      threads: state.threads.map((thread) =>
-        thread.id === threadId ? { ...thread, resolved: !thread.resolved } : thread,
-      ),
-    }));
-  },
-}));
-
 type UseReviewFilesInput = {
   includeUnchangedFiles: boolean;
 };
 
 export function useReviewFiles({ includeUnchangedFiles }: UseReviewFilesInput) {
-  const files = useReviewDataStore((state) => state.files);
+  const review = useReviewPayload();
 
   return useMemo(
-    () => files.filter((file) => includeUnchangedFiles || file.isChanged),
-    [files, includeUnchangedFiles],
+    () => review.files.filter((file) => includeUnchangedFiles || file.isChanged),
+    [review.files, includeUnchangedFiles],
   );
 }
 
 export function useChangedFiles() {
-  const files = useReviewDataStore((state) => state.files);
+  const review = useReviewPayload();
 
-  return useMemo(() => files.filter((file) => file.isChanged), [files]);
+  return useMemo(() => review.files.filter((file) => file.isChanged), [review.files]);
 }
 
 export function useReviewFile(path: string) {
-  const files = useReviewDataStore((state) => state.files);
+  const review = useReviewPayload();
 
   return useMemo(
-    () => files.find((candidate) => candidate.path === path) ?? files[0],
-    [files, path],
+    () => review.files.find((candidate) => candidate.path === path) ?? review.files[0] ?? emptyFile,
+    [review.files, path],
   );
 }
 
 export function useThreads() {
-  return useReviewDataStore((state) => state.threads);
+  return useReviewPayload().threads;
 }
 
 export function useThreadsForFile(path: string) {
@@ -721,15 +294,311 @@ export function useThreadsForFile(path: string) {
 }
 
 export function useReviewCommentActions() {
-  const deleteComment = useReviewDataStore((state) => state.deleteComment);
-  const deleteThread = useReviewDataStore((state) => state.deleteThread);
-  const editComment = useReviewDataStore((state) => state.editComment);
-  const toggleThreadResolved = useReviewDataStore((state) => state.toggleThreadResolved);
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: async (operation: CommentOperation) => {
+      const config = requirePeersConfig();
+      const client = await peersClient(config);
+      const result = await runCommentOperation(client, config.token, operation);
+
+      if (!result.ok) {
+        throw new Error(result.error);
+      }
+
+      return adaptPayload(result.value);
+    },
+    onSuccess: (payload) => {
+      latestPayload = payload;
+      queryClient.setQueryData(reviewQueryKey(requirePeersConfig()), payload);
+    },
+  });
 
   return {
-    deleteComment,
-    deleteThread,
-    editComment,
-    toggleThreadResolved,
+    createThread: (input: {
+      scope: "line" | "file" | "review";
+      path?: string;
+      side?: FileSide;
+      startLine?: number;
+      endLine?: number;
+      body: string;
+    }) => {
+      mutation.mutate({
+        kind: "createThread",
+        body: input.body,
+        endLine: input.endLine,
+        path: input.path,
+        scope: input.scope,
+        side: input.side,
+        startLine: input.startLine,
+      });
+    },
+    deleteComment: (_threadId: string, commentId: string) => {
+      mutation.mutate({ kind: "deleteComment", commentId });
+    },
+    deleteThread: (threadId: string) => {
+      mutation.mutate({ kind: "deleteThread", threadId });
+    },
+    editComment: (_threadId: string, commentId: string, body: string) => {
+      mutation.mutate({ kind: "editComment", body, commentId });
+    },
+    refreshDiff: () => {
+      mutation.mutate({ kind: "refreshDiff" });
+    },
+    replyToThread: (threadId: string, body: string) => {
+      mutation.mutate({ kind: "replyToThread", body, threadId });
+    },
+    toggleThreadResolved: (threadId: string) => {
+      const thread = latestPayload.threads.find((candidate) => candidate.id === threadId);
+      mutation.mutate({
+        kind: thread?.resolved ? "reopenThread" : "resolveThread",
+        threadId,
+      });
+    },
   };
 }
+
+function useReviewPayload() {
+  const config = currentPeersConfig();
+  const query = useQuery({
+    enabled: config !== undefined,
+    queryKey: reviewQueryKey(config),
+    queryFn: async () => {
+      const config = requirePeersConfig();
+      const result = await (await peersClient(config)).getReview(config.token);
+
+      if (!result.ok) {
+        throw new Error(result.error);
+      }
+
+      return adaptPayload(result.value);
+    },
+  });
+  const payload = query.data ?? latestPayload;
+  latestPayload = payload;
+
+  return payload;
+}
+
+type CommentOperation =
+  | {
+      kind: "createThread";
+      scope: "line" | "file" | "review";
+      path?: string;
+      side?: FileSide;
+      startLine?: number;
+      endLine?: number;
+      body: string;
+    }
+  | { kind: "deleteComment"; commentId: string }
+  | { kind: "deleteThread"; threadId: string }
+  | { kind: "editComment"; commentId: string; body: string }
+  | { kind: "refreshDiff" }
+  | { kind: "replyToThread"; threadId: string; body: string }
+  | { kind: "resolveThread"; threadId: string }
+  | { kind: "reopenThread"; threadId: string };
+
+async function runCommentOperation(
+  client: PeersReviewClient,
+  token: string,
+  operation: CommentOperation,
+) {
+  switch (operation.kind) {
+    case "createThread":
+      return client.createThread(token, {
+        body: operation.body,
+        end_line: operation.endLine ?? null,
+        path: operation.path ?? null,
+        scope: operation.scope,
+        side:
+          operation.side === "old"
+            ? { tag: "Old" }
+            : operation.side === "new"
+              ? { tag: "New" }
+              : null,
+        start_line: operation.startLine ?? null,
+      });
+    case "deleteComment":
+      return client.deleteComment(token, { comment_id: operation.commentId });
+    case "deleteThread":
+      return client.deleteThread(token, { thread_id: operation.threadId });
+    case "editComment":
+      return client.editComment(token, {
+        body: operation.body,
+        comment_id: operation.commentId,
+      });
+    case "refreshDiff":
+      return client.refreshDiff(token);
+    case "replyToThread":
+      return client.replyToThread(token, {
+        body: operation.body,
+        thread_id: operation.threadId,
+      });
+    case "resolveThread":
+      return client.resolveThread(token, { thread_id: operation.threadId });
+    case "reopenThread":
+      return client.reopenThread(token, { thread_id: operation.threadId });
+  }
+}
+
+function adaptPayload(payload: ApiReviewPayload): ReviewPayload {
+  return {
+    reviewId: payload.review_id,
+    targetLabel: payload.target_label,
+    isBranchReview: payload.is_branch_review,
+    files: payload.files.map((file) => ({
+      path: file.path,
+      status: fileStatus(file.status),
+      isChanged: file.is_changed,
+      viewed: file.viewed,
+      commentCount: file.comment_count,
+      addedLines: file.added_lines,
+      removedLines: file.removed_lines,
+    })),
+    fileContentsByPath: mapRecord(payload.file_contents_by_path, (content) => ({
+      old: content.old ?? undefined,
+      new: content.new ?? undefined,
+    })),
+    fileDiffsByPath: mapRecord(payload.file_diffs_by_path, (diff) => ({
+      path: diff.path,
+      hunks: diff.hunks.map((hunk) => ({
+        old: hunk.old ?? undefined,
+        new: hunk.new ?? undefined,
+        sections: hunk.sections.map(adaptDiffSection),
+      })),
+    })),
+    threads: payload.threads.map(adaptThread),
+  };
+}
+
+function adaptThread(thread: ApiCommentThread): CommentThread {
+  const startLine = thread.anchor.start_line ?? 1;
+  const endLine = thread.anchor.end_line ?? startLine;
+
+  return {
+    id: thread.id,
+    scope: threadScope(thread.scope),
+    path: thread.path ?? undefined,
+    lineLabel: thread.line_label,
+    anchor: {
+      side: thread.anchor.side === "old" ? "old" : "new",
+      startLine,
+      endLine,
+    },
+    resolved: thread.resolved,
+    comments: thread.comments.map((comment) => ({
+      id: comment.id,
+      authorName: comment.author_name,
+      authorKind: comment.author_kind === "agent" ? "agent" : "human",
+      body: comment.body,
+      createdAt: comment.created_at,
+      editedAt: comment.edited_at ?? undefined,
+      canEdit: comment.can_edit,
+    })),
+  };
+}
+
+function adaptDiffSection(section: WireDiffSection): DiffSection {
+  switch (section.tag) {
+    case "Context":
+      return { context: section.context };
+    case "Added":
+      return { added: section.added };
+    case "Removed":
+      return { removed: section.removed };
+  }
+}
+
+function fileStatus(status: WireFileStatus): FileStatus {
+  switch (status.tag) {
+    case "Modified":
+      return "modified";
+    case "Added":
+      return "added";
+    case "Deleted":
+      return "deleted";
+    case "Renamed":
+      return "renamed";
+    case "Unchanged":
+      return "unchanged";
+    case "Binary":
+      return "binary";
+  }
+}
+
+function threadScope(scope: string): CommentThread["scope"] {
+  if (scope === "file" || scope === "review") {
+    return scope;
+  }
+  return "line";
+}
+
+function mapRecord<T, U>(map: Map<string, T> | Record<string, T>, transform: (value: T) => U) {
+  const entries = map instanceof Map ? map.entries() : Object.entries(map);
+  const record: Record<string, U> = {};
+
+  for (const [key, value] of entries) {
+    record[key] = transform(value);
+  }
+
+  return record;
+}
+
+function peersClient(config: PeersConfig) {
+  clientPromise ??= connectPeersReview(config.voxUrl);
+  return clientPromise;
+}
+
+type PeersConfig = {
+  token: string;
+  voxUrl: string;
+};
+
+function currentPeersConfig(): PeersConfig | undefined {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  const voxUrl = params.get("vox");
+  const token = params.get("token");
+
+  if (!voxUrl || !token) {
+    return undefined;
+  }
+
+  return { token, voxUrl };
+}
+
+function requirePeersConfig() {
+  const config = currentPeersConfig();
+  if (!config) {
+    throw new Error("Open Peers from the URL printed by `peers diff` or `peers review`.");
+  }
+  return config;
+}
+
+function reviewQueryKey(config: PeersConfig | undefined) {
+  return ["review", config?.voxUrl ?? "missing", config?.token ?? "missing"] as const;
+}
+
+function emptyReviewPayload(): ReviewPayload {
+  return {
+    reviewId: "",
+    targetLabel: "",
+    isBranchReview: false,
+    files: [],
+    fileContentsByPath: {},
+    fileDiffsByPath: {},
+    threads: [],
+  };
+}
+
+const emptyFile: ReviewFile = {
+  path: "",
+  status: "unchanged",
+  isChanged: false,
+  viewed: false,
+  commentCount: 0,
+  addedLines: 0,
+  removedLines: 0,
+};
