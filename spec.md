@@ -370,7 +370,7 @@ Core concepts:
 - `ReviewableFile`
 - `FileDiff`
 - `Hunk`
-- `DiffLine`
+- `DiffSection`
 - `LineAnchor`
 - `CommentThread`
 - `Comment`
@@ -387,6 +387,7 @@ Rendering rules:
 
 - Modified files use side-by-side diff by default.
 - Renamed files with edits use side-by-side diff by default.
+- Side-by-side diffs use equal-width old/new panes that fill the available container width. Each pane owns its horizontal overflow, both panes use the larger content width, and pane scroll positions stay synchronized.
 - Added files use full-width file view, not side-by-side.
 - Deleted files use full-width old-file view.
 - Unchanged files use full-width file view.
@@ -400,6 +401,27 @@ Full-file view:
 - Allows comments on any line.
 - For modified files, annotates changed lines.
 - Uses current/new file content by default.
+- Preserves code whitespace exactly in rendered lines.
+- Reuses the same line rendering, comment anchoring, inline thread, and line selection logic as the diff view.
+- Diff views may show only changed hunks; full-file views must show the complete file content while preserving the same comment behavior.
+
+Frontend review payload shape:
+
+- `files`: ordered list of `ReviewableFile` metadata for the sidebar and file headers.
+- `fileContentsByPath`: map keyed by repo path. Each value contains `old` and/or `new` line arrays for full-file rendering.
+- `fileDiffsByPath`: map keyed by repo path. Each `FileDiff` contains hunks with optional old/new line ranges and ordered compact sections.
+- `threads`: ordered list of `CommentThread` records anchored by path, side, and line/range, with file-level and review-level scopes added later.
+
+Diff hunks must point back into `fileContentsByPath`:
+
+- Ranges are 1-based and inclusive.
+- Context sections contain old and new ranges.
+- Added sections contain a new range.
+- Removed sections contain an old range.
+- The UI expands sections into render rows and reads text from `fileContentsByPath`.
+- Added files should have only `new` content and added sections.
+- Deleted files should have only `old` content and removed sections.
+- Unchanged files may omit `FileDiff`; the UI should render full-file content when they are explicitly shown.
 
 ## Anchors
 
@@ -852,13 +874,14 @@ Current status:
 | Arborium highlighting | Planned | Not implemented. |
 | Vox RPC service | Planned | Not implemented. |
 | Review workspace layout | Partial | Toolbar, sidebar, diff surface, full-file route, and quick access exist. |
-| Inline comments in diff/full-file views | Partial | Preview layout exists for sample anchored threads; composer and persistence are not wired. |
+| Frontend review payload shape | Partial | Sample data is normalized into file metadata, per-path file content, compact per-path diff section ranges, and threads; it is still local mock data, not server-provided. |
+| Inline comments in diff/full-file views | Partial | Shared full-width line/comment renderer exists for non-side-by-side diffs and full-file views; side-by-side comments still use separate layout, and composer/persistence are not wired. |
 | File-level comments | Planned | Specified as `Comment on this file`; button exists as an affordance only. |
 | Review-level comments | Planned | Specified for the `Conversation` tab; not implemented. |
 | Conversation tab | Planned | Specified as all-comments timeline; not implemented. |
 | Commits tab | Planned | Specified for branch/range reviews; not implemented. |
 | File sidebar path grouping/collapse | Planned | Current sidebar remains a flat list. |
-| Full-file persistent sidebar | Partial | Full-file route keeps the sidebar visible, but current-file highlighting is not complete. |
+| Full-file persistent sidebar | Partial | Full-file route keeps the sidebar visible and reuses the full-width line/comment renderer, but current-file highlighting is not complete. |
 | Unchanged-file toggle | Partial | Toggle and routing exist; behavior still needs verification against all routes. |
 | Quick access menu | Partial | File/comment search exists for current sample data; review/file/review-level scopes are not complete. |
 | Comment card presentation | Partial | Inline cards exist, but date/time, agent icon, edit state, and invalidation warning behavior are not complete. |

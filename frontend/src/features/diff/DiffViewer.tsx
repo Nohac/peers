@@ -1,4 +1,4 @@
-import type { CommentThread, ReviewFile } from "../review/reviewData";
+import { diffLinesForPath, type CommentThread, type ReviewFile } from "../review/reviewData";
 import { fileAnchorId } from "../review/fileLinks";
 import { DiffHeader } from "./DiffHeader";
 import { FullFileView } from "./FullFileView";
@@ -22,9 +22,14 @@ export function DiffViewer({ activeCommentId, allFiles, file, threads }: DiffVie
       <DiffHeader allFiles={allFiles} file={file} threads={threads} />
       <div className="p-4">
         {sideBySide ? (
-          <SideBySideDiff activeCommentId={activeCommentId} threads={threads} />
+          <SideBySideDiff activeCommentId={activeCommentId} path={file.path} threads={threads} />
         ) : (
-          <FullFileView activeCommentId={activeCommentId} file={file} threads={threads} />
+          <FullFileView
+            activeCommentId={activeCommentId}
+            file={file}
+            lines={diffLinesForPath(file.path)}
+            threads={threads}
+          />
         )}
       </div>
     </section>
