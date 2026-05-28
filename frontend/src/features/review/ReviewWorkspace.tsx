@@ -1,6 +1,5 @@
 import { FileSidebar } from "./FileSidebar";
-import { useReviewFiles, useThreads, useThreadsForFile } from "./reviewData";
-import { CommentPanel } from "../comments/CommentPanel";
+import { useReviewFiles, useThreadsForFile } from "./reviewData";
 import { DiffViewer } from "../diff/DiffViewer";
 import type { ReviewFile } from "./reviewData";
 
@@ -11,11 +10,10 @@ type ReviewWorkspaceProps = {
 
 export function ReviewWorkspace({ activeCommentId, allFiles }: ReviewWorkspaceProps) {
   const visibleFiles = useReviewFiles({ includeUnchangedFiles: allFiles });
-  const commentThreads = useThreads();
   const changedFiles = visibleFiles.filter((file) => file.isChanged);
 
   return (
-    <div className="grid min-h-0 flex-1 grid-cols-[280px_minmax(0,1fr)_340px] border-t">
+    <div className="grid min-h-0 flex-1 grid-cols-[280px_minmax(0,1fr)] border-t">
       <FileSidebar allFiles={allFiles} files={visibleFiles} />
       <section className="min-h-0 scroll-smooth overflow-auto bg-muted/20">
         <div className="space-y-4 p-4">
@@ -29,7 +27,6 @@ export function ReviewWorkspace({ activeCommentId, allFiles }: ReviewWorkspacePr
           ))}
         </div>
       </section>
-      <CommentPanel activeCommentId={activeCommentId} threads={commentThreads} />
     </div>
   );
 }

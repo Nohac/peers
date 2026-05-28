@@ -9,7 +9,7 @@ type FileSidebarProps = {
 };
 
 export function FileSidebar({ allFiles, files }: FileSidebarProps) {
-  const navigate = useNavigate({ from: "/" });
+  const navigate = useNavigate();
 
   return (
     <aside className="min-h-0 border-r bg-sidebar text-sidebar-foreground">
@@ -20,7 +20,9 @@ export function FileSidebar({ allFiles, files }: FileSidebarProps) {
             checked={allFiles}
             className="size-3.5 accent-primary"
             onChange={(event) => {
-              void navigate({
+              navigate({
+                replace: true,
+                to: ".",
                 search: (previous) => ({
                   ...previous,
                   allFiles: event.target.checked,

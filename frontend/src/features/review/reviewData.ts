@@ -21,17 +21,27 @@ export type DiffLine = {
   newText?: string;
 };
 
+export type ReviewComment = {
+  id: string;
+  authorName: string;
+  authorKind: "human" | "agent";
+  body: string;
+  createdAt: string;
+  editedAt?: string;
+  canEdit: boolean;
+};
+
 export type CommentThread = {
   id: string;
   path: string;
   lineLabel: string;
+  anchor: {
+    side: "old" | "new";
+    startLine: number;
+    endLine: number;
+  };
   resolved: boolean;
-  comments: Array<{
-    id: string;
-    authorName: string;
-    authorKind: "human" | "agent";
-    body: string;
-  }>;
+  comments: ReviewComment[];
 };
 
 const reviewFiles: ReviewFile[] = [
@@ -86,7 +96,12 @@ const commentThreads: CommentThread[] = [
   {
     id: "thr_validation",
     path: "src/cli.rs",
-    lineLabel: "src/cli.rs:42-47",
+    lineLabel: "src/cli.rs:39-40",
+    anchor: {
+      side: "new",
+      startLine: 39,
+      endLine: 40,
+    },
     resolved: false,
     comments: [
       {
@@ -94,19 +109,28 @@ const commentThreads: CommentThread[] = [
         authorName: "Jonas",
         authorKind: "human",
         body: "This command should validate mutually exclusive body inputs before appending an event.",
+        createdAt: "2026-05-28T18:12:00Z",
+        canEdit: true,
       },
       {
         id: "cmt_agent_reply",
         authorName: "Codex",
         authorKind: "agent",
         body: "I can move this into a pure helper so the CLI branch stays small.",
+        createdAt: "2026-05-28T18:17:00Z",
+        canEdit: false,
       },
     ],
   },
   {
     id: "thr_agent_context",
     path: "src/comments.rs",
-    lineLabel: "src/comments.rs:117",
+    lineLabel: "src/comments.rs:4",
+    anchor: {
+      side: "new",
+      startLine: 4,
+      endLine: 4,
+    },
     resolved: false,
     comments: [
       {
@@ -114,13 +138,20 @@ const commentThreads: CommentThread[] = [
         authorName: "Jonas",
         authorKind: "human",
         body: "Make sure unresolved comments are easy for agents to scan without the UI.",
+        createdAt: "2026-05-28T18:34:00Z",
+        canEdit: true,
       },
     ],
   },
   {
     id: "thr_spec",
     path: "spec.md",
-    lineLabel: "spec.md:315",
+    lineLabel: "spec.md:4",
+    anchor: {
+      side: "new",
+      startLine: 4,
+      endLine: 4,
+    },
     resolved: true,
     comments: [
       {
@@ -128,6 +159,8 @@ const commentThreads: CommentThread[] = [
         authorName: "ai agent",
         authorKind: "agent",
         body: "The IO boundary rule is reflected in the storage API shape.",
+        createdAt: "2026-05-28T18:45:00Z",
+        canEdit: false,
       },
     ],
   },
@@ -164,11 +197,73 @@ export const addedFileLines = [
 type ReviewDataState = {
   files: ReviewFile[];
   threads: CommentThread[];
+  deleteComment: (threadId: string, commentId: string) => void;
+  deleteThread: (threadId: string) => void;
+  editComment: (threadId: string, commentId: string, body: string) => void;
+  toggleThreadResolved: (threadId: string) => void;
 };
 
-const useReviewDataStore = create<ReviewDataState>(() => ({
+const useReviewDataStore = create<ReviewDataState>((set) => ({
   files: reviewFiles,
   threads: commentThreads,
+  deleteComment: (threadId, commentId) => {
+    set((state) => ({
+      threads: state.threads.flatMap((thread) => {
+        if (thread.id !== threadId) {
+          return [thread];
+        }
+
+        const commentIndex = thread.comments.findIndex((comment) => comment.id === commentId);
+        if (commentIndex === -1 || !thread.comments[commentIndex]?.canEdit) {
+          return [thread];
+        }
+
+        const comments = thread.comments.slice(0, commentIndex);
+        return comments.length === 0 ? [] : [{ ...thread, comments, resolved: false }];
+      }),
+    }));
+  },
+  deleteThread: (threadId) => {
+    set((state) => ({
+      threads: state.threads.filter((thread) => thread.id !== threadId),
+    }));
+  },
+  editComment: (threadId, commentId, body) => {
+    const editedAt = new Date().toISOString();
+    set((state) => ({
+      threads: state.threads.map((thread) => {
+        if (thread.id !== threadId) {
+          return thread;
+        }
+
+        const commentIndex = thread.comments.findIndex((comment) => comment.id === commentId);
+        const comment = thread.comments[commentIndex];
+        if (!comment?.canEdit) {
+          return thread;
+        }
+
+        const comments = thread.comments.slice(0, commentIndex + 1);
+        comments[commentIndex] = {
+          ...comment,
+          body,
+          editedAt,
+        };
+
+        return {
+          ...thread,
+          comments,
+          resolved: false,
+        };
+      }),
+    }));
+  },
+  toggleThreadResolved: (threadId) => {
+    set((state) => ({
+      threads: state.threads.map((thread) =>
+        thread.id === threadId ? { ...thread, resolved: !thread.resolved } : thread,
+      ),
+    }));
+  },
 }));
 
 type UseReviewFilesInput = {
@@ -207,4 +302,18 @@ export function useThreadsForFile(path: string) {
   const threads = useThreads();
 
   return useMemo(() => threads.filter((thread) => thread.path === path), [path, threads]);
+}
+
+export function useReviewCommentActions() {
+  const deleteComment = useReviewDataStore((state) => state.deleteComment);
+  const deleteThread = useReviewDataStore((state) => state.deleteThread);
+  const editComment = useReviewDataStore((state) => state.editComment);
+  const toggleThreadResolved = useReviewDataStore((state) => state.toggleThreadResolved);
+
+  return {
+    deleteComment,
+    deleteThread,
+    editComment,
+    toggleThreadResolved,
+  };
 }

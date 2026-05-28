@@ -10,5 +10,11 @@ export const Route = createFileRoute("/file")({
 function FileRoute() {
   const search = Route.useSearch();
 
-  return <FullFileRouteView activeCommentId={search.comment} path={search.path} />;
+  return (
+    <FullFileRouteView
+      activeCommentId={search.comment}
+      allFiles={search.allFiles}
+      path={search.path}
+    />
+  );
 }

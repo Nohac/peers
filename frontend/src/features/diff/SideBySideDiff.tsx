@@ -1,4 +1,5 @@
 import { MessageSquarePlus } from "lucide-react";
+import { InlineCommentThread } from "../comments/InlineCommentThread";
 import { modifiedDiff, type CommentThread } from "../review/reviewData";
 
 type SideBySideDiffProps = {
@@ -13,41 +14,55 @@ export function SideBySideDiff({ threads, activeCommentId }: SideBySideDiffProps
         <div className="border-r px-3 py-2">Old</div>
         <div className="px-3 py-2">New</div>
       </div>
-      {modifiedDiff.map((line, index) => (
-        <div
-          className="group grid grid-cols-2"
-          key={`${line.oldNumber}-${line.newNumber}-${index}`}
-        >
-          <DiffCell
-            lineNumber={line.oldNumber}
-            text={line.oldText}
-            tone={line.kind === "deleted" ? "deleted" : "context"}
-          />
-          <DiffCell
-            lineNumber={line.newNumber}
-            text={line.newText}
-            tone={line.kind === "added" ? "added" : "context"}
-          />
-        </div>
-      ))}
+      {modifiedDiff.map((line, index) => {
+        const oldThreads = threads.filter(
+          (thread) => thread.anchor.side === "old" && thread.anchor.endLine === line.oldNumber,
+        );
+        const newThreads = threads.filter(
+          (thread) => thread.anchor.side === "new" && thread.anchor.endLine === line.newNumber,
+        );
+
+        return (
+          <div key={`${line.oldNumber}-${line.newNumber}-${index}`}>
+            <div className="group grid grid-cols-2">
+              <DiffCell
+                lineNumber={line.oldNumber}
+                text={line.oldText}
+                tone={line.kind === "deleted" ? "deleted" : "context"}
+              />
+              <DiffCell
+                lineNumber={line.newNumber}
+                text={line.newText}
+                tone={line.kind === "added" ? "added" : "context"}
+              />
+            </div>
+            {oldThreads.length > 0 || newThreads.length > 0 ? (
+              <div className="grid grid-cols-2 border-t bg-muted/30">
+                <InlineThreadStack activeCommentId={activeCommentId} threads={oldThreads} />
+                <InlineThreadStack activeCommentId={activeCommentId} threads={newThreads} />
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+type InlineThreadStackProps = {
+  threads: CommentThread[];
+  activeCommentId?: string;
+};
+
+function InlineThreadStack({ threads, activeCommentId }: InlineThreadStackProps) {
+  return (
+    <div className="space-y-3 border-r p-3 font-sans">
       {threads.map((thread) => (
-        <div
-          className={[
-            "border-t p-3 font-sans text-sm",
-            activeCommentId === thread.id ? "bg-primary text-primary-foreground" : "bg-accent/50",
-          ].join(" ")}
+        <InlineCommentThread
+          active={activeCommentId === thread.id}
           key={thread.id}
-        >
-          <span className="font-mono font-medium">{thread.lineLabel}</span>
-          <span
-            className={[
-              "ml-2",
-              activeCommentId === thread.id ? "text-primary-foreground" : "text-muted-foreground",
-            ].join(" ")}
-          >
-            {thread.comments[0]?.body}
-          </span>
-        </div>
+          thread={thread}
+        />
       ))}
     </div>
   );

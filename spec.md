@@ -2,6 +2,12 @@
 
 Peers is a local Git review tool. It provides a GitHub-like review UI for local changes and branch reviews, while storing comments in the project so humans and AI agents can read, create, and respond to review feedback.
 
+Slogan:
+
+```text
+Local Git peer review for humans and agents.
+```
+
 ## Goals
 
 - Review unstaged, staged, full working tree, and branch-range diffs locally.
@@ -264,6 +270,8 @@ Review data is stored inside the reviewed project:
 
 `agent-context.md` is generated for agents and should contain unresolved comments with enough file, line, and surrounding context to act on them.
 
+File-level and review-level comments should also be included in generated review summaries and agent context.
+
 Use append-only JSONL events so agents can append safely and merge conflicts stay manageable.
 
 Example events:
@@ -271,6 +279,8 @@ Example events:
 ```json
 {"kind":"review_created","review_id":"rev_20260528_121530_a1b2c3","created_at":"2026-05-28T12:15:30Z","target":{"kind":"branch","base":"main","head":"HEAD"}}
 {"kind":"thread_created","thread_id":"thr_01j","author":{"kind":"human","display_name":"Jonas","email":"jonas@example.com"},"anchor":{"path":"src/foo.rs","side":"new","start_line":42,"end_line":47,"content_hash":"..."},"body":"This bypasses validation."}
+{"kind":"thread_created","thread_id":"thr_02j","author":{"kind":"human","display_name":"Jonas","email":"jonas@example.com"},"anchor":{"path":"src/foo.rs","scope":"file"},"body":"This file needs a smaller public API before merging."}
+{"kind":"thread_created","thread_id":"thr_03j","author":{"kind":"human","display_name":"Jonas","email":"jonas@example.com"},"anchor":null,"body":"Before merging, let's decide whether this should be split into two commits."}
 {"kind":"comment_added","thread_id":"thr_01j","comment_id":"cmt_01j","author":{"kind":"agent","display_name":"Codex","email":null},"body":"I can fix this by moving validation before the write."}
 {"kind":"thread_resolved","thread_id":"thr_01j","author":{"kind":"human","display_name":"Jonas","email":"jonas@example.com"}}
 ```
@@ -393,9 +403,17 @@ Full-file view:
 
 ## Anchors
 
-Thread anchors must survive reasonable file edits.
+Threads may be line/range anchored, file-level, or review-level.
 
-Store:
+Line/range anchored threads belong to a file, side, and line/range. They are created from the `Files changed` tab and render inline in diff/full-file views.
+
+File-level threads belong to a file, but not to a specific line. They are created from a file header action labeled `Comment on this file`. Use them for feedback about a file as a whole, such as module boundaries, naming, test coverage, generated code, or whether the file should exist.
+
+Review-level threads have no anchor. They are created from the `Conversation` tab and belong to the review as a whole. Use them for general review discussion, merge readiness, commit structure, follow-up tasks, or questions that are not about a specific line.
+
+Line/range anchors must survive reasonable file edits.
+
+Store for line/range anchors:
 
 - path
 - old path, if renamed
@@ -462,11 +480,12 @@ The review UI should feel close to GitHub's pull request review experience.
 Desktop layout:
 
 ```text
-top bar: review target, refresh, view mode, unresolved count
+top bar: review target, refresh, review tabs, unresolved count
 left: file sidebar
-center: diff or full-file viewer
-right: comments panel
+center: active review tab content
 ```
+
+The "Files changed" tab should be the primary/default tab. Comments and threads should be inline in the diff/full-file surface, similar to GitHub pull request review.
 
 Use shadcn primitives:
 
@@ -474,25 +493,85 @@ Use shadcn primitives:
 - `Sidebar` for file list
 - `ScrollArea` for long lists and diffs
 - `Popover` for inline comment composer
-- `Sheet` for comments on narrow screens
 - `Textarea` for Markdown comments
 - `Badge`, `Button`, `Tabs`, `ToggleGroup`, `Tooltip`, `Separator`
 
 The first screen is the review workspace, not a landing page.
 
-Compositional layout files should stay lean. For example, `ReviewWorkspace.tsx` should compose the toolbar, sidebar, diff viewer, comments panel, and quick access menu, but detailed row styling and primitive UI behavior should live in smaller component files.
+Compositional layout files should stay lean. For example, `ReviewWorkspace.tsx` should compose the toolbar, sidebar, diff viewer, inline thread layer, and quick access menu, but detailed row styling and primitive UI behavior should live in smaller component files.
+
+## Review Navigation
+
+Use top-level review tabs similar to GitHub pull requests:
+
+- `Files changed`: primary/default tab. Shows the file sidebar and diff/full-file viewer.
+- `Conversation`: shows all review comments and threads in one chronological scrollable page.
+- `Commits`: shown only for branch review mode, not for `peers diff`, `peers diff --cached`, or `peers diff --all`.
+
+The `Files changed` tab:
+
+- Opens by default for every review.
+- Keeps comments inline with the relevant diff or full-file lines.
+- Keeps the file sidebar visible on desktop.
+
+The `Conversation` tab:
+
+- Provides a scrollable review-wide timeline of comments and threads.
+- Groups thread activity clearly enough to understand the anchor, author, status, and latest replies.
+- Links anchored threads back to their file and line/range in `Files changed`.
+- Links file-level threads back to their file in `Files changed`.
+- Includes resolved and unresolved threads, with status clearly shown.
+- Allows creating review-level threads that are not attached to any diff, file, or line.
+- Shows review-level threads in the same timeline as anchored threads, with a clear review-level label instead of a file/line anchor.
+- Is an overview/history surface, not the primary commenting surface.
+
+The `Commits` tab:
+
+- Appears only when the review target is a branch/range review with meaningful commits between base and head.
+- Lists commits in the reviewed range with enough metadata to identify them: abbreviated hash, title, author, and time.
+- May be read-only in the first pass.
 
 ## File Sidebar
 
-The left sidebar should always be available on desktop.
+The left sidebar should always be available on desktop in the `Files changed` tab, including when viewing a full file.
 
 Default:
 
 - Show only changed files.
-- Group by status.
+- Group files by parent directory path.
+- Render one level of directory path groups and one level of file rows.
 - Show file status badge.
 - Show viewed state.
 - Show unresolved comment count.
+- Allow directory path groups to be collapsed and expanded.
+
+Example:
+
+```text
+src/features/review/
+  FileSidebar.tsx
+  ReviewWorkspace.tsx
+
+src/features/review/search/
+  quickAccessSearch.ts
+  reviewSearch.ts
+```
+
+Directory path group labels:
+
+- Show the full parent path when there is enough space.
+- Truncate from the beginning when the path is too long, preserving the most specific trailing path segments.
+- Use the shadcn `Tooltip` primitive on hover to show the full path.
+- Use a stable hit target for collapse/expand so long path labels do not shift the control.
+- Root-level files should be grouped under a clear root label such as `/`.
+
+File rows:
+
+- Show only the basename as the primary label.
+- Keep status, viewed state, and unresolved count on the file row.
+- Use the full repo-relative file path for navigation, search, and tooltips when needed.
+- Highlight the currently selected/viewed file, whether the center pane is showing a diff or full-file view.
+- Keep the selected file visible in the sidebar when practical, expanding its parent path group if needed.
 
 Toggle:
 
@@ -549,12 +628,60 @@ Supported operations:
 Threads render:
 
 - Inline below the selected line/range.
-- In the right comments panel.
+- Near the file header for file-level comments.
+- In the `Conversation` timeline.
 - As counts in the file sidebar.
 
 Comments use plain Markdown text in a textarea.
 
 No rich text editor initially.
+
+Comment presentation:
+
+- Comment cards should be dense but complete; avoid sparse cards that only show body text.
+- Each comment shows author display name and created date/time.
+- Prefer a compact relative time in the main card, with exact timestamp available on hover or in a tooltip.
+- Do not show raw author kind labels such as `human` or `agent` in the card body.
+- Agent comments should be visually distinguishable with a small icon or badge; an icon is enough when the author name already makes the source clear.
+- Edited comments should show an edited marker with enough timestamp detail to understand when the edit happened.
+- Thread status such as resolved/outdated/detached should be shown at the thread level, not repeated on every comment.
+
+Editing and deletion:
+
+- Users can edit their own comments.
+- Users can delete their own comments.
+- Users can delete a whole thread when they are allowed to delete the thread's root comment.
+- Editing or deleting a user comment invalidates later dependent activity in that thread.
+- Dependent activity includes following agent comments, following agent-created replies, and later resolved/reopened status changes that happened after the edited/deleted comment.
+- Before applying an edit/delete that would invalidate later activity, show a confirmation warning that those later comments/status changes will be removed from the visible thread state.
+- After confirmation, the UI should remove the invalidated later activity from the visible thread and from generated review summaries/agent context.
+- Because storage is append-only, do not physically rewrite old JSONL lines. Record edit/delete/invalidation events and let derived state hide the invalidated activity.
+
+Inline thread behavior:
+
+- Existing threads render directly below their anchored line or range in both diff and full-file views.
+- Multiple threads on the same line or range render in a stable order by creation time.
+- Resolved threads may be collapsed by default, but unresolved threads should be visible without opening a side panel.
+- Reply, edit, delete, resolve, and reopen actions are available from the inline thread.
+- Creating a new thread opens the composer inline at the selected range after the comment affordance is clicked.
+- If an anchor becomes outdated or detached, show the thread inline at the best relocated position when possible; otherwise show it in a clear detached/outdated section for that file.
+
+File-level thread behavior:
+
+- File-level threads are created from a file header action labeled `Comment on this file`.
+- They are attached to the file path, not a diff hunk or line range.
+- They render near the file header in the `Files changed` tab and at the top of full-file view.
+- They support the same reply, edit, delete, resolve, and reopen operations as line/range threads.
+- They should appear in file sidebar unresolved counts for that file.
+- They should be included in global unresolved counts and quick access comment search.
+
+Review-level thread behavior:
+
+- Review-level threads are created from the `Conversation` tab.
+- They are not attached to a file, diff hunk, or line range.
+- They support the same reply, edit, delete, resolve, and reopen operations as anchored threads.
+- They should not appear in file sidebar unresolved counts.
+- They should be included in global unresolved counts and quick access comment search.
 
 ## Quick Access Menu
 
@@ -582,7 +709,7 @@ The file search must respect the sidebar's "show unchanged files" toggle:
 - Toggle off: search changed files only.
 - Toggle on: search changed and unchanged reviewable files.
 
-Comment search should search all comments in the current review, regardless of the file visibility filter. Selecting a comment in a currently hidden unchanged file should open the file directly and indicate that it is outside the current file filter.
+Comment search should search all comments in the current review, regardless of the file visibility filter. Selecting an anchored or file-level comment in a currently hidden unchanged file should open the file directly and indicate that it is outside the current file filter. Selecting a review-level comment should open it in the `Conversation` tab.
 
 Result model:
 
@@ -599,11 +726,12 @@ type QuickAccessResult =
       kind: "comment"
       threadId: string
       commentId: string
-      path: string
-      lineLabel: string
+      path?: string
+      lineLabel?: string
       authorName: string
       excerpt: string
       resolved: boolean
+      scope: "anchored" | "file" | "review"
     }
 ```
 
@@ -698,6 +826,43 @@ Do not test:
 - Simple DTO mappings.
 - CLI flag plumbing unless it becomes subtle.
 - Basic component wrappers.
+
+## Feature Status
+
+Use this section as the short source of truth for implementation progress. Update it whenever a feature moves materially closer to or farther from the spec.
+
+Statuses:
+
+- `Complete`: implemented and believed to follow the current spec.
+- `Partial`: implemented enough to use or preview, but known gaps remain.
+- `Planned`: specified, but not meaningfully implemented.
+- `Out of date`: implemented behavior exists but conflicts with the current spec.
+
+Current status:
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Project rename to Peers | Complete | CLI/package/docs use `peers`, `.peers`, and `PEERS_*`. |
+| CLI skeleton | Partial | Commands exist, but UI launch and full backend behavior are not wired. |
+| Review storage/event log | Partial | Append-only JSONL storage exists for initial review/comment flows. |
+| Author detection and overrides | Partial | Git config, CLI flags, and `PEERS_*` env vars are implemented. |
+| CLI comment operations | Partial | Add/reply/edit/delete/resolve/reopen plumbing exists, but invalidation semantics are not complete. |
+| Generated review and agent context files | Partial | Basic generated files exist; file-level/review-level comments and invalidation rules still need coverage. |
+| Git diff loading | Planned | Current frontend uses sample diff data. |
+| Arborium highlighting | Planned | Not implemented. |
+| Vox RPC service | Planned | Not implemented. |
+| Review workspace layout | Partial | Toolbar, sidebar, diff surface, full-file route, and quick access exist. |
+| Inline comments in diff/full-file views | Partial | Preview layout exists for sample anchored threads; composer and persistence are not wired. |
+| File-level comments | Planned | Specified as `Comment on this file`; button exists as an affordance only. |
+| Review-level comments | Planned | Specified for the `Conversation` tab; not implemented. |
+| Conversation tab | Planned | Specified as all-comments timeline; not implemented. |
+| Commits tab | Planned | Specified for branch/range reviews; not implemented. |
+| File sidebar path grouping/collapse | Planned | Current sidebar remains a flat list. |
+| Full-file persistent sidebar | Partial | Full-file route keeps the sidebar visible, but current-file highlighting is not complete. |
+| Unchanged-file toggle | Partial | Toggle and routing exist; behavior still needs verification against all routes. |
+| Quick access menu | Partial | File/comment search exists for current sample data; review/file/review-level scopes are not complete. |
+| Comment card presentation | Partial | Inline cards exist, but date/time, agent icon, edit state, and invalidation warning behavior are not complete. |
+| Packaging embedded frontend assets | Planned | Not implemented. |
 
 ## Implementation Order
 

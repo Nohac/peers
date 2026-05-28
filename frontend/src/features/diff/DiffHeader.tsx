@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { MessageSquareText, PanelTopOpen } from "lucide-react";
+import { MessageSquarePlus, PanelTopOpen } from "lucide-react";
 import { fullFileSearch } from "../review/fileLinks";
 import type { CommentThread, ReviewFile } from "../review/reviewData";
 
@@ -23,26 +23,18 @@ export function DiffHeader({ allFiles, file, threads }: DiffHeaderProps) {
         </div>
       </div>
       <div className="flex items-center gap-2">
-        {firstThread ? (
-          <Link
-            className="inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs no-underline hover:bg-accent"
-            hash={`comment-${firstThread.id}`}
-            search={{ allFiles, comment: firstThread.id }}
-            to="/"
-          >
-            <MessageSquareText className="size-3.5" />
-            {threads.length}
-          </Link>
-        ) : (
-          <button
-            className="inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs opacity-50"
-            disabled
-            type="button"
-          >
-            <MessageSquareText className="size-3.5" />
-            {threads.length}
-          </button>
-        )}
+        <button
+          className="inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs hover:bg-accent"
+          type="button"
+        >
+          <MessageSquarePlus className="size-3.5" />
+          Comment on this file
+        </button>
+        {threads.length > 0 ? (
+          <span className="rounded border px-2 py-1 text-xs text-muted-foreground">
+            {threads.length} {threads.length === 1 ? "thread" : "threads"}
+          </span>
+        ) : null}
         <Link
           className="inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs no-underline hover:bg-accent"
           search={fullFileSearch({ allFiles, comment: firstThread?.id, path: file.path })}
