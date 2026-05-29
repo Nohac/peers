@@ -494,7 +494,9 @@ fn review_payload(
         .collect();
     let mut comment_counts = BTreeMap::<String, u32>::new();
     for thread in &threads {
-        if let Some(path) = &thread.path {
+        if !thread.resolved
+            && let Some(path) = &thread.path
+        {
             *comment_counts.entry(path.clone()).or_default() += 1;
         }
     }

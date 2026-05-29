@@ -880,7 +880,7 @@ Current status:
 | Review-level comments | Planned | Specified for the `Conversation` tab; not implemented. |
 | Conversation tab | Planned | Specified as all-comments timeline; not implemented. |
 | Commits tab | Planned | Specified for branch/range reviews; not implemented. |
-| File sidebar path grouping/collapse | Planned | Current sidebar remains a flat list. |
+| File sidebar path grouping/collapse | Complete | Sidebar groups by parent path, supports collapse/expand, shows basename rows with status/viewed/comment counts, preserves active-file highlighting, and uses tooltips for full paths. |
 | Full-file persistent sidebar | Partial | Full-file route keeps the sidebar visible and can show full file content; current-file highlighting and full-file parity still need work. |
 | Unchanged-file toggle | Partial | Toggle and routing exist; behavior still needs verification against all routes. |
 | Quick access menu | Partial | File/comment search exists against live review data; review/file/review-level scope navigation is not complete. |

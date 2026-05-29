@@ -197,6 +197,9 @@ export function useReviewCommentActions() {
     refreshDiff: () => {
       mutation.mutate({ kind: "refreshDiff" });
     },
+    markFileViewed: (path: string, viewed: boolean) => {
+      mutation.mutate({ kind: "markFileViewed", path, viewed });
+    },
     replyToThread: (threadId: string, body: string) => {
       mutation.mutate({ kind: "replyToThread", body, threadId });
     },
@@ -245,6 +248,7 @@ type CommentOperation =
   | { kind: "deleteComment"; commentId: string }
   | { kind: "deleteThread"; threadId: string }
   | { kind: "editComment"; commentId: string; body: string }
+  | { kind: "markFileViewed"; path: string; viewed: boolean }
   | { kind: "refreshDiff" }
   | { kind: "replyToThread"; threadId: string; body: string }
   | { kind: "resolveThread"; threadId: string }
@@ -278,6 +282,11 @@ async function runCommentOperation(
       return client.editComment(token, {
         body: operation.body,
         comment_id: operation.commentId,
+      });
+    case "markFileViewed":
+      return client.markFileViewed(token, {
+        path: operation.path,
+        viewed: operation.viewed,
       });
     case "refreshDiff":
       return client.refreshDiff(token);

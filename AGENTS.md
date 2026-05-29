@@ -15,3 +15,7 @@ Current shape:
 - Frontend features: `frontend/src/features/`
 - TanStack routes: `frontend/src/routes/`
 - Review storage target: `.peers/` inside reviewed repos
+
+Implementation note:
+
+- Check [CONTRIBUTING.md](./CONTRIBUTING.md) before making implementation decisions. It covers routing, state, testing, styling, and frontend component rules, including when to use shadcn/ui-style primitives instead of creating custom components from scratch.

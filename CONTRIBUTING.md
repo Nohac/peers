@@ -133,6 +133,8 @@ Route and layout files should stay lean:
 
 Primitive components may use inline Tailwind freely and should follow shadcn conventions. Composition components should mostly arrange smaller components and keep Tailwind minimal.
 
+Before hand-rolling common frontend controls, check whether an existing shadcn/ui-style primitive or shadcn example fits. Prefer those patterns for buttons, checkboxes, collapsibles, tooltips, tabs, dialogs, menus, and similar UI building blocks.
+
 ## Routing
 
 Use TanStack Router as the source of truth for app navigation.
