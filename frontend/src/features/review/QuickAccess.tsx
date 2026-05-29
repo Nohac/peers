@@ -55,26 +55,35 @@ export function QuickAccess({ allFiles, open, files, threads, onClose }: QuickAc
                     if (result.isChanged) {
                       void navigate({
                         to: "/",
-                        search: { allFiles, comment: result.threadId },
+                        search: (previous) => ({
+                          ...previous,
+                          allFiles,
+                          comment: result.threadId,
+                        }),
                         hash: `comment-${result.threadId}`,
                       });
                     } else {
                       void navigate({
                         to: "/file",
-                        search: { allFiles, comment: result.threadId, path: result.path },
+                        search: (previous) => ({
+                          ...previous,
+                          allFiles,
+                          comment: result.threadId,
+                          path: result.path,
+                        }),
                         hash: `comment-${result.threadId}`,
                       });
                     }
                   } else if (result.isChanged) {
                     void navigate({
                       to: "/",
-                      search: { allFiles },
+                      search: (previous) => ({ ...previous, allFiles }),
                       hash: fileAnchorId(result.path),
                     });
                   } else {
                     void navigate({
                       to: "/file",
-                      search: { allFiles, path: result.path },
+                      search: (previous) => ({ ...previous, allFiles, path: result.path }),
                     });
                   }
                   onClose();

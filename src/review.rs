@@ -52,23 +52,15 @@ impl AuthorOverride {
             });
 
         let git_author = git_author(repo);
-        let display_name = self
-            .name
-            .or(env_name)
-            .or_else(|| {
-                git_author
-                    .as_ref()
-                    .map(|author| author.display_name.clone())
-            })
-            .unwrap_or_else(|| match kind {
-                AuthorKind::Human => Author::fallback_human().display_name,
-                AuthorKind::Agent => Author::fallback_agent().display_name,
-            });
+        let display_name = author_display_name(
+            &kind,
+            self.name.or(env_name),
+            git_author
+                .as_ref()
+                .map(|author| author.display_name.clone()),
+        );
 
-        let email = self
-            .email
-            .or(env_email)
-            .or_else(|| git_author.and_then(|author| author.email));
+        let email = author_email(&kind, self.email.or(env_email), git_author);
 
         Author {
             kind,
@@ -76,6 +68,28 @@ impl AuthorOverride {
             email,
         }
     }
+}
+
+fn author_display_name(
+    kind: &AuthorKind,
+    configured_name: Option<String>,
+    git_name: Option<String>,
+) -> String {
+    configured_name.unwrap_or_else(|| match kind {
+        AuthorKind::Human => git_name.unwrap_or_else(|| Author::fallback_human().display_name),
+        AuthorKind::Agent => Author::fallback_agent().display_name,
+    })
+}
+
+fn author_email(
+    kind: &AuthorKind,
+    configured_email: Option<String>,
+    git_author: Option<Author>,
+) -> Option<String> {
+    configured_email.or_else(|| match kind {
+        AuthorKind::Human => git_author.and_then(|author| author.email),
+        AuthorKind::Agent => None,
+    })
 }
 
 fn parse_author_kind(input: &str) -> Option<AuthorKind> {

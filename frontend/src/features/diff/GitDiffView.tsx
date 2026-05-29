@@ -168,6 +168,8 @@ export function GitDiffView({
                     startLine: range.startLine,
                   });
                   diffViewRef.current?.clearSelection();
+                  diffViewRef.current?.setPreselectedLines({ new: [], old: [] });
+                  window.getSelection()?.removeAllRanges();
                   setActiveWidgetRange(undefined);
                   onClose();
                 }}
@@ -182,7 +184,14 @@ export function GitDiffView({
 
 function commentRanges(threads: CommentThread[]) {
   return threads.flatMap((thread) => {
-    if (thread.scope !== "line" || thread.anchor.startLine === thread.anchor.endLine) {
+    if (
+      thread.scope !== "line" ||
+      !isMultiLineRange({
+        endLine: thread.anchor.endLine,
+        side: thread.anchor.side,
+        startLine: thread.anchor.startLine,
+      })
+    ) {
       return [];
     }
 
@@ -192,6 +201,10 @@ function commentRanges(threads: CommentThread[]) {
       startLine: thread.anchor.startLine,
     };
   });
+}
+
+function isMultiLineRange(range: SelectedRange) {
+  return range.startLine !== range.endLine;
 }
 
 function normalizeSelectedRange(range: SelectedRange): SelectedRange {
@@ -259,29 +272,38 @@ function highlightCommentRanges(container: HTMLElement | null, ranges: SelectedR
     return;
   }
 
-  for (const cell of container.querySelectorAll(".peers-comment-range-highlight")) {
-    cell.classList.remove("peers-comment-range-highlight");
+  for (const element of container.querySelectorAll<HTMLElement>("[data-peers-range-decoration]")) {
+    element.classList.remove("peers-comment-range-box", "peers-comment-range-rail");
+    element.removeAttribute("data-peers-range-decoration");
   }
 
   for (const range of ranges) {
     highlightSplitRange(container, range);
     highlightUnifiedRange(container, range);
+    highlightRangeCommentBox(container, range);
   }
 }
 
 function highlightSplitRange(container: HTMLElement, range: SelectedRange) {
-  for (const row of container.querySelectorAll<HTMLTableRowElement>(
-    `tr[data-side="${range.side}"][data-line]`,
-  )) {
-    const lineNumber = lineNumberFromText(row.querySelector("[data-line-num]")?.textContent);
+  for (const row of container.querySelectorAll<HTMLTableRowElement>("tr[data-line]")) {
+    const rowSide = row.getAttribute("data-side");
+
+    if (rowSide && rowSide !== range.side) {
+      continue;
+    }
+
+    const lineCell = row.querySelector<HTMLElement>(`.diff-line-${range.side}-num`);
+    if (!lineCell) {
+      continue;
+    }
+
+    const lineNumber = lineNumberFromText(lineCell.querySelector("[data-line-num]")?.textContent);
 
     if (!lineNumber || !lineIsInRange(lineNumber, range)) {
       continue;
     }
 
-    row
-      .querySelectorAll("td")
-      .forEach((cell) => cell.classList.add("peers-comment-range-highlight"));
+    addRangeDecoration(lineCell, "peers-comment-range-rail");
   }
 }
 
@@ -295,10 +317,46 @@ function highlightUnifiedRange(container: HTMLElement, range: SelectedRange) {
       continue;
     }
 
-    row
-      .querySelectorAll(".diff-line-num, .diff-line-content")
-      .forEach((cell) => cell.classList.add("peers-comment-range-highlight"));
+    const lineCell = row.querySelector<HTMLElement>(".diff-line-num");
+
+    if (lineCell) {
+      addRangeDecoration(lineCell, "peers-comment-range-rail");
+    }
   }
+}
+
+function highlightRangeCommentBox(container: HTMLElement, range: SelectedRange) {
+  const lineKey = `${range.endLine}-extend`;
+  const sideClass = range.side === "old" ? "old" : "new";
+  const sideSpecificTargets = container.querySelectorAll<HTMLElement>(
+    [
+      `tr[data-line="${lineKey}"][data-side="${range.side}"] .diff-line-extend-wrapper`,
+      `div[data-line="${lineKey}"][data-side="${range.side}"] .diff-line-extend-wrapper`,
+      `.diff-line-extend-wrapper[data-line="${range.endLine}-extend-content"][data-side="${range.side}"]`,
+      `tr[data-line="${lineKey}"] .diff-line-extend-${sideClass}-content`,
+      `div[data-line="${lineKey}"] .diff-line-extend-${sideClass}-content`,
+    ].join(","),
+  );
+
+  if (sideSpecificTargets.length > 0) {
+    sideSpecificTargets.forEach((target) => addRangeDecoration(target, "peers-comment-range-box"));
+    return;
+  }
+
+  for (const row of container.querySelectorAll<HTMLElement>(
+    `[data-line="${lineKey}"][data-state="extend"]`,
+  )) {
+    const wrappers = row.querySelectorAll<HTMLElement>(".diff-line-extend-wrapper");
+
+    if (wrappers.length === 1) {
+      addRangeDecoration(wrappers[0], "peers-comment-range-box");
+    }
+  }
+}
+
+function addRangeDecoration(element: HTMLElement, className: string) {
+  element.classList.add(className);
+  element.setAttribute("data-peers-range-decoration", "true");
 }
 
 function lineNumberFromText(value: string | null | undefined) {
@@ -345,8 +403,25 @@ type InlineThreadStackProps = {
 };
 
 function InlineThreadStack({ activeCommentId, threads }: InlineThreadStackProps) {
+  const hasRangeThread = threads.some(
+    (thread) =>
+      thread.scope === "line" &&
+      isMultiLineRange({
+        endLine: thread.anchor.endLine,
+        side: thread.anchor.side,
+        startLine: thread.anchor.startLine,
+      }),
+  );
+
   return (
-    <div className="space-y-3 bg-muted/30 p-3 font-sans">
+    <div
+      className={[
+        "space-y-3 bg-muted/30 p-3 font-sans",
+        hasRangeThread ? "peers-comment-range-content" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
       {threads.map((thread) => (
         <InlineCommentThread
           active={activeCommentId === thread.id}

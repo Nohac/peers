@@ -13,20 +13,26 @@ const allFilesSearchParam = z.preprocess(
 export const rootReviewSearchSchema = z
   .object({
     allFiles: allFilesSearchParam,
+    token: optionalSearchString,
+    vox: optionalSearchString,
   })
-  .catch({ allFiles: false });
+  .catch({ allFiles: false, token: undefined, vox: undefined });
 
 export const reviewSearchSchema = z
   .object({
     allFiles: allFilesSearchParam,
     comment: optionalSearchString,
+    token: optionalSearchString,
+    vox: optionalSearchString,
   })
-  .catch({ allFiles: false, comment: undefined });
+  .catch({ allFiles: false, comment: undefined, token: undefined, vox: undefined });
 
 export const fileReviewSearchSchema = z
   .object({
     allFiles: allFilesSearchParam,
     comment: optionalSearchString,
     path: z.preprocess((value) => (typeof value === "string" ? value : ""), z.string()),
+    token: optionalSearchString,
+    vox: optionalSearchString,
   })
-  .catch({ allFiles: false, comment: undefined, path: "" });
+  .catch({ allFiles: false, comment: undefined, path: "", token: undefined, vox: undefined });

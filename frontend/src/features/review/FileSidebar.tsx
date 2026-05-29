@@ -69,14 +69,26 @@ function FileSidebarLink({ allFiles, file }: FileSidebarLinkProps) {
 
   if (!file.isChanged) {
     return (
-      <Link className={className} search={fullFileSearch({ allFiles, path: file.path })} to="/file">
+      <Link
+        className={className}
+        search={(previous) => ({
+          ...previous,
+          ...fullFileSearch({ allFiles, path: file.path }),
+        })}
+        to="/file"
+      >
         {content}
       </Link>
     );
   }
 
   return (
-    <Link className={className} hash={fileAnchorId(file.path)} search={{ allFiles }} to="/">
+    <Link
+      className={className}
+      hash={fileAnchorId(file.path)}
+      search={(previous) => ({ ...previous, allFiles })}
+      to="/"
+    >
       {content}
     </Link>
   );

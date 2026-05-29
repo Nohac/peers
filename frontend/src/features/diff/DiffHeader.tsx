@@ -43,7 +43,10 @@ export function DiffHeader({ allFiles, file, threads }: DiffHeaderProps) {
           ) : null}
           <Link
             className="inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs no-underline hover:bg-accent"
-            search={fullFileSearch({ allFiles, comment: firstThread?.id, path: file.path })}
+            search={(previous) => ({
+              ...previous,
+              ...fullFileSearch({ allFiles, comment: firstThread?.id, path: file.path }),
+            })}
             to="/file"
           >
             <PanelTopOpen className="size-3.5" />

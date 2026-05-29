@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearch } from "@tanstack/react-router";
 import {
   connectPeersReview,
   type ApiCommentThread,
@@ -96,7 +97,7 @@ export type CommentThread = {
 };
 
 let latestPayload: ReviewPayload = emptyReviewPayload();
-let clientPromise: Promise<PeersReviewClient> | undefined;
+const clientPromises = new Map<string, Promise<PeersReviewClient>>();
 
 export function diffForPath(path: string) {
   return latestPayload.fileDiffsByPath[path];
@@ -146,11 +147,12 @@ export function useThreadsForFile(path: string) {
 
 export function useReviewCommentActions() {
   const queryClient = useQueryClient();
+  const config = usePeersConfig();
   const mutation = useMutation({
     mutationFn: async (operation: CommentOperation) => {
-      const config = requirePeersConfig();
-      const client = await peersClient(config);
-      const result = await runCommentOperation(client, config.token, operation);
+      const requiredConfig = requirePeersConfig(config);
+      const client = await peersClient(requiredConfig);
+      const result = await runCommentOperation(client, requiredConfig.token, operation);
 
       if (!result.ok) {
         throw new Error(result.error);
@@ -160,7 +162,7 @@ export function useReviewCommentActions() {
     },
     onSuccess: (payload) => {
       latestPayload = payload;
-      queryClient.setQueryData(reviewQueryKey(requirePeersConfig()), payload);
+      queryClient.setQueryData(reviewQueryKey(requirePeersConfig(config)), payload);
     },
   });
 
@@ -209,13 +211,13 @@ export function useReviewCommentActions() {
 }
 
 function useReviewPayload() {
-  const config = currentPeersConfig();
+  const config = usePeersConfig();
   const query = useQuery({
     enabled: config !== undefined,
     queryKey: reviewQueryKey(config),
     queryFn: async () => {
-      const config = requirePeersConfig();
-      const result = await (await peersClient(config)).getReview(config.token);
+      const requiredConfig = requirePeersConfig(config);
+      const result = await (await peersClient(requiredConfig)).getReview(requiredConfig.token);
 
       if (!result.ok) {
         throw new Error(result.error);
@@ -395,8 +397,14 @@ function mapRecord<T, U>(map: Map<string, T> | Record<string, T>, transform: (va
 }
 
 function peersClient(config: PeersConfig) {
-  clientPromise ??= connectPeersReview(config.voxUrl);
-  return clientPromise;
+  const existingClient = clientPromises.get(config.voxUrl);
+  if (existingClient) {
+    return existingClient;
+  }
+
+  const client = connectPeersReview(config.voxUrl);
+  clientPromises.set(config.voxUrl, client);
+  return client;
 }
 
 type PeersConfig = {
@@ -404,14 +412,10 @@ type PeersConfig = {
   voxUrl: string;
 };
 
-function currentPeersConfig(): PeersConfig | undefined {
-  if (typeof window === "undefined") {
-    return undefined;
-  }
-
-  const params = new URLSearchParams(window.location.search);
-  const voxUrl = params.get("vox");
-  const token = params.get("token");
+function usePeersConfig(): PeersConfig | undefined {
+  const search = useSearch({ from: "__root__" });
+  const voxUrl = search.vox;
+  const token = search.token;
 
   if (!voxUrl || !token) {
     return undefined;
@@ -420,8 +424,7 @@ function currentPeersConfig(): PeersConfig | undefined {
   return { token, voxUrl };
 }
 
-function requirePeersConfig() {
-  const config = currentPeersConfig();
+function requirePeersConfig(config: PeersConfig | undefined) {
   if (!config) {
     throw new Error("Open Peers from the URL printed by `peers diff` or `peers review`.");
   }

@@ -7,8 +7,8 @@ import { useReviewFiles, useThreads } from "./reviewData";
 
 export function ReviewShell() {
   const [quickAccessOpen, setQuickAccessOpen] = useState(false);
-  const search = useSearch({ strict: false }) as { allFiles?: boolean };
-  const allFiles = search.allFiles ?? false;
+  const search = useSearch({ from: "__root__" });
+  const allFiles = search.allFiles;
   const files = useReviewFiles({ includeUnchangedFiles: allFiles });
   const threads = useThreads();
 

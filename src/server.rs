@@ -39,7 +39,7 @@ impl LocalServer {
 
     pub fn frontend_url(&self) -> String {
         format!(
-            "http://127.0.0.1:3000/?vox={}&token={}",
+            "http://localhost:3000/?vox={}&token={}",
             self.vox_url(),
             self.token
         )

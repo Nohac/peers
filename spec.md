@@ -865,26 +865,26 @@ Current status:
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Project rename to Peers | Complete | CLI/package/docs use `peers`, `.peers`, and `PEERS_*`. |
-| CLI skeleton | Partial | Commands exist, but UI launch and full backend behavior are not wired. |
-| Review storage/event log | Partial | Append-only JSONL storage exists for initial review/comment flows. |
-| Author detection and overrides | Partial | Git config, CLI flags, and `PEERS_*` env vars are implemented. |
-| CLI comment operations | Partial | Add/reply/edit/delete/resolve/reopen plumbing exists, but invalidation semantics are not complete. |
-| Generated review and agent context files | Partial | Basic generated files exist; file-level/review-level comments and invalidation rules still need coverage. |
-| Git diff loading | Planned | Current frontend uses sample diff data. |
+| CLI skeleton | Partial | Commands exist and review UI launch starts the local Vox server; browser auto-open and packaging polish remain. |
+| Review storage/event log | Partial | Append-only JSONL storage exists for review/comment/file-viewed/submit flows. |
+| Author detection and overrides | Complete | Git config, CLI flags, `PEERS_*` env vars, and agent fallback identity are implemented. |
+| CLI comment operations | Partial | Add/reply/edit/delete/resolve/reopen plumbing exists for line comments; file/review-level CLI creation is not implemented. |
+| Generated review and agent context files | Partial | Basic generated files exist and replay hides invalidated dependent activity; richer file/review-level coverage still needs polish. |
+| Git diff loading | Partial | Working tree, cached, all-changes, and branch targets load real Git diffs into the compact payload. This currently shells out to `git` for diff data rather than using `gix` end-to-end. |
 | Arborium highlighting | Planned | Not implemented. |
-| Vox RPC service | Planned | Not implemented. |
-| Review workspace layout | Partial | Toolbar, sidebar, diff surface, full-file route, and quick access exist. |
-| Frontend review payload shape | Partial | Sample data is normalized into file metadata, per-path file content, compact per-path diff section ranges, and threads; it is still local mock data, not server-provided. |
-| Inline comments in diff/full-file views | Partial | Shared full-width line/comment renderer exists for non-side-by-side diffs and full-file views; side-by-side comments still use separate layout, and composer/persistence are not wired. |
-| File-level comments | Planned | Specified as `Comment on this file`; button exists as an affordance only. |
+| Vox RPC service | Partial | Local WebSocket service exposes review load, refresh, comment mutations, viewed files, and submit review; dev UI consumes generated TypeScript client. |
+| Review workspace layout | Partial | Toolbar, sidebar, diff surface, full-file route, quick access, sticky diff headers, and empty-diff state exist. Conversation/Commits tabs are still missing. |
+| Frontend review payload shape | Complete | Frontend consumes server-provided files, per-path file content, per-path compact diffs, and thread data through TanStack Query. |
+| Inline comments in diff/full-file views | Partial | `git-diff-view` renders real diffs with inline composers, persisted threads, multi-line selection, and range rails. Full-file comments still rely on the current full-file route behavior rather than the same library surface. |
+| File-level comments | Partial | `Comment on this file` creates persisted file-level threads; broader Conversation/quick-access treatment still needs completion. |
 | Review-level comments | Planned | Specified for the `Conversation` tab; not implemented. |
 | Conversation tab | Planned | Specified as all-comments timeline; not implemented. |
 | Commits tab | Planned | Specified for branch/range reviews; not implemented. |
 | File sidebar path grouping/collapse | Planned | Current sidebar remains a flat list. |
-| Full-file persistent sidebar | Partial | Full-file route keeps the sidebar visible and reuses the full-width line/comment renderer, but current-file highlighting is not complete. |
+| Full-file persistent sidebar | Partial | Full-file route keeps the sidebar visible and can show full file content; current-file highlighting and full-file parity still need work. |
 | Unchanged-file toggle | Partial | Toggle and routing exist; behavior still needs verification against all routes. |
-| Quick access menu | Partial | File/comment search exists for current sample data; review/file/review-level scopes are not complete. |
-| Comment card presentation | Partial | Inline cards exist, but date/time, agent icon, edit state, and invalidation warning behavior are not complete. |
+| Quick access menu | Partial | File/comment search exists against live review data; review/file/review-level scope navigation is not complete. |
+| Comment card presentation | Partial | Inline cards, edit/delete warnings, resolve/reopen, and agent identity display exist; finer timestamp/icon polish remains. |
 | Packaging embedded frontend assets | Planned | Not implemented. |
 
 ## Implementation Order

@@ -176,6 +176,7 @@ pre {
 .peers-git-diff-view {
   --diff-add-widget--: var(--primary);
   --diff-add-widget-color--: var(--primary-foreground);
+  --peers-comment-range-rail: oklch(0.56 0.19 257);
 }
 
 .peers-git-diff-view .diff-line-old-num,
@@ -184,9 +185,10 @@ pre {
   cursor: ns-resize;
 }
 
-.peers-git-diff-view .peers-comment-range-highlight {
-  background-color: color-mix(in oklch, var(--ring) 28%, transparent) !important;
-  box-shadow: inset 3px 0 0 var(--ring);
+.peers-git-diff-view .diff-line-extend-wrapper:has(.peers-comment-range-content),
+.peers-git-diff-view .peers-comment-range-box,
+.peers-git-diff-view .peers-comment-range-rail {
+  box-shadow: inset 3px 0 0 var(--peers-comment-range-rail);
 }
 
 .peers-git-diff-view .diff-line-widget-wrapper td,
