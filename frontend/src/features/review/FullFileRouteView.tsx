@@ -1,4 +1,4 @@
-import { FullFileView } from "../diff/FullFileView";
+import { GitDiffView } from "../diff/GitDiffView";
 import { FileSidebar } from "./FileSidebar";
 import { useReviewFile, useReviewFiles, useThreadsForFile } from "./reviewData";
 
@@ -24,7 +24,13 @@ export function FullFileRouteView({ path, activeCommentId, allFiles }: FullFileR
           </div>
         </header>
         <div className="p-4">
-          <FullFileView activeCommentId={activeCommentId} file={file} threads={fileThreads} />
+          <GitDiffView
+            activeCommentId={activeCommentId}
+            expandAllContext
+            file={file}
+            mode="unified"
+            threads={fileThreads}
+          />
         </div>
       </section>
     </div>

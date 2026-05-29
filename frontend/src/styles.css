@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "@git-diff-view/react/styles/diff-view.css";
 @plugin '@tailwindcss/typography';
 @import "tw-animate-css";
 
@@ -170,4 +171,25 @@ pre {
   * {
     @apply border-border outline-ring/50;
   }
+}
+
+.peers-git-diff-view {
+  --diff-add-widget--: var(--primary);
+  --diff-add-widget-color--: var(--primary-foreground);
+}
+
+.peers-git-diff-view .diff-line-old-num,
+.peers-git-diff-view .diff-line-new-num,
+.peers-git-diff-view .diff-line-num {
+  cursor: ns-resize;
+}
+
+.peers-git-diff-view .peers-comment-range-highlight {
+  background-color: color-mix(in oklch, var(--ring) 28%, transparent) !important;
+  box-shadow: inset 3px 0 0 var(--ring);
+}
+
+.peers-git-diff-view .diff-line-widget-wrapper td,
+.peers-git-diff-view .diff-line-extend-wrapper td {
+  padding: 0;
 }
