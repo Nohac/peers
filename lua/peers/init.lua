@@ -1,10 +1,12 @@
 local buffer = require("peers.buffer")
+local lsp_proxy = require("peers.lsp_proxy")
 local session = require("peers.session")
 
 local M = {}
 
 local AUGROUP = "peers-nvim-session"
 local COMMAND_REVIEW = "PeersReview"
+local COMMAND_COMMENT = "PeersComment"
 local COMMAND_STOP = "PeersStop"
 
 local defaults = {
@@ -28,6 +30,10 @@ local function define_commands()
   vim.api.nvim_create_user_command(COMMAND_STOP, function()
     session.stop()
   end, {})
+
+  vim.api.nvim_create_user_command(COMMAND_COMMENT, function()
+    buffer.comment_current()
+  end, {})
 end
 
 local function define_autocmds()
@@ -49,6 +55,7 @@ function M.setup(opts)
 
   define_commands()
   define_autocmds()
+  lsp_proxy.setup()
 end
 
 function M.review(opts)

@@ -3,6 +3,8 @@ local M = {}
 local PEERS_LSP_NAME = "peersdiff"
 local LOOPBACK_HOST = "127.0.0.1"
 local RENDER_METHOD = "peers/renderReview"
+local CREATE_THREAD_METHOD = "peers/createThread"
+local COMMAND_ADD_COMMENT = "peers.addComment"
 local INVALID_LSP_URL_ERROR = "Invalid nvim_lsp_url: "
 local RENDER_READY_TIMEOUT = 5000
 local RENDER_READY_INTERVAL = 50
@@ -40,6 +42,12 @@ function M.attach(buf, root, session)
     cmd = vim.lsp.rpc.connect(LOOPBACK_HOST, port),
     root_dir = root,
     peers_port = port,
+    commands = {
+      [COMMAND_ADD_COMMENT] = function(command, context)
+        local anchor = command.arguments and command.arguments[1] or nil
+        require("peers.buffer").comment_current(context and context.bufnr or nil, anchor)
+      end,
+    },
   }, {
     bufnr = buf,
     reuse_client = function(client, config)
@@ -88,6 +96,21 @@ function M.render_now(client_id, buf, on_render)
   end
 
   request_render(client, buf, on_render)
+end
+
+function M.create_thread(client_id, buf, request, on_render)
+  local client = vim.lsp.get_client_by_id(client_id)
+  if not client then
+    return
+  end
+
+  client:request(CREATE_THREAD_METHOD, request, function(error, result)
+    if error then
+      vim.notify(error.message or tostring(error), vim.log.levels.ERROR)
+      return
+    end
+    on_render(result)
+  end, buf)
 end
 
 return M

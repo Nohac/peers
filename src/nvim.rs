@@ -6,9 +6,9 @@ use tower_lsp_server::jsonrpc::{Error as LspError, Result as LspResult};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
-use crate::diff::{DiffSection, LineRange};
-use crate::review_provider::ApiReviewPayload;
+use crate::diff::{DiffSection, FileSide, LineRange};
 use crate::review_provider::ReviewProvider;
+use crate::review_provider::{ApiCommentThread, ApiReviewPayload, CreateThreadRequest};
 
 const LOOPBACK_BIND_HOST: &str = "127.0.0.1";
 const LOCALHOST: &str = "localhost";
@@ -25,6 +25,10 @@ const FILES_LABEL: &str = "Files";
 const THREADS_LABEL: &str = "Threads";
 const TOTAL_THREADS_LABEL: &str = "total";
 const UNRESOLVED_THREADS_LABEL: &str = "unresolved";
+const THREAD_SCOPE_LINE: &str = "line";
+const THREAD_SCOPE_FILE: &str = "file";
+const COMMENT_STATE_RESOLVED: &str = "resolved";
+const COMMENT_STATE_UNRESOLVED: &str = "unresolved";
 const CURSOR_LABEL: &str = "Cursor";
 const LINE_LABEL: &str = "line";
 const COLUMN_LABEL: &str = "column";
@@ -37,18 +41,33 @@ const OLD_LINES_LABEL: &str = "old lines";
 
 const COMMAND_ADD_COMMENT: &str = "peers.addComment";
 const COMMAND_REPLY: &str = "peers.reply";
+const COMMAND_EDIT_COMMENT: &str = "peers.editComment";
 const COMMAND_RESOLVE_THREAD: &str = "peers.resolveThread";
+const COMMAND_REOPEN_THREAD: &str = "peers.reopenThread";
 const COMMAND_MARK_VIEWED: &str = "peers.markViewed";
 const COMMAND_SUBMIT_REVIEW: &str = "peers.submitReview";
 const COMMAND_ASK_AGENT: &str = "peers.askAgent";
 
-const ACTION_ADD_COMMENT: &str = "Peers: Add comment";
+const ACTION_ADD_LINE_COMMENT: &str = "Peers: Add line comment";
+const ACTION_ADD_RANGE_COMMENT_PREFIX: &str = "Peers: Add comment on lines";
+const ACTION_ADD_FILE_COMMENT: &str = "Peers: Add comment on file";
 const ACTION_REPLY: &str = "Peers: Reply";
+const ACTION_EDIT_COMMENT: &str = "Peers: Edit comment";
 const ACTION_RESOLVE_THREAD: &str = "Peers: Resolve thread";
-const ACTION_MARK_VIEWED: &str = "Peers: Mark file viewed";
-const ACTION_SUBMIT_REVIEW: &str = "Peers: Submit review";
-const ACTION_ASK_AGENT: &str = "Peers: Ask agent";
+const ACTION_REOPEN_THREAD: &str = "Peers: Reopen thread";
 const METHOD_RENDER_REVIEW: &str = "peers/renderReview";
+const METHOD_CREATE_THREAD: &str = "peers/createThread";
+const PARAM_SCOPE: &str = "scope";
+const PARAM_PATH: &str = "path";
+const PARAM_SIDE: &str = "side";
+const PARAM_START_LINE: &str = "start_line";
+const PARAM_END_LINE: &str = "end_line";
+const PARAM_BODY: &str = "body";
+const PARAM_THREAD_ID: &str = "thread_id";
+const PARAM_COMMENT_ID: &str = "comment_id";
+const LSP_INVALID_PARAMS: &str = "invalid Peers request params";
+const LSP_MISSING_FIELD: &str = "missing field";
+const LSP_INVALID_FIELD: &str = "invalid field";
 
 const ROW_KIND_FILE_HEADER: &str = "file_header";
 const ROW_KIND_HUNK_HEADER: &str = "hunk_header";
@@ -155,6 +174,16 @@ impl PeersDiffLanguageServer {
             .map_err(|_| LspError::internal_error())?;
         Ok(render_review_payload(review).into_lsp())
     }
+
+    async fn create_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = create_thread_request(&params)?;
+        let review = self
+            .provider
+            .create_thread(request)
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        Ok(render_review_payload(review).into_lsp())
+    }
 }
 
 impl LanguageServer for PeersDiffLanguageServer {
@@ -177,7 +206,9 @@ impl LanguageServer for PeersDiffLanguageServer {
                     commands: vec![
                         COMMAND_ADD_COMMENT.to_string(),
                         COMMAND_REPLY.to_string(),
+                        COMMAND_EDIT_COMMENT.to_string(),
                         COMMAND_RESOLVE_THREAD.to_string(),
+                        COMMAND_REOPEN_THREAD.to_string(),
                         COMMAND_MARK_VIEWED.to_string(),
                         COMMAND_SUBMIT_REVIEW.to_string(),
                         COMMAND_ASK_AGENT.to_string(),
@@ -226,39 +257,14 @@ impl LanguageServer for PeersDiffLanguageServer {
         Ok(None)
     }
 
-    async fn code_action(&self, _: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
-        Ok(Some(vec![
-            CodeActionOrCommand::Command(Command::new(
-                ACTION_ADD_COMMENT.to_string(),
-                COMMAND_ADD_COMMENT.to_string(),
-                None,
-            )),
-            CodeActionOrCommand::Command(Command::new(
-                ACTION_REPLY.to_string(),
-                COMMAND_REPLY.to_string(),
-                None,
-            )),
-            CodeActionOrCommand::Command(Command::new(
-                ACTION_RESOLVE_THREAD.to_string(),
-                COMMAND_RESOLVE_THREAD.to_string(),
-                None,
-            )),
-            CodeActionOrCommand::Command(Command::new(
-                ACTION_MARK_VIEWED.to_string(),
-                COMMAND_MARK_VIEWED.to_string(),
-                None,
-            )),
-            CodeActionOrCommand::Command(Command::new(
-                ACTION_SUBMIT_REVIEW.to_string(),
-                COMMAND_SUBMIT_REVIEW.to_string(),
-                None,
-            )),
-            CodeActionOrCommand::Command(Command::new(
-                ACTION_ASK_AGENT.to_string(),
-                COMMAND_ASK_AGENT.to_string(),
-                None,
-            )),
-        ]))
+    async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
+        let review = self
+            .provider
+            .get_review()
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        let rendered = render_review_payload(review);
+        Ok(Some(code_actions_for_range(&rendered, params.range)))
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<LSPAny>> {
@@ -307,6 +313,7 @@ async fn serve_lsp_connection(stream: TcpStream, provider: ReviewProvider) -> Re
     let (service, socket) =
         LspService::build(|client| PeersDiffLanguageServer::new(client, provider.clone()))
             .custom_method(METHOD_RENDER_REVIEW, PeersDiffLanguageServer::render_review)
+            .custom_method(METHOD_CREATE_THREAD, PeersDiffLanguageServer::create_thread)
             .finish();
     Server::new(read, write, socket).serve(service).await;
     Ok(())
@@ -367,16 +374,24 @@ struct RenderedRow {
     side: Option<&'static str>,
     source_line: Option<u32>,
     code_start_col: Option<u32>,
+    thread_id: Option<String>,
+    comment_id: Option<String>,
+    can_edit: Option<bool>,
+    resolved: Option<bool>,
 }
 
 impl RenderedRow {
-    fn meta(kind: &'static str) -> Self {
+    fn file_meta(kind: &'static str, path: &str) -> Self {
         Self {
             kind,
-            path: None,
+            path: Some(path.to_string()),
             side: None,
             source_line: None,
             code_start_col: None,
+            thread_id: None,
+            comment_id: None,
+            can_edit: None,
+            resolved: None,
         }
     }
 
@@ -387,6 +402,28 @@ impl RenderedRow {
             side: Some(side),
             source_line: Some(source_line),
             code_start_col: Some(LINE_PREFIX_WIDTH),
+            thread_id: None,
+            comment_id: None,
+            can_edit: None,
+            resolved: None,
+        }
+    }
+
+    fn comment(thread: &ApiCommentThread, comment_id: &str) -> Self {
+        Self {
+            kind: ROW_KIND_COMMENT,
+            path: thread.path.clone(),
+            side: thread.anchor.side.as_deref().and_then(rendered_side_name),
+            source_line: thread.anchor.end_line,
+            code_start_col: None,
+            thread_id: Some(thread.id.clone()),
+            comment_id: Some(comment_id.to_string()),
+            can_edit: thread
+                .comments
+                .iter()
+                .find(|comment| comment.id == comment_id)
+                .map(|comment| comment.can_edit),
+            resolved: Some(thread.resolved),
         }
     }
 
@@ -404,6 +441,18 @@ impl RenderedRow {
         }
         if let Some(code_start_col) = self.code_start_col {
             object.insert("code_start_col".to_string(), lsp_number(code_start_col));
+        }
+        if let Some(thread_id) = self.thread_id {
+            object.insert("thread_id".to_string(), LSPAny::String(thread_id));
+        }
+        if let Some(comment_id) = self.comment_id {
+            object.insert("comment_id".to_string(), LSPAny::String(comment_id));
+        }
+        if let Some(can_edit) = self.can_edit {
+            object.insert("can_edit".to_string(), LSPAny::Bool(can_edit));
+        }
+        if let Some(resolved) = self.resolved {
+            object.insert("resolved".to_string(), LSPAny::Bool(resolved));
         }
         LSPAny::Object(object)
     }
@@ -452,7 +501,7 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                 "{FILE_HEADER_PREFIX}{}  {:?}  +{} -{}",
                 file.path, file.status, file.added_lines, file.removed_lines
             ),
-            RenderedRow::meta(ROW_KIND_FILE_HEADER),
+            RenderedRow::file_meta(ROW_KIND_FILE_HEADER, &file.path),
         );
         rendered.push_highlight(
             file_line,
@@ -474,11 +523,18 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
             continue;
         };
         let content = review.file_contents_by_path.get(&file.path);
+        let file_threads: Vec<_> = review
+            .threads
+            .iter()
+            .filter(|thread| thread.path.as_deref() == Some(file.path.as_str()))
+            .collect();
 
         for hunk in &diff.hunks {
             let hunk_text = hunk_header(hunk.old, hunk.new);
-            let hunk_line =
-                rendered.push_line(hunk_text.clone(), RenderedRow::meta(ROW_KIND_HUNK_HEADER));
+            let hunk_line = rendered.push_line(
+                hunk_text.clone(),
+                RenderedRow::file_meta(ROW_KIND_HUNK_HEADER, &file.path),
+            );
             rendered.push_highlight(hunk_line, 0, hunk_text.len() as u32, HIGHLIGHT_HUNK_HEADER);
             rendered.symbols.push(RenderedSymbol {
                 name: hunk_symbol_name(hunk.new, hunk.old),
@@ -507,6 +563,13 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 " ",
                                 text,
                             );
+                            push_inline_threads(
+                                &mut rendered,
+                                &file_threads,
+                                &file.path,
+                                SIDE_NEW,
+                                line,
+                            );
                         }
                     }
                     DiffSection::Added { added } => {
@@ -524,6 +587,13 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 Some(line),
                                 "+",
                                 text,
+                            );
+                            push_inline_threads(
+                                &mut rendered,
+                                &file_threads,
+                                &file.path,
+                                SIDE_NEW,
+                                line,
                             );
                         }
                     }
@@ -543,33 +613,25 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 "-",
                                 text,
                             );
+                            push_inline_threads(
+                                &mut rendered,
+                                &file_threads,
+                                &file.path,
+                                SIDE_OLD,
+                                line,
+                            );
                         }
                     }
                 }
             }
         }
 
-        for thread in review
-            .threads
+        for thread in file_threads
             .iter()
-            .filter(|thread| thread.path.as_deref() == Some(file.path.as_str()))
+            .copied()
+            .filter(|thread| thread.scope == THREAD_SCOPE_FILE)
         {
-            let Some(comment) = thread.comments.first() else {
-                continue;
-            };
-            let state = if thread.resolved {
-                "resolved"
-            } else {
-                "unresolved"
-            };
-            let comment_line = format!(
-                "{COMMENT_PREFIX}[{state}] {}: {}",
-                comment.author_name,
-                first_line(&comment.body)
-            );
-            let line =
-                rendered.push_line(comment_line.clone(), RenderedRow::meta(ROW_KIND_COMMENT));
-            rendered.push_highlight(line, 0, comment_line.len() as u32, HIGHLIGHT_COMMENT);
+            push_thread_comments(&mut rendered, thread);
         }
 
         let end_line = rendered.lines.len().saturating_sub(1) as u32;
@@ -630,6 +692,252 @@ fn push_source_line(
         _ => HIGHLIGHT_LINE_NUMBER,
     };
     rendered.push_highlight(line, 12, 13, gutter_group);
+}
+
+fn push_inline_threads(
+    rendered: &mut RenderedReview,
+    threads: &[&ApiCommentThread],
+    path: &str,
+    side: &str,
+    line: u32,
+) {
+    for thread in threads
+        .iter()
+        .copied()
+        .filter(|thread| thread_matches_line(thread, path, side, line))
+    {
+        push_thread_comments(rendered, thread);
+    }
+}
+
+fn thread_matches_line(thread: &ApiCommentThread, path: &str, side: &str, line: u32) -> bool {
+    thread.scope == THREAD_SCOPE_LINE
+        && thread.path.as_deref() == Some(path)
+        && thread.anchor.side.as_deref() == Some(side)
+        && thread.anchor.end_line == Some(line)
+}
+
+fn push_thread_comments(rendered: &mut RenderedReview, thread: &ApiCommentThread) {
+    let state = if thread.resolved {
+        COMMENT_STATE_RESOLVED
+    } else {
+        COMMENT_STATE_UNRESOLVED
+    };
+
+    for comment in &thread.comments {
+        let comment_line = format!(
+            "{COMMENT_PREFIX}[{state}] {}: {}",
+            comment.author_name,
+            first_line(&comment.body)
+        );
+        let line = rendered.push_line(
+            comment_line.clone(),
+            RenderedRow::comment(thread, &comment.id),
+        );
+        rendered.push_highlight(line, 0, comment_line.len() as u32, HIGHLIGHT_COMMENT);
+    }
+}
+
+fn code_actions_for_range(rendered: &RenderedReview, range: Range) -> CodeActionResponse {
+    let mut actions = Vec::new();
+    let start_row = row_at(rendered, range.start.line);
+
+    if let Some(row) = start_row
+        && row.kind == ROW_KIND_COMMENT
+    {
+        actions.extend(comment_row_actions(row));
+    }
+
+    if let Some(anchor) = line_comment_anchor(rendered, range) {
+        let title = if anchor.start_line == anchor.end_line {
+            ACTION_ADD_LINE_COMMENT.to_string()
+        } else {
+            format!(
+                "{ACTION_ADD_RANGE_COMMENT_PREFIX} {}..{}",
+                anchor.start_line, anchor.end_line
+            )
+        };
+        actions.push(command_action(
+            title,
+            COMMAND_ADD_COMMENT,
+            Some(vec![line_anchor_arg(&anchor)]),
+        ));
+    }
+
+    if let Some(path) = file_context_path(start_row) {
+        actions.push(command_action(
+            ACTION_ADD_FILE_COMMENT.to_string(),
+            COMMAND_ADD_COMMENT,
+            Some(vec![file_anchor_arg(path)]),
+        ));
+    }
+
+    actions
+}
+
+fn comment_row_actions(row: &RenderedRow) -> CodeActionResponse {
+    let mut actions = Vec::new();
+    if let Some(thread_id) = &row.thread_id {
+        actions.push(command_action(
+            ACTION_REPLY.to_string(),
+            COMMAND_REPLY,
+            Some(vec![thread_arg(thread_id)]),
+        ));
+        if row.resolved.unwrap_or(false) {
+            actions.push(command_action(
+                ACTION_REOPEN_THREAD.to_string(),
+                COMMAND_REOPEN_THREAD,
+                Some(vec![thread_arg(thread_id)]),
+            ));
+        } else {
+            actions.push(command_action(
+                ACTION_RESOLVE_THREAD.to_string(),
+                COMMAND_RESOLVE_THREAD,
+                Some(vec![thread_arg(thread_id)]),
+            ));
+        }
+    }
+    if row.can_edit.unwrap_or(false)
+        && let Some(comment_id) = &row.comment_id
+    {
+        actions.push(command_action(
+            ACTION_EDIT_COMMENT.to_string(),
+            COMMAND_EDIT_COMMENT,
+            Some(vec![comment_arg(comment_id)]),
+        ));
+    }
+    actions
+}
+
+fn row_at(rendered: &RenderedReview, line: u32) -> Option<&RenderedRow> {
+    rendered.rows.get(line as usize)
+}
+
+#[derive(Debug)]
+struct LineCommentAnchor<'a> {
+    path: &'a str,
+    side: &'static str,
+    start_line: u32,
+    end_line: u32,
+}
+
+fn line_comment_anchor(rendered: &RenderedReview, range: Range) -> Option<LineCommentAnchor<'_>> {
+    let start = range.start.line.min(range.end.line);
+    let end = normalized_range_end(range);
+    if end < start {
+        return None;
+    }
+    let mut path = None;
+    let mut side = None;
+    let mut start_line: Option<u32> = None;
+    let mut end_line: Option<u32> = None;
+
+    for row_index in start..=end {
+        let row = row_at(rendered, row_index)?;
+        if !row_is_source(row) {
+            return None;
+        }
+        let source_line = row.source_line?;
+        let row_path = row.path.as_deref()?;
+        let row_side = row.side?;
+
+        if let Some(path) = path {
+            if path != row_path {
+                return None;
+            }
+        } else {
+            path = Some(row_path);
+        }
+
+        if let Some(side) = side {
+            if side != row_side {
+                return None;
+            }
+        } else {
+            side = Some(row_side);
+        }
+
+        start_line = Some(start_line.map_or(source_line, |line| line.min(source_line)));
+        end_line = Some(end_line.map_or(source_line, |line| line.max(source_line)));
+    }
+
+    Some(LineCommentAnchor {
+        path: path?,
+        side: side?,
+        start_line: start_line?,
+        end_line: end_line?,
+    })
+}
+
+fn row_is_source(row: &RenderedRow) -> bool {
+    matches!(row.kind, ROW_KIND_CONTEXT | ROW_KIND_ADD | ROW_KIND_DELETE)
+}
+
+fn normalized_range_end(range: Range) -> u32 {
+    if range.end.character == 0 && range.end.line > range.start.line {
+        range.end.line - 1
+    } else {
+        range.end.line
+    }
+}
+
+fn file_context_path(row: Option<&RenderedRow>) -> Option<&str> {
+    row.and_then(|row| row.path.as_deref())
+}
+
+fn command_action(
+    title: String,
+    command: &str,
+    arguments: Option<Vec<LSPAny>>,
+) -> CodeActionOrCommand {
+    CodeActionOrCommand::Command(Command::new(title, command.to_string(), arguments))
+}
+
+fn line_anchor_arg(anchor: &LineCommentAnchor<'_>) -> LSPAny {
+    let mut object = LSPObject::new();
+    object.insert(
+        PARAM_SCOPE.to_string(),
+        LSPAny::String(THREAD_SCOPE_LINE.to_string()),
+    );
+    object.insert(
+        PARAM_PATH.to_string(),
+        LSPAny::String(anchor.path.to_string()),
+    );
+    object.insert(
+        PARAM_SIDE.to_string(),
+        LSPAny::String(anchor.side.to_string()),
+    );
+    object.insert(PARAM_START_LINE.to_string(), lsp_number(anchor.start_line));
+    object.insert(PARAM_END_LINE.to_string(), lsp_number(anchor.end_line));
+    LSPAny::Object(object)
+}
+
+fn file_anchor_arg(path: &str) -> LSPAny {
+    let mut object = LSPObject::new();
+    object.insert(
+        PARAM_SCOPE.to_string(),
+        LSPAny::String(THREAD_SCOPE_FILE.to_string()),
+    );
+    object.insert(PARAM_PATH.to_string(), LSPAny::String(path.to_string()));
+    LSPAny::Object(object)
+}
+
+fn thread_arg(thread_id: &str) -> LSPAny {
+    let mut object = LSPObject::new();
+    object.insert(
+        PARAM_THREAD_ID.to_string(),
+        LSPAny::String(thread_id.to_string()),
+    );
+    LSPAny::Object(object)
+}
+
+fn comment_arg(comment_id: &str) -> LSPAny {
+    let mut object = LSPObject::new();
+    object.insert(
+        PARAM_COMMENT_ID.to_string(),
+        LSPAny::String(comment_id.to_string()),
+    );
+    LSPAny::Object(object)
 }
 
 fn gutter_background_group(kind: &str) -> Option<&'static str> {
@@ -803,6 +1111,70 @@ fn source_text(lines: &[String], line: u32) -> Option<&str> {
 
 fn first_line(input: &str) -> &str {
     input.lines().next().unwrap_or(input)
+}
+
+fn create_thread_request(params: &LSPAny) -> LspResult<CreateThreadRequest> {
+    Ok(CreateThreadRequest {
+        scope: required_string_param(params, PARAM_SCOPE)?,
+        path: optional_string_param(params, PARAM_PATH)?,
+        side: optional_side_param(params, PARAM_SIDE)?,
+        start_line: optional_u32_param(params, PARAM_START_LINE)?,
+        end_line: optional_u32_param(params, PARAM_END_LINE)?,
+        body: required_string_param(params, PARAM_BODY)?,
+    })
+}
+
+fn required_string_param(params: &LSPAny, field: &str) -> LspResult<String> {
+    optional_string_param(params, field)?
+        .ok_or_else(|| LspError::invalid_params(format!("{LSP_MISSING_FIELD} `{field}`")))
+}
+
+fn optional_string_param(params: &LSPAny, field: &str) -> LspResult<Option<String>> {
+    match object_param(params)?.get(field) {
+        Some(LSPAny::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(invalid_field(field)),
+        None => Ok(None),
+    }
+}
+
+fn optional_u32_param(params: &LSPAny, field: &str) -> LspResult<Option<u32>> {
+    match object_param(params)?.get(field) {
+        Some(LSPAny::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| invalid_field(field)),
+        Some(_) => Err(invalid_field(field)),
+        None => Ok(None),
+    }
+}
+
+fn optional_side_param(params: &LSPAny, field: &str) -> LspResult<Option<FileSide>> {
+    match optional_string_param(params, field)?.as_deref() {
+        Some(SIDE_NEW) => Ok(Some(FileSide::New)),
+        Some(SIDE_OLD) => Ok(Some(FileSide::Old)),
+        Some(_) => Err(invalid_field(field)),
+        None => Ok(None),
+    }
+}
+
+fn rendered_side_name(side: &str) -> Option<&'static str> {
+    match side {
+        SIDE_NEW => Some(SIDE_NEW),
+        SIDE_OLD => Some(SIDE_OLD),
+        _ => None,
+    }
+}
+
+fn object_param(params: &LSPAny) -> LspResult<&LSPObject> {
+    match params {
+        LSPAny::Object(object) => Ok(object),
+        _ => Err(LspError::invalid_params(LSP_INVALID_PARAMS)),
+    }
+}
+
+fn invalid_field(field: &str) -> LspError {
+    LspError::invalid_params(format!("{LSP_INVALID_FIELD} `{field}`"))
 }
 
 fn lsp_number(value: u32) -> LSPAny {

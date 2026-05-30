@@ -40,11 +40,25 @@ local HIGHLIGHT_GROUPS = {
   PeersDiffFileHeader = { link = "Title" },
   PeersDiffHunkHeader = { link = "DiffChange" },
   PeersDiffLineNumber = { link = "LineNr" },
-  PeersDiffComment = { link = "Comment" },
 }
 local ROW_SIDE_NEW = "new"
+local ROW_SCOPE_LINE = "line"
+local ROW_SCOPE_FILE = "file"
 local ROW_KIND_ADD = "add"
 local ROW_KIND_CONTEXT = "context"
+local ROW_KIND_DELETE = "delete"
+local SOURCE_PROXY_UNAVAILABLE = "Peers source LSP proxy is only available on current-side added or context lines"
+local COMPOSER_TITLE = " Peers comment "
+local COMPOSER_FILETYPE = "markdown"
+local COMPOSER_INITIAL_LINE = ""
+local COMPOSER_SUBMIT_MAP = "<C-s>"
+local COMPOSER_CANCEL_MAP = "q"
+local COMPOSER_HEIGHT = 7
+local COMPOSER_MIN_WIDTH = 40
+local COMPOSER_MAX_WIDTH = 88
+local COMPOSER_GUTTER_COL = 14
+local COMMENT_EMPTY_MESSAGE = "Peers comment is empty"
+local COMMENT_UNAVAILABLE_MESSAGE = "Peers comment is only available on diff lines for now"
 local MIRROR_DEBOUNCE_MS = 30
 local AUTOCMD_GROUP_PREFIX = "peers-review-source-"
 local AUTOCMD_EVENTS = {
@@ -157,6 +171,11 @@ local function define_diff_gutter_highlights()
     default = true,
     [HIGHLIGHT_BG] = delete_line_bg,
   })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffComment", {
+    default = true,
+    [HIGHLIGHT_FG] = normal_fg,
+    [HIGHLIGHT_BG] = blend_color(normal_fg, normal_bg, 0.08),
+  })
 end
 
 local function set_lines(buf, lines)
@@ -263,6 +282,31 @@ local function row_is_mirrorable(row)
     and (row.kind == ROW_KIND_ADD or row.kind == ROW_KIND_CONTEXT)
     and row.path
     and row.source_line
+end
+
+local function row_is_proxyable(row)
+  return row_is_mirrorable(row)
+end
+
+local function row_is_commentable(row)
+  return row
+    and row.path
+    and row.side
+    and row.source_line
+    and (row.kind == ROW_KIND_ADD or row.kind == ROW_KIND_CONTEXT or row.kind == ROW_KIND_DELETE)
+end
+
+local function source_for_proxy_row(state, row)
+  local source = state.source_lsp_buffers[row.path]
+  if source == nil then
+    source = source_buffer(state.root, row.path)
+    state.source_lsp_buffers[row.path] = source or false
+  end
+
+  if source == false then
+    return nil
+  end
+  return source
 end
 
 local function source_for_row(state, row)
@@ -388,22 +432,195 @@ local function setup_mirror_autocmds(buf)
   })
 end
 
-local function apply_render(root, buf, render)
+local apply_render
+
+local function close_composer(state)
+  if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+    vim.api.nvi_win_close(state.composer_win, true)
+  end
+  if state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf) then
+    vim.api.nvim_buf_delete(state.composer_buf, { force = true })
+  end
+  state.composer_win = nil
+  state.composer_buf = nil
+end
+
+local function composer_width(review_win)
+  local available = vim.api.nvim_win_get_width(review_win) - COMPOSER_GUTTER_COL - 2
+  return math.max(COMPOSER_MIN_WIDTH, math.min(COMPOSER_MAX_WIDTH, available))
+end
+
+local function composer_row()
+  local winline = vim.fn.winline()
+  if winline > COMPOSER_HEIGHT + 3 then
+    return winline - COMPOSER_HEIGHT - 2
+  end
+  return winline
+end
+
+local function composer_config(review_win)
+  return {
+    relative = "win",
+    win = review_win,
+    row = composer_row(),
+    col = COMPOSER_GUTTER_COL,
+    width = composer_width(review_win),
+    height = COMPOSER_HEIGHT,
+    border = "rounded",
+    title = COMPOSER_TITLE,
+    style = "minimal",
+  }
+end
+
+local function composer_body(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  return vim.trim(table.concat(lines, "\n"))
+end
+
+local function submit_composer(review_buf, row, draft_buf)
+  local state = RENDER_STATES[review_buf]
+  if not state then
+    return
+  end
+
+  local body = composer_body(draft_buf)
+  if body == "" then
+    vim.notify(COMMENT_EMPTY_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+
+  lsp.create_thread(state.client_id, review_buf, {
+    scope = row.scope or ROW_SCOPE_LINE,
+    path = row.path,
+    side = row.side,
+    start_line = row.start_line or row.source_line,
+    end_line = row.end_line or row.source_line,
+    body = body,
+  }, function(render)
+    close_composer(state)
+    apply_render(state.root, review_buf, render, state.client_id)
+  end)
+end
+
+local function open_composer(review_buf, row)
+  local state = RENDER_STATES[review_buf]
+  if not state then
+    return
+  end
+
+  close_composer(state)
+  local review_win = vim.api.nvim_get_current_win()
+  local draft_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[draft_buf].buftype = "nofile"
+  vim.bo[draft_buf].bufhidden = "wipe"
+  vim.bo[draft_buf].buflisted = false
+  vim.bo[draft_buf].swapfile = false
+  vim.bo[draft_buf].filetype = COMPOSER_FILETYPE
+  vim.api.nvim_buf_set_lines(draft_buf, 0, -1, false, { COMPOSER_INITIAL_LINE })
+
+  local draft_win = vim.api.nvim_open_win(draft_buf, true, composer_config(review_win))
+  state.composer_buf = draft_buf
+  state.composer_win = draft_win
+
+  vim.keymap.set({ "n", "i" }, COMPOSER_SUBMIT_MAP, function()
+    submit_composer(review_buf, row, draft_buf)
+  end, { buffer = draft_buf, nowait = true })
+  vim.keymap.set("n", COMPOSER_CANCEL_MAP, function()
+    close_composer(state)
+  end, { buffer = draft_buf, nowait = true })
+  vim.keymap.set("n", "<Esc>", function()
+    close_composer(state)
+  end, { buffer = draft_buf, nowait = true })
+
+  vim.cmd("startinsert")
+end
+
+function apply_render(root, buf, render, client_id)
   if not render or not render.lines then
     return
+  end
+
+  local existing = RENDER_STATES[buf]
+  if existing then
+    close_composer(existing)
   end
 
   set_lines(buf, render.lines)
   apply_structural_highlights(buf, render.highlights)
   RENDER_STATES[buf] = {
     root = root,
+    client_id = client_id,
     rows = render.rows or {},
     source_buffers = {},
+    source_lsp_buffers = {},
     source_segments = {},
     scheduled = false,
   }
   setup_mirror_autocmds(buf)
   mirror_visible_treesitter(buf)
+end
+
+function M.comment_current(buf, anchor)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+
+  if anchor and anchor.scope == ROW_SCOPE_FILE and anchor.path then
+    open_composer(buf, anchor)
+    return
+  end
+
+  if anchor and anchor.scope == ROW_SCOPE_LINE and anchor.path and anchor.side and anchor.start_line then
+    open_composer(buf, anchor)
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local row = state.rows[cursor[1]]
+  if not row_is_commentable(row) then
+    vim.notify(COMMENT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+
+  open_composer(buf, row)
+end
+
+function M.is_review_buffer(buf)
+  return RENDER_STATES[buf or vim.api.nvim_get_current_buf()] ~= nil
+end
+
+function M.source_location(buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return nil
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local row = state.rows[cursor[1]]
+  if not row_is_proxyable(row) then
+    return nil, SOURCE_PROXY_UNAVAILABLE
+  end
+
+  local source = source_for_proxy_row(state, row)
+  if not source then
+    return nil, SOURCE_PROXY_UNAVAILABLE
+  end
+
+  local source_row = row.source_line - 1
+  local source_text = vim.api.nvim_buf_get_lines(source, source_row, source_row + 1, false)[1] or ""
+  local source_col = math.max(0, cursor[2] - (row.code_start_col or 0))
+  source_col = math.min(source_col, #source_text)
+
+  return {
+    bufnr = source,
+    row = source_row,
+    col = source_col,
+    path = row.path,
+    source_line = row.source_line,
+  }
 end
 
 function M.open(root, review_id, session)
@@ -436,7 +653,7 @@ function M.open(root, review_id, session)
   local client_id = lsp.attach(buf, root, session)
   if client_id then
     lsp.render(client_id, buf, function(render)
-      apply_render(root, buf, render)
+      apply_render(root, buf, render, client_id)
     end)
   end
 end

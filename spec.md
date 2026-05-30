@@ -568,21 +568,23 @@ Expected behavior:
 - The review buffer should not appear in normal buffer lists or Telescope buffer pickers that respect `buflisted=false`.
 - The review buffer should be easy to reopen with `:PeersReview` and should remain usable through the jumplist where practical.
 - The buffer should render files, hunks, added/removed/context lines, inline threads, multiline range markers, file-level comments, review-level conversation entries, and compact unchanged-context placeholders.
+- File context labels, including file header rows and editor breadcrumb/document-symbol context, should include compact Git-style status markers such as `[A]`, `[D]`, `[R]`, `[M]`, `[U]`, or `[B]` for added, deleted, renamed, modified, unchanged, and binary files.
 - Peers owns the render model. The `peersdiff` LSP exposes a custom `peers/renderReview` request that returns synthetic lines, row metadata, structural highlights, and symbol metadata derived from the shared review provider.
 - The Lua attachment layer applies rendered lines and extmarks to the synthetic buffer, while Rust remains the source of truth for row semantics and review data.
 - Structural highlights cover file headers, hunk headers, line numbers, add/delete gutter markers, and comment rows. Prefer gutter/prefix color over full-line color unless a stronger visual treatment is required.
 - Current-side added and context rows should mirror Tree-sitter capture highlights from hidden real file buffers so the review buffer follows the user's Neovim theme and language setup. This mirroring must be viewport-scoped for performance on large reviews. Deleted/base-side rows may start with structural diff coloring only.
 - Do not depend on Neovim folds or persistent split sidebars for the primary workflow.
 - The review buffer remains read-only. Comment bodies are entered through a focused writable composer, such as a temporary floating buffer.
+- Neovim comment composers should use native editor primitives. The default composer is a writable floating scratch buffer anchored near the relevant review row; `<Enter>` should remain available for newlines, and submission should use an explicit mapping such as `<C-s>`.
 
 Peers should expose a `peersdiff` language server for this synthetic buffer. Use the `tower-lsp-server` crate from `tower-lsp-community/tower-lsp-server`, the maintained community fork of `tower-lsp`, unless a better maintained LSP server crate is chosen before implementation.
 
 The `peersdiff` LSP should let users keep their existing LSP mappings instead of defining Peers-specific replacements:
 
-- `textDocument/hover`: show Peers metadata for review rows and proxy source hover for mapped code rows.
-- `textDocument/definition`: proxy from mapped current-side code rows to the real source buffer and open the real target.
-- `textDocument/references`: proxy references from mapped current-side code rows where practical.
-- `textDocument/codeAction`: expose review actions such as add comment, reply, edit/delete own comment, resolve/reopen, mark viewed, open real file, submit review, and ask agent.
+- `textDocument/hover`: show Peers metadata for review rows and proxy source hover for mapped current-side code rows.
+- `textDocument/definition`: proxy from mapped current-side code rows to the hidden real source buffer's attached language servers and open the real target in the current window.
+- `textDocument/references`: proxy references from mapped current-side code rows where practical, using the user's normal quickfix/location-list behavior.
+- `textDocument/codeAction`: expose context-aware review actions only. Source LSP code actions from hidden buffers should not be proxied into the review buffer. Source rows should offer labels such as `Add line comment` or `Add comment on lines 3..9`; file-related contexts should also offer `Add comment on file`; comment rows should offer reply, edit own comment, delete own comment, resolve, and reopen actions as applicable. Deleting comments must show the same invalidation warning flow as the web frontend before appending the delete event.
 - `textDocument/diagnostic` or published diagnostics: show unresolved comments, stale anchors, failed mappings, and projected diagnostics from the real source buffer.
 - `textDocument/documentSymbol`: expose a root review target label, file path symbols, readable hunk range symbols such as `lines 10-21` or `old lines 10-17`, and later thread/unresolved comment symbols for picker/outline workflows.
 
@@ -592,7 +594,9 @@ Peers should keep a row map for each synthetic review buffer:
 review row -> repo path, side, source line/range, source column mapping, thread/comment identity
 ```
 
-For current-side rows, Neovim should open the real file in a hidden source buffer so the user's normal Tree-sitter and language server setup attaches. Hidden buffers are used first for syntax mirroring, and Peers can then proxy LSP-like requests from the `peersdiff` buffer to that hidden real buffer. Deleted/base-side rows may initially provide Peers metadata only; hidden base-version buffers can be added later as a best-effort enhancement.
+Row metadata should be rich enough for context-aware actions: source rows include line/range anchor data, file and hunk rows include file scope, and comment rows include thread id, comment id, ownership/editability, and resolved state.
+
+For current-side rows, Neovim should open the real file in a hidden source buffer so the user's normal Tree-sitter and language server setup attaches. Hidden buffers are used first for syntax mirroring, and Peers can then proxy LSP-like requests from the `peersdiff` buffer to that hidden real buffer. The bundled plugin may transparently wrap normal `vim.lsp.buf` entry points while the active buffer is a Peers review buffer so existing user mappings keep working, but source code actions must remain disabled so review-owned actions stay predictable. Deleted/base-side rows may initially provide Peers metadata only; hidden base-version buffers can be added later as a best-effort enhancement.
 
 Because an LSP server cannot directly manipulate Neovim buffers, the Neovim integration will likely also need a small Neovim attachment layer. Keep that layer thin:
 
@@ -796,6 +800,7 @@ Editing and deletion:
 - Users can edit their own comments.
 - Users can delete their own comments.
 - Users can delete a whole thread when they are allowed to delete the thread's root comment.
+- Neovim must follow the same edit/delete rules as the web UI. Delete comment should be available from comment-row code actions for comments the current author can edit/delete, and must show the same warning before invalidating later dependent activity.
 - Editing or deleting a user comment invalidates later dependent activity in that thread.
 - Dependent activity includes following agent comments, following agent-created replies, and later resolved/reopened status changes that happened after the edited/deleted comment.
 - Before applying an edit/delete that would invalidate later activity, show a confirmation warning that those later comments/status changes will be removed from the visible thread state.
@@ -997,7 +1002,7 @@ Current status:
 | Arborium highlighting | Planned | Not implemented. |
 | Vox RPC service | Partial | Local WebSocket service exposes review load, refresh, comment mutations, viewed files, and submit review; dev UI consumes generated TypeScript client. |
 | Realtime UI updates | Planned | Specified for event-log, agent/CLI comment, UI comment, viewed/submitted, and diff/file-change updates; not implemented. |
-| Neovim review mode | Partial | The local Peers session starts a `peersdiff` LSP endpoint using `tower-lsp-server`, `peers nvim` can launch the current review session, Vox/LSP share a cloneable review provider, and Lua `:PeersReview` opens a full-focus synthetic review buffer. Rust now serves a `peers/renderReview` payload with rendered diff rows, row metadata, structural highlights, and document symbols; Lua applies those rows and mirrors Tree-sitter highlights from hidden current-side source buffers. Realtime buffer updates, LSP proxying, diagnostics, code actions, and writable comment composers are still missing. |
+| Neovim review mode | Partial | The local Peers session starts a `peersdiff` LSP endpoint using `tower-lsp-server`, `peers nvim` can launch the current review session, Vox/LSP share a cloneable review provider, and Lua `:PeersReview` opens a full-focus synthetic review buffer. Rust serves `peers/renderReview` with rendered diff rows, row metadata, structural highlights, and document symbols; Lua applies rows, mirrors viewport-scoped Tree-sitter highlights from hidden current-side source buffers, opens a floating writable composer for add-comment code actions, and proxies hover/definition/declaration/type-definition/implementation/references from mapped current-side rows into hidden source buffer LSP clients. Line comments render inline at their anchor row, and code actions are becoming context-aware for line/range/file/comment rows. Realtime buffer updates, diagnostics, reply/edit/delete/resolve/reopen mutations, and delete invalidation confirmation are still missing. |
 | Review workspace layout | Partial | Toolbar, sidebar, diff surface, full-file route, quick access, sticky diff headers, and empty-diff state exist. Conversation/Commits tabs are still missing. |
 | Frontend review payload shape | Complete | Frontend consumes server-provided files, per-path file content, per-path compact diffs, and thread data through TanStack Query. |
 | Inline comments in diff/full-file views | Partial | `git-diff-view` renders real diffs with inline composers, persisted threads, multi-line selection, and range rails. Full-file comments still rely on the current full-file route behavior rather than the same library surface. |
