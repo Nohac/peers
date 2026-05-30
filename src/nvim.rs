@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use chrono::DateTime;
+use chrono_humanize::HumanTime;
 use tokio::net::{TcpListener, TcpStream};
 use tower_lsp_server::jsonrpc::{Error as LspError, Result as LspResult};
 use tower_lsp_server::ls_types::*;
@@ -8,7 +10,10 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
 use crate::diff::{DiffSection, FileSide, LineRange};
 use crate::review_provider::ReviewProvider;
-use crate::review_provider::{ApiCommentThread, ApiReviewPayload, CreateThreadRequest};
+use crate::review_provider::{
+    ApiCommentThread, ApiReviewComment, ApiReviewPayload, CommentRequest, CreateThreadRequest,
+    EditCommentRequest, ThreadBodyRequest, ThreadRequest,
+};
 
 const LOOPBACK_BIND_HOST: &str = "127.0.0.1";
 const LOCALHOST: &str = "localhost";
@@ -27,8 +32,13 @@ const TOTAL_THREADS_LABEL: &str = "total";
 const UNRESOLVED_THREADS_LABEL: &str = "unresolved";
 const THREAD_SCOPE_LINE: &str = "line";
 const THREAD_SCOPE_FILE: &str = "file";
-const COMMENT_STATE_RESOLVED: &str = "resolved";
-const COMMENT_STATE_UNRESOLVED: &str = "unresolved";
+const COMMENT_STATUS_OPEN: &str = "Open";
+const COMMENT_STATUS_RESOLVED: &str = "Resolved";
+const COMMENT_AGENT_MARKER: &str = " [agent]";
+const COMMENT_EDITED_LABEL: &str = "edited";
+const COMMENT_META_SEPARATOR: &str = " · ";
+const COMMENT_COMMENT_LABEL: &str = "comment";
+const COMMENT_COMMENTS_LABEL: &str = "comments";
 const CURSOR_LABEL: &str = "Cursor";
 const LINE_LABEL: &str = "line";
 const COLUMN_LABEL: &str = "column";
@@ -42,6 +52,7 @@ const OLD_LINES_LABEL: &str = "old lines";
 const COMMAND_ADD_COMMENT: &str = "peers.addComment";
 const COMMAND_REPLY: &str = "peers.reply";
 const COMMAND_EDIT_COMMENT: &str = "peers.editComment";
+const COMMAND_DELETE_COMMENT: &str = "peers.deleteComment";
 const COMMAND_RESOLVE_THREAD: &str = "peers.resolveThread";
 const COMMAND_REOPEN_THREAD: &str = "peers.reopenThread";
 const COMMAND_MARK_VIEWED: &str = "peers.markViewed";
@@ -53,10 +64,16 @@ const ACTION_ADD_RANGE_COMMENT_PREFIX: &str = "Peers: Add comment on lines";
 const ACTION_ADD_FILE_COMMENT: &str = "Peers: Add comment on file";
 const ACTION_REPLY: &str = "Peers: Reply";
 const ACTION_EDIT_COMMENT: &str = "Peers: Edit comment";
+const ACTION_DELETE_COMMENT: &str = "Peers: Delete comment";
 const ACTION_RESOLVE_THREAD: &str = "Peers: Resolve thread";
 const ACTION_REOPEN_THREAD: &str = "Peers: Reopen thread";
 const METHOD_RENDER_REVIEW: &str = "peers/renderReview";
 const METHOD_CREATE_THREAD: &str = "peers/createThread";
+const METHOD_REPLY_TO_THREAD: &str = "peers/replyToThread";
+const METHOD_EDIT_COMMENT: &str = "peers/editComment";
+const METHOD_DELETE_COMMENT: &str = "peers/deleteComment";
+const METHOD_RESOLVE_THREAD: &str = "peers/resolveThread";
+const METHOD_REOPEN_THREAD: &str = "peers/reopenThread";
 const PARAM_SCOPE: &str = "scope";
 const PARAM_PATH: &str = "path";
 const PARAM_SIDE: &str = "side";
@@ -65,6 +82,7 @@ const PARAM_END_LINE: &str = "end_line";
 const PARAM_BODY: &str = "body";
 const PARAM_THREAD_ID: &str = "thread_id";
 const PARAM_COMMENT_ID: &str = "comment_id";
+const PARAM_INVALIDATES_LATER_ACTIVITY: &str = "invalidates_later_activity";
 const LSP_INVALID_PARAMS: &str = "invalid Peers request params";
 const LSP_MISSING_FIELD: &str = "missing field";
 const LSP_INVALID_FIELD: &str = "invalid field";
@@ -87,11 +105,15 @@ const HIGHLIGHT_DELETE_GUTTER_BACKGROUND: &str = "PeersDiffDeleteGutterBackgroun
 const HIGHLIGHT_ADD_LINE_BACKGROUND: &str = "PeersDiffAddLineBackground";
 const HIGHLIGHT_DELETE_LINE_BACKGROUND: &str = "PeersDiffDeleteLineBackground";
 const HIGHLIGHT_LINE_NUMBER: &str = "PeersDiffLineNumber";
-const HIGHLIGHT_COMMENT: &str = "PeersDiffComment";
+const HIGHLIGHT_THREAD_ATTACHMENT: &str = "PeersDiffThreadAttachment";
+const HIGHLIGHT_THREAD_BODY: &str = "PeersDiffThreadBody";
+const HIGHLIGHT_THREAD_BORDER: &str = "PeersDiffThreadBorder";
+const HIGHLIGHT_THREAD_HEADER: &str = "PeersDiffThreadHeader";
+const HIGHLIGHT_THREAD_META: &str = "PeersDiffThreadMeta";
+const HIGHLIGHT_THREAD_RAIL: &str = "PeersDiffThreadRail";
 const HIGHLIGHT_EMPTY_TITLE: &str = "PeersDiffEmptyTitle";
 const HIGHLIGHT_EMPTY_TEXT: &str = "PeersDiffEmptyText";
 const HUNK_HEADER_PREFIX: &str = "@@";
-const COMMENT_PREFIX: &str = "      | ";
 const FILE_HEADER_PREFIX: &str = "diff -- ";
 const LINE_NUMBER_WIDTH: usize = 5;
 const LINE_PREFIX_WIDTH: u32 = 14;
@@ -102,6 +124,14 @@ const EMPTY_BODY: &str = "This review has no diffs to show.";
 const EMPTY_REFRESH: &str = "Run :PeersReview if you expected local edits to appear.";
 const EMPTY_SYMBOL_NAME: &str = "No file changes";
 const EMPTY_SYMBOL_DETAIL: &str = "empty review";
+const THREAD_RAIL_START_COL: u32 = 0;
+const THREAD_RAIL_END_COL: u32 = 1;
+const THREAD_CARD_WIDTH: usize = 86;
+const THREAD_HEADER_PREFIX: &str = "│ ╭─ ";
+const THREAD_BODY_PREFIX: &str = "│ │ ";
+const THREAD_FOOTER: &str = "│ ╰─";
+const THREAD_COUNT_SEPARATOR: &str = " ";
+const THREAD_BLANK: &str = "│ │";
 
 pub struct NvimLspServer {
     listener: TcpListener,
@@ -194,6 +224,56 @@ impl PeersDiffLanguageServer {
             .map_err(|_| LspError::internal_error())?;
         Ok(render_review_payload(review).into_lsp())
     }
+
+    async fn reply_to_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = thread_body_request(&params)?;
+        let review = self
+            .provider
+            .reply_to_thread(request)
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        Ok(render_review_payload(review).into_lsp())
+    }
+
+    async fn edit_comment(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = edit_comment_request(&params)?;
+        let review = self
+            .provider
+            .edit_comment(request)
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        Ok(render_review_payload(review).into_lsp())
+    }
+
+    async fn delete_comment(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = comment_request(&params)?;
+        let review = self
+            .provider
+            .delete_comment(request)
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        Ok(render_review_payload(review).into_lsp())
+    }
+
+    async fn resolve_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = thread_request(&params)?;
+        let review = self
+            .provider
+            .resolve_thread(request)
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        Ok(render_review_payload(review).into_lsp())
+    }
+
+    async fn reopen_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = thread_request(&params)?;
+        let review = self
+            .provider
+            .reopen_thread(request)
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        Ok(render_review_payload(review).into_lsp())
+    }
 }
 
 impl LanguageServer for PeersDiffLanguageServer {
@@ -217,6 +297,7 @@ impl LanguageServer for PeersDiffLanguageServer {
                         COMMAND_ADD_COMMENT.to_string(),
                         COMMAND_REPLY.to_string(),
                         COMMAND_EDIT_COMMENT.to_string(),
+                        COMMAND_DELETE_COMMENT.to_string(),
                         COMMAND_RESOLVE_THREAD.to_string(),
                         COMMAND_REOPEN_THREAD.to_string(),
                         COMMAND_MARK_VIEWED.to_string(),
@@ -324,6 +405,20 @@ async fn serve_lsp_connection(stream: TcpStream, provider: ReviewProvider) -> Re
         LspService::build(|client| PeersDiffLanguageServer::new(client, provider.clone()))
             .custom_method(METHOD_RENDER_REVIEW, PeersDiffLanguageServer::render_review)
             .custom_method(METHOD_CREATE_THREAD, PeersDiffLanguageServer::create_thread)
+            .custom_method(
+                METHOD_REPLY_TO_THREAD,
+                PeersDiffLanguageServer::reply_to_thread,
+            )
+            .custom_method(METHOD_EDIT_COMMENT, PeersDiffLanguageServer::edit_comment)
+            .custom_method(
+                METHOD_DELETE_COMMENT,
+                PeersDiffLanguageServer::delete_comment,
+            )
+            .custom_method(
+                METHOD_RESOLVE_THREAD,
+                PeersDiffLanguageServer::resolve_thread,
+            )
+            .custom_method(METHOD_REOPEN_THREAD, PeersDiffLanguageServer::reopen_thread)
             .finish();
     Server::new(read, write, socket).serve(service).await;
     Ok(())
@@ -386,7 +481,9 @@ struct RenderedRow {
     code_start_col: Option<u32>,
     thread_id: Option<String>,
     comment_id: Option<String>,
+    comment_body: Option<String>,
     can_edit: Option<bool>,
+    invalidates_later_activity: Option<bool>,
     resolved: Option<bool>,
 }
 
@@ -400,7 +497,9 @@ impl RenderedRow {
             code_start_col: None,
             thread_id: None,
             comment_id: None,
+            comment_body: None,
             can_edit: None,
+            invalidates_later_activity: None,
             resolved: None,
         }
     }
@@ -414,7 +513,9 @@ impl RenderedRow {
             code_start_col: None,
             thread_id: None,
             comment_id: None,
+            comment_body: None,
             can_edit: None,
+            invalidates_later_activity: None,
             resolved: None,
         }
     }
@@ -428,12 +529,18 @@ impl RenderedRow {
             code_start_col: Some(LINE_PREFIX_WIDTH),
             thread_id: None,
             comment_id: None,
+            comment_body: None,
             can_edit: None,
+            invalidates_later_activity: None,
             resolved: None,
         }
     }
 
-    fn comment(thread: &ApiCommentThread, comment_id: &str) -> Self {
+    fn comment(
+        thread: &ApiCommentThread,
+        comment: Option<&ApiReviewComment>,
+        invalidates_later_activity: bool,
+    ) -> Self {
         Self {
             kind: ROW_KIND_COMMENT,
             path: thread.path.clone(),
@@ -441,12 +548,10 @@ impl RenderedRow {
             source_line: thread.anchor.end_line,
             code_start_col: None,
             thread_id: Some(thread.id.clone()),
-            comment_id: Some(comment_id.to_string()),
-            can_edit: thread
-                .comments
-                .iter()
-                .find(|comment| comment.id == comment_id)
-                .map(|comment| comment.can_edit),
+            comment_id: comment.map(|comment| comment.id.clone()),
+            comment_body: comment.map(|comment| comment.body.clone()),
+            can_edit: comment.map(|comment| comment.can_edit),
+            invalidates_later_activity: comment.map(|_| invalidates_later_activity),
             resolved: Some(thread.resolved),
         }
     }
@@ -472,8 +577,17 @@ impl RenderedRow {
         if let Some(comment_id) = self.comment_id {
             object.insert("comment_id".to_string(), LSPAny::String(comment_id));
         }
+        if let Some(comment_body) = self.comment_body {
+            object.insert("comment_body".to_string(), LSPAny::String(comment_body));
+        }
         if let Some(can_edit) = self.can_edit {
             object.insert("can_edit".to_string(), LSPAny::Bool(can_edit));
+        }
+        if let Some(invalidates_later_activity) = self.invalidates_later_activity {
+            object.insert(
+                "invalidates_later_activity".to_string(),
+                LSPAny::Bool(invalidates_later_activity),
+            );
         }
         if let Some(resolved) = self.resolved {
             object.insert("resolved".to_string(), LSPAny::Bool(resolved));
@@ -586,7 +700,7 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 .and_then(|content| content.new.as_ref())
                                 .and_then(|lines| source_text(lines, line))
                                 .unwrap_or_default();
-                            push_source_line(
+                            let source_row = push_source_line(
                                 &mut rendered,
                                 &file.path,
                                 ROW_KIND_CONTEXT,
@@ -595,6 +709,14 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 Some(line),
                                 " ",
                                 text,
+                            );
+                            push_attachment_highlights(
+                                &mut rendered,
+                                &file_threads,
+                                &file.path,
+                                SIDE_NEW,
+                                line,
+                                source_row,
                             );
                             push_inline_threads(
                                 &mut rendered,
@@ -611,7 +733,7 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 .and_then(|content| content.new.as_ref())
                                 .and_then(|lines| source_text(lines, line))
                                 .unwrap_or_default();
-                            push_source_line(
+                            let source_row = push_source_line(
                                 &mut rendered,
                                 &file.path,
                                 ROW_KIND_ADD,
@@ -620,6 +742,14 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 Some(line),
                                 "+",
                                 text,
+                            );
+                            push_attachment_highlights(
+                                &mut rendered,
+                                &file_threads,
+                                &file.path,
+                                SIDE_NEW,
+                                line,
+                                source_row,
                             );
                             push_inline_threads(
                                 &mut rendered,
@@ -636,7 +766,7 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 .and_then(|content| content.old.as_ref())
                                 .and_then(|lines| source_text(lines, line))
                                 .unwrap_or_default();
-                            push_source_line(
+                            let source_row = push_source_line(
                                 &mut rendered,
                                 &file.path,
                                 ROW_KIND_DELETE,
@@ -645,6 +775,14 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
                                 None,
                                 "-",
                                 text,
+                            );
+                            push_attachment_highlights(
+                                &mut rendered,
+                                &file_threads,
+                                &file.path,
+                                SIDE_OLD,
+                                line,
+                                source_row,
                             );
                             push_inline_threads(
                                 &mut rendered,
@@ -664,7 +802,7 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
             .copied()
             .filter(|thread| thread.scope == THREAD_SCOPE_FILE)
         {
-            push_thread_comments(&mut rendered, thread);
+            push_thread_block(&mut rendered, thread);
         }
 
         let end_line = rendered.lines.len().saturating_sub(1) as u32;
@@ -755,7 +893,7 @@ fn push_source_line(
     new_line: Option<u32>,
     sign: &str,
     text: &str,
-) {
+) -> u32 {
     let line_number = match side {
         SIDE_NEW => new_line,
         SIDE_OLD => old_line,
@@ -785,6 +923,38 @@ fn push_source_line(
         _ => HIGHLIGHT_LINE_NUMBER,
     };
     rendered.push_highlight(line, 12, 13, gutter_group);
+    line
+}
+
+fn push_attachment_highlights(
+    rendered: &mut RenderedReview,
+    threads: &[&ApiCommentThread],
+    path: &str,
+    side: &str,
+    line: u32,
+    rendered_line: u32,
+) {
+    if !threads
+        .iter()
+        .copied()
+        .any(|thread| thread_covers_line(thread, path, side, line))
+    {
+        return;
+    }
+
+    let end_col = rendered.lines[rendered_line as usize].len() as u32;
+    rendered.push_highlight(
+        rendered_line,
+        LINE_PREFIX_WIDTH,
+        end_col,
+        HIGHLIGHT_THREAD_ATTACHMENT,
+    );
+    rendered.push_highlight(
+        rendered_line,
+        THREAD_RAIL_START_COL,
+        THREAD_RAIL_END_COL,
+        HIGHLIGHT_THREAD_RAIL,
+    );
 }
 
 fn push_inline_threads(
@@ -799,7 +969,7 @@ fn push_inline_threads(
         .copied()
         .filter(|thread| thread_matches_line(thread, path, side, line))
     {
-        push_thread_comments(rendered, thread);
+        push_thread_block(rendered, thread);
     }
 }
 
@@ -810,25 +980,167 @@ fn thread_matches_line(thread: &ApiCommentThread, path: &str, side: &str, line: 
         && thread.anchor.end_line == Some(line)
 }
 
-fn push_thread_comments(rendered: &mut RenderedReview, thread: &ApiCommentThread) {
-    let state = if thread.resolved {
-        COMMENT_STATE_RESOLVED
-    } else {
-        COMMENT_STATE_UNRESOLVED
-    };
-
-    for comment in &thread.comments {
-        let comment_line = format!(
-            "{COMMENT_PREFIX}[{state}] {}: {}",
-            comment.author_name,
-            first_line(&comment.body)
-        );
-        let line = rendered.push_line(
-            comment_line.clone(),
-            RenderedRow::comment(thread, &comment.id),
-        );
-        rendered.push_highlight(line, 0, comment_line.len() as u32, HIGHLIGHT_COMMENT);
+fn thread_covers_line(thread: &ApiCommentThread, path: &str, side: &str, line: u32) -> bool {
+    if thread.scope != THREAD_SCOPE_LINE
+        || thread.path.as_deref() != Some(path)
+        || thread.anchor.side.as_deref() != Some(side)
+    {
+        return false;
     }
+
+    let start = thread.anchor.start_line.or(thread.anchor.end_line);
+    let end = thread.anchor.end_line.or(thread.anchor.start_line);
+    matches!((start, end), (Some(start), Some(end)) if line >= start && line <= end)
+}
+
+fn push_thread_block(rendered: &mut RenderedReview, thread: &ApiCommentThread) {
+    let status = if thread.resolved {
+        COMMENT_STATUS_RESOLVED
+    } else {
+        COMMENT_STATUS_OPEN
+    };
+    let count = thread.comments.len();
+    let count_label = if count == 1 {
+        COMMENT_COMMENT_LABEL
+    } else {
+        COMMENT_COMMENTS_LABEL
+    };
+    let header = format!(
+        "{THREAD_HEADER_PREFIX}{} [{status}] {count}{THREAD_COUNT_SEPARATOR}{count_label}",
+        thread.line_label
+    );
+    push_thread_line(
+        rendered,
+        header,
+        thread,
+        None,
+        false,
+        HIGHLIGHT_THREAD_HEADER,
+    );
+
+    for (index, comment) in thread.comments.iter().enumerate() {
+        let invalidates_later_activity = index + 1 < thread.comments.len() || thread.resolved;
+        let marker = if comment.author_kind == "agent" {
+            COMMENT_AGENT_MARKER
+        } else {
+            ""
+        };
+        let mut meta = format!(
+            "{THREAD_BODY_PREFIX}{}{marker}{COMMENT_META_SEPARATOR}{}",
+            comment.author_name,
+            comment_timestamp(&comment.created_at)
+        );
+        if let Some(edited_at) = &comment.edited_at {
+            meta.push_str(&format!(
+                "{COMMENT_META_SEPARATOR}{COMMENT_EDITED_LABEL} {}",
+                comment_timestamp(edited_at)
+            ));
+        }
+        push_thread_line(
+            rendered,
+            meta,
+            thread,
+            Some(comment),
+            invalidates_later_activity,
+            HIGHLIGHT_THREAD_META,
+        );
+
+        for line in wrap_comment_body(&comment.body) {
+            push_thread_line(
+                rendered,
+                format!("{THREAD_BODY_PREFIX}{line}"),
+                thread,
+                Some(comment),
+                invalidates_later_activity,
+                HIGHLIGHT_THREAD_BODY,
+            );
+        }
+        if index + 1 < thread.comments.len() {
+            push_thread_line(
+                rendered,
+                THREAD_BLANK.to_string(),
+                thread,
+                None,
+                false,
+                HIGHLIGHT_THREAD_BODY,
+            );
+        }
+    }
+
+    push_thread_line(
+        rendered,
+        THREAD_FOOTER.to_string(),
+        thread,
+        None,
+        false,
+        HIGHLIGHT_THREAD_BORDER,
+    );
+}
+
+fn push_thread_line(
+    rendered: &mut RenderedReview,
+    line_text: String,
+    thread: &ApiCommentThread,
+    comment: Option<&ApiReviewComment>,
+    invalidates_later_activity: bool,
+    group: &'static str,
+) {
+    let line = rendered.push_line(
+        truncate_display_line(line_text),
+        RenderedRow::comment(thread, comment, invalidates_later_activity),
+    );
+    let end_col = rendered.lines[line as usize].len() as u32;
+    rendered.push_highlight(line, 0, end_col, group);
+    rendered.push_highlight(
+        line,
+        THREAD_RAIL_START_COL,
+        THREAD_RAIL_END_COL,
+        HIGHLIGHT_THREAD_RAIL,
+    );
+}
+
+fn wrap_comment_body(body: &str) -> Vec<String> {
+    let width = THREAD_CARD_WIDTH
+        .saturating_sub(THREAD_BODY_PREFIX.chars().count())
+        .max(1);
+    let mut lines = Vec::new();
+    for paragraph in body.lines() {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let separator = usize::from(!current.is_empty());
+            if !current.is_empty() && current.len() + separator + word.len() > width {
+                lines.push(current);
+                current = String::new();
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn truncate_display_line(line: String) -> String {
+    line.chars().take(THREAD_CARD_WIDTH).collect()
+}
+
+fn comment_timestamp(input: &str) -> String {
+    let Ok(created_at) = DateTime::parse_from_rfc3339(input) else {
+        return input.to_string();
+    };
+    HumanTime::from(created_at).to_string()
 }
 
 fn code_actions_for_range(rendered: &RenderedReview, range: Range) -> CodeActionResponse {
@@ -890,13 +1202,16 @@ fn comment_row_actions(row: &RenderedRow) -> CodeActionResponse {
             ));
         }
     }
-    if row.can_edit.unwrap_or(false)
-        && let Some(comment_id) = &row.comment_id
-    {
+    if row.can_edit.unwrap_or(false) && row.comment_id.is_some() {
         actions.push(command_action(
             ACTION_EDIT_COMMENT.to_string(),
             COMMAND_EDIT_COMMENT,
-            Some(vec![comment_arg(comment_id)]),
+            Some(vec![comment_arg(row)]),
+        ));
+        actions.push(command_action(
+            ACTION_DELETE_COMMENT.to_string(),
+            COMMAND_DELETE_COMMENT,
+            Some(vec![comment_arg(row)]),
         ));
     }
     actions
@@ -1024,12 +1339,23 @@ fn thread_arg(thread_id: &str) -> LSPAny {
     LSPAny::Object(object)
 }
 
-fn comment_arg(comment_id: &str) -> LSPAny {
+fn comment_arg(row: &RenderedRow) -> LSPAny {
     let mut object = LSPObject::new();
-    object.insert(
-        PARAM_COMMENT_ID.to_string(),
-        LSPAny::String(comment_id.to_string()),
-    );
+    if let Some(comment_id) = &row.comment_id {
+        object.insert(
+            PARAM_COMMENT_ID.to_string(),
+            LSPAny::String(comment_id.to_string()),
+        );
+    }
+    if let Some(body) = &row.comment_body {
+        object.insert(PARAM_BODY.to_string(), LSPAny::String(body.to_string()));
+    }
+    if let Some(invalidates_later_activity) = row.invalidates_later_activity {
+        object.insert(
+            PARAM_INVALIDATES_LATER_ACTIVITY.to_string(),
+            LSPAny::Bool(invalidates_later_activity),
+        );
+    }
     LSPAny::Object(object)
 }
 
@@ -1202,10 +1528,6 @@ fn source_text(lines: &[String], line: u32) -> Option<&str> {
         .map(String::as_str)
 }
 
-fn first_line(input: &str) -> &str {
-    input.lines().next().unwrap_or(input)
-}
-
 fn create_thread_request(params: &LSPAny) -> LspResult<CreateThreadRequest> {
     Ok(CreateThreadRequest {
         scope: required_string_param(params, PARAM_SCOPE)?,
@@ -1214,6 +1536,32 @@ fn create_thread_request(params: &LSPAny) -> LspResult<CreateThreadRequest> {
         start_line: optional_u32_param(params, PARAM_START_LINE)?,
         end_line: optional_u32_param(params, PARAM_END_LINE)?,
         body: required_string_param(params, PARAM_BODY)?,
+    })
+}
+
+fn thread_body_request(params: &LSPAny) -> LspResult<ThreadBodyRequest> {
+    Ok(ThreadBodyRequest {
+        thread_id: required_string_param(params, PARAM_THREAD_ID)?,
+        body: required_string_param(params, PARAM_BODY)?,
+    })
+}
+
+fn edit_comment_request(params: &LSPAny) -> LspResult<EditCommentRequest> {
+    Ok(EditCommentRequest {
+        comment_id: required_string_param(params, PARAM_COMMENT_ID)?,
+        body: required_string_param(params, PARAM_BODY)?,
+    })
+}
+
+fn comment_request(params: &LSPAny) -> LspResult<CommentRequest> {
+    Ok(CommentRequest {
+        comment_id: required_string_param(params, PARAM_COMMENT_ID)?,
+    })
+}
+
+fn thread_request(params: &LSPAny) -> LspResult<ThreadRequest> {
+    Ok(ThreadRequest {
+        thread_id: required_string_param(params, PARAM_THREAD_ID)?,
     })
 }
 

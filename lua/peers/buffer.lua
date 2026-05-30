@@ -8,6 +8,7 @@ local NAMESPACE = vim.api.nvim_create_namespace("peers-review")
 local SOURCE_NAMESPACE = vim.api.nvim_create_namespace("peers-review-source")
 local ADD_FALLBACK_FG = "#3fb950"
 local DELETE_FALLBACK_FG = "#f85149"
+local THREAD_FALLBACK_FG = "#58a6ff"
 local NORMAL_FALLBACK_FG = "#f0f6fc"
 local NORMAL_FALLBACK_BG = "#000000"
 local HIGHLIGHT_FG = "fg"
@@ -36,6 +37,10 @@ local ADD_BACKGROUND_GROUPS = {
 local DELETE_BACKGROUND_GROUPS = {
   "DiffDelete",
 }
+local THREAD_FOREGROUND_GROUPS = {
+  "DiagnosticInfo",
+  "Identifier",
+}
 local HIGHLIGHT_GROUPS = {
   PeersDiffFileHeader = { link = "Title" },
   PeersDiffHunkHeader = { link = "DiffChange" },
@@ -61,6 +66,17 @@ local COMPOSER_MAX_WIDTH = 88
 local COMPOSER_GUTTER_COL = 14
 local COMMENT_EMPTY_MESSAGE = "Peers comment is empty"
 local COMMENT_UNAVAILABLE_MESSAGE = "Peers comment is only available on diff lines for now"
+local COMMENT_REPLY_UNAVAILABLE_MESSAGE = "Peers reply is only available on comment threads"
+local COMMENT_EDIT_UNAVAILABLE_MESSAGE = "Peers edit is only available on editable comments"
+local COMMENT_DELETE_UNAVAILABLE_MESSAGE = "Peers delete is only available on editable comments"
+local COMMENT_THREAD_UNAVAILABLE_MESSAGE = "Peers thread action is only available on comment threads"
+local COMMENT_CONFIRM_CHOICES = "&Proceed\n&Cancel"
+local COMMENT_CONFIRM_DEFAULT = 2
+local COMMENT_CONFIRM_DANGER = "WarningMsg"
+local COMMENT_EDIT_CONFIRM_TITLE = "Edit comment?"
+local COMMENT_EDIT_CONFIRM_MESSAGE = "Editing this comment will remove later replies and thread status changes from the visible review state."
+local COMMENT_DELETE_CONFIRM_TITLE = "Delete comment?"
+local COMMENT_DELETE_CONFIRM_MESSAGE = "Deleting this comment will remove later replies and thread status changes from the visible review state."
 local MIRROR_DEBOUNCE_MS = 30
 local AUTOCMD_GROUP_PREFIX = "peers-review-source-"
 local AUTOCMD_EVENTS = {
@@ -177,6 +193,32 @@ local function define_diff_gutter_highlights()
     default = true,
     [HIGHLIGHT_FG] = normal_fg,
     [HIGHLIGHT_BG] = blend_color(normal_fg, normal_bg, 0.08),
+  })
+  local thread_fg = foreground_from(THREAD_FOREGROUND_GROUPS, THREAD_FALLBACK_FG)
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadAttachment", {
+    default = true,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadBody", {
+    default = true,
+    [HIGHLIGHT_FG] = normal_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadBorder", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadHeader", {
+    default = true,
+    [HIGHLIGHT_FG] = normal_fg,
+    [HIGHLIGHT_BOLD] = true,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadMeta", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadRail", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_fg,
+    [HIGHLIGHT_BG] = thread_fg,
   })
 end
 
@@ -470,7 +512,7 @@ local function composer_row()
   return winline
 end
 
-local function composer_config(review_win)
+local function composer_config(review_win, title)
   return {
     relative = "win",
     win = review_win,
@@ -479,7 +521,7 @@ local function composer_config(review_win)
     width = composer_width(review_win),
     height = COMPOSER_HEIGHT,
     border = "rounded",
-    title = COMPOSER_TITLE,
+    title = title or COMPOSER_TITLE,
     style = "minimal",
   }
 end
@@ -489,7 +531,25 @@ local function composer_body(buf)
   return vim.trim(table.concat(lines, "\n"))
 end
 
-local function submit_composer(review_buf, row, draft_buf)
+local function apply_mutation_render(state, review_buf, render)
+  close_composer(state)
+  apply_render(state.root, review_buf, render, state.client_id)
+end
+
+local function confirm_invalidating(input)
+  if not input or not input.invalidates_later_activity then
+    return true
+  end
+  local choice = vim.fn.confirm(
+    input.title .. "\n\n" .. input.message,
+    COMMENT_CONFIRM_CHOICES,
+    COMMENT_CONFIRM_DEFAULT,
+    COMMENT_CONFIRM_DANGER
+  )
+  return choice == 1
+end
+
+local function submit_composer(review_buf, draft_buf, on_submit)
   local state = RENDER_STATES[review_buf]
   if not state then
     return
@@ -501,20 +561,10 @@ local function submit_composer(review_buf, row, draft_buf)
     return
   end
 
-  lsp.create_thread(state.client_id, review_buf, {
-    scope = row.scope or ROW_SCOPE_LINE,
-    path = row.path,
-    side = row.side,
-    start_line = row.start_line or row.source_line,
-    end_line = row.end_line or row.source_line,
-    body = body,
-  }, function(render)
-    close_composer(state)
-    apply_render(state.root, review_buf, render, state.client_id)
-  end)
+  on_submit(state, body)
 end
 
-local function open_composer(review_buf, row)
+local function open_composer(review_buf, opts)
   local state = RENDER_STATES[review_buf]
   if not state then
     return
@@ -528,14 +578,16 @@ local function open_composer(review_buf, row)
   vim.bo[draft_buf].buflisted = false
   vim.bo[draft_buf].swapfile = false
   vim.bo[draft_buf].filetype = COMPOSER_FILETYPE
-  vim.api.nvim_buf_set_lines(draft_buf, 0, -1, false, { COMPOSER_INITIAL_LINE })
+  vim.api.nvim_buf_set_lines(draft_buf, 0, -1, false, vim.split(opts.initial_body or COMPOSER_INITIAL_LINE, "\n", {
+    plain = true,
+  }))
 
-  local draft_win = vim.api.nvim_open_win(draft_buf, true, composer_config(review_win))
+  local draft_win = vim.api.nvim_open_win(draft_buf, true, composer_config(review_win, opts.title))
   state.composer_buf = draft_buf
   state.composer_win = draft_win
 
   vim.keymap.set({ "n", "i" }, COMPOSER_SUBMIT_MAP, function()
-    submit_composer(review_buf, row, draft_buf)
+    submit_composer(review_buf, draft_buf, opts.on_submit)
   end, { buffer = draft_buf, nowait = true })
   vim.keymap.set("n", COMPOSER_CANCEL_MAP, function()
     close_composer(state)
@@ -580,12 +632,35 @@ function M.comment_current(buf, anchor)
   end
 
   if anchor and anchor.scope == ROW_SCOPE_FILE and anchor.path then
-    open_composer(buf, anchor)
+    open_composer(buf, {
+      on_submit = function(state, body)
+        lsp.create_thread(state.client_id, buf, {
+          scope = anchor.scope,
+          path = anchor.path,
+          body = body,
+        }, function(render)
+          apply_mutation_render(state, buf, render)
+        end)
+      end,
+    })
     return
   end
 
   if anchor and anchor.scope == ROW_SCOPE_LINE and anchor.path and anchor.side and anchor.start_line then
-    open_composer(buf, anchor)
+    open_composer(buf, {
+      on_submit = function(state, body)
+        lsp.create_thread(state.client_id, buf, {
+          scope = anchor.scope,
+          path = anchor.path,
+          side = anchor.side,
+          start_line = anchor.start_line,
+          end_line = anchor.end_line,
+          body = body,
+        }, function(render)
+          apply_mutation_render(state, buf, render)
+        end)
+      end,
+    })
     return
   end
 
@@ -596,7 +671,119 @@ function M.comment_current(buf, anchor)
     return
   end
 
-  open_composer(buf, row)
+  open_composer(buf, {
+    on_submit = function(state, body)
+      lsp.create_thread(state.client_id, buf, {
+        scope = row.scope or ROW_SCOPE_LINE,
+        path = row.path,
+        side = row.side,
+        start_line = row.start_line or row.source_line,
+        end_line = row.end_line or row.source_line,
+        body = body,
+      }, function(render)
+        apply_mutation_render(state, buf, render)
+      end)
+    end,
+  })
+end
+
+function M.reply_to_thread(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  if not input or not input.thread_id then
+    vim.notify(COMMENT_REPLY_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+
+  open_composer(buf, {
+    on_submit = function(state, body)
+      lsp.reply_to_thread(state.client_id, buf, {
+        thread_id = input.thread_id,
+        body = body,
+      }, function(render)
+        apply_mutation_render(state, buf, render)
+      end)
+    end,
+  })
+end
+
+function M.edit_comment(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  if not input or not input.comment_id then
+    vim.notify(COMMENT_EDIT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+
+  open_composer(buf, {
+    initial_body = input.body or "",
+    on_submit = function(state, body)
+      if
+        not confirm_invalidating({
+          invalidates_later_activity = input.invalidates_later_activity,
+          title = COMMENT_EDIT_CONFIRM_TITLE,
+          message = COMMENT_EDIT_CONFIRM_MESSAGE,
+        })
+      then
+        return
+      end
+      lsp.edit_comment(state.client_id, buf, {
+        comment_id = input.comment_id,
+        body = body,
+      }, function(render)
+        apply_mutation_render(state, buf, render)
+      end)
+    end,
+  })
+end
+
+function M.delete_comment(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state or not input or not input.comment_id then
+    vim.notify(COMMENT_DELETE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  if
+    not confirm_invalidating({
+      invalidates_later_activity = input.invalidates_later_activity,
+      title = COMMENT_DELETE_CONFIRM_TITLE,
+      message = COMMENT_DELETE_CONFIRM_MESSAGE,
+    })
+  then
+    return
+  end
+  lsp.delete_comment(state.client_id, buf, {
+    comment_id = input.comment_id,
+  }, function(render)
+    apply_mutation_render(state, buf, render)
+  end)
+end
+
+function M.resolve_thread(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state or not input or not input.thread_id then
+    vim.notify(COMMENT_THREAD_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  lsp.resolve_thread(state.client_id, buf, {
+    thread_id = input.thread_id,
+  }, function(render)
+    apply_mutation_render(state, buf, render)
+  end)
+end
+
+function M.reopen_thread(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state or not input or not input.thread_id then
+    vim.notify(COMMENT_THREAD_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  lsp.reopen_thread(state.client_id, buf, {
+    thread_id = input.thread_id,
+  }, function(render)
+    apply_mutation_render(state, buf, render)
+  end)
 end
 
 function M.is_review_buffer(buf)

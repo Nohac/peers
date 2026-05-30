@@ -4,10 +4,52 @@ local PEERS_LSP_NAME = "peersdiff"
 local LOOPBACK_HOST = "127.0.0.1"
 local RENDER_METHOD = "peers/renderReview"
 local CREATE_THREAD_METHOD = "peers/createThread"
+local REPLY_TO_THREAD_METHOD = "peers/replyToThread"
+local EDIT_COMMENT_METHOD = "peers/editComment"
+local DELETE_COMMENT_METHOD = "peers/deleteComment"
+local RESOLVE_THREAD_METHOD = "peers/resolveThread"
+local REOPEN_THREAD_METHOD = "peers/reopenThread"
 local COMMAND_ADD_COMMENT = "peers.addComment"
+local COMMAND_REPLY = "peers.reply"
+local COMMAND_EDIT_COMMENT = "peers.editComment"
+local COMMAND_DELETE_COMMENT = "peers.deleteComment"
+local COMMAND_RESOLVE_THREAD = "peers.resolveThread"
+local COMMAND_REOPEN_THREAD = "peers.reopenThread"
 local INVALID_LSP_URL_ERROR = "Invalid nvim_lsp_url: "
 local RENDER_READY_TIMEOUT = 5000
 local RENDER_READY_INTERVAL = 50
+
+local COMMAND_HANDLERS = {
+  [COMMAND_ADD_COMMENT] = "comment_current",
+  [COMMAND_REPLY] = "reply_to_thread",
+  [COMMAND_EDIT_COMMENT] = "edit_comment",
+  [COMMAND_DELETE_COMMENT] = "delete_comment",
+  [COMMAND_RESOLVE_THREAD] = "resolve_thread",
+  [COMMAND_REOPEN_THREAD] = "reopen_thread",
+}
+
+local MUTATION_METHODS = {
+  create_thread = CREATE_THREAD_METHOD,
+  reply_to_thread = REPLY_TO_THREAD_METHOD,
+  edit_comment = EDIT_COMMENT_METHOD,
+  delete_comment = DELETE_COMMENT_METHOD,
+  resolve_thread = RESOLVE_THREAD_METHOD,
+  reopen_thread = REOPEN_THREAD_METHOD,
+}
+
+local function command_input(command)
+  return command.arguments and command.arguments[1] or nil
+end
+
+local function build_command_handlers()
+  local handlers = {}
+  for command_name, handler_name in pairs(COMMAND_HANDLERS) do
+    handlers[command_name] = function(command, context)
+      require("peers.buffer")[handler_name](context and context.bufnr or nil, command_input(command))
+    end
+  end
+  return handlers
+end
 
 local function lsp_port(session)
   local port = tostring(session.nvim_lsp_url or ""):match(":(%d+)$")
@@ -42,12 +84,7 @@ function M.attach(buf, root, session)
     cmd = vim.lsp.rpc.connect(LOOPBACK_HOST, port),
     root_dir = root,
     peers_port = port,
-    commands = {
-      [COMMAND_ADD_COMMENT] = function(command, context)
-        local anchor = command.arguments and command.arguments[1] or nil
-        require("peers.buffer").comment_current(context and context.bufnr or nil, anchor)
-      end,
-    },
+    commands = build_command_handlers(),
   }, {
     bufnr = buf,
     reuse_client = function(client, config)
@@ -98,19 +135,25 @@ function M.render_now(client_id, buf, on_render)
   request_render(client, buf, on_render)
 end
 
-function M.create_thread(client_id, buf, request, on_render)
+local function mutate(client_id, buf, method, request, on_render)
   local client = vim.lsp.get_client_by_id(client_id)
   if not client then
     return
   end
 
-  client:request(CREATE_THREAD_METHOD, request, function(error, result)
+  client:request(method, request, function(error, result)
     if error then
       vim.notify(error.message or tostring(error), vim.log.levels.ERROR)
       return
     end
     on_render(result)
   end, buf)
+end
+
+for function_name, method in pairs(MUTATION_METHODS) do
+  M[function_name] = function(client_id, buf, request, on_render)
+    mutate(client_id, buf, method, request, on_render)
+  end
 end
 
 return M
