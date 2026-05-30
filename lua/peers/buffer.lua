@@ -6,6 +6,7 @@ local BUFFER_PREFIX = "peers://review/"
 local FILETYPE = "peersdiff"
 local NAMESPACE = vim.api.nvim_create_namespace("peers-review")
 local SOURCE_NAMESPACE = vim.api.nvim_create_namespace("peers-review-source")
+local DIAGNOSTIC_NAMESPACE = vim.api.nvim_create_namespace("peers-review-diagnostics")
 local ADD_FALLBACK_FG = "#3fb950"
 local DELETE_FALLBACK_FG = "#f85149"
 local THREAD_FALLBACK_FG = "#58a6ff"
@@ -14,6 +15,8 @@ local NORMAL_FALLBACK_BG = "#000000"
 local HIGHLIGHT_FG = "fg"
 local HIGHLIGHT_BG = "bg"
 local HIGHLIGHT_BOLD = "bold"
+local HIGHLIGHT_DIRTY_TITLE = "PeersDiffDirtyTitle"
+local HIGHLIGHT_DIRTY_TEXT = "PeersDiffDirtyText"
 local GUTTER_BACKGROUND_BLEND = 0.42
 local LINE_BACKGROUND_BLEND = 0.16
 local GUTTER_FOREGROUND_GROUPS = {
@@ -47,13 +50,23 @@ local HIGHLIGHT_GROUPS = {
   PeersDiffLineNumber = { link = "LineNr" },
   PeersDiffEmptyTitle = { link = "Title" },
   PeersDiffEmptyText = { link = "Normal" },
+  [HIGHLIGHT_DIRTY_TITLE] = { link = "DiagnosticError" },
+  [HIGHLIGHT_DIRTY_TEXT] = { link = "WarningMsg" },
 }
 local ROW_SIDE_NEW = "new"
 local ROW_SCOPE_LINE = "line"
 local ROW_SCOPE_FILE = "file"
+local ROW_KIND_FILE_HEADER = "file_header"
+local ROW_KIND_DIRTY = "dirty"
 local ROW_KIND_ADD = "add"
 local ROW_KIND_CONTEXT = "context"
 local ROW_KIND_DELETE = "delete"
+local DIRTY_FILE_TITLE = "Unsaved changes in this file"
+local DIRTY_FILE_MESSAGE = "Peers is hiding this file diff because Neovim has a modified buffer for it."
+local DIRTY_FILE_HINT = "Write or reload the file, then refresh the review."
+local DIRTY_FILE_DIAGNOSTIC_SOURCE = "peers"
+local DIRTY_FILE_DIAGNOSTIC_MESSAGE = "Peers review diff hidden because this file has unsaved Neovim changes"
+local DIRTY_FILE_INDENT = "  "
 local SOURCE_PROXY_UNAVAILABLE = "Peers source LSP proxy is only available on current-side added or context lines"
 local COMPOSER_TITLE = " Peers comment "
 local COMPOSER_FILETYPE = "markdown"
@@ -230,6 +243,147 @@ local function set_lines(buf, lines)
   vim.bo[buf].readonly = true
 end
 
+local function file_buffer_name(root, path)
+  return vim.fn.fnamemodify(root .. "/" .. path, ":p")
+end
+
+local function modified_buffer_for_path(root, path)
+  local name = file_buffer_name(root, path)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    local buffer_name = vim.api.nvim_buf_get_name(buf)
+    if
+      vim.api.nvim_buf_is_valid(buf)
+      and buffer_name ~= ""
+      and vim.fn.fnamemodify(buffer_name, ":p") == name
+      and vim.bo[buf].modified
+    then
+      return buf
+    end
+  end
+  return nil
+end
+
+local function dirty_paths_for_render(root, render)
+  local dirty = {}
+  for _, row in ipairs(render.rows or {}) do
+    if row.path and not dirty[row.path] and modified_buffer_for_path(root, row.path) then
+      dirty[row.path] = true
+    end
+  end
+  return dirty
+end
+
+local function dirty_warning_rows(path)
+  return {
+    {
+      line = DIRTY_FILE_INDENT .. DIRTY_FILE_TITLE,
+      row = { kind = ROW_KIND_DIRTY, path = path },
+      group = HIGHLIGHT_DIRTY_TITLE,
+    },
+    {
+      line = DIRTY_FILE_INDENT .. DIRTY_FILE_MESSAGE,
+      row = { kind = ROW_KIND_DIRTY, path = path },
+      group = HIGHLIGHT_DIRTY_TEXT,
+    },
+    {
+      line = DIRTY_FILE_INDENT .. DIRTY_FILE_HINT,
+      row = { kind = ROW_KIND_DIRTY, path = path },
+      group = HIGHLIGHT_DIRTY_TEXT,
+    },
+  }
+end
+
+local function highlights_by_line(highlights)
+  local by_line = {}
+  for _, highlight in ipairs(highlights or {}) do
+    local line = highlight.line
+    if line then
+      by_line[line] = by_line[line] or {}
+      table.insert(by_line[line], highlight)
+    end
+  end
+  return by_line
+end
+
+local function push_render_line(target, source_line, line, row, by_line)
+  local next_line = #target.lines
+  table.insert(target.lines, line)
+  table.insert(target.rows, row)
+  for _, highlight in ipairs(by_line[source_line] or {}) do
+    table.insert(target.highlights, vim.tbl_extend("force", highlight, {
+      line = next_line,
+    }))
+  end
+end
+
+local function push_dirty_diagnostic(diagnostics, line, end_col)
+  table.insert(diagnostics, {
+    lnum = line,
+    col = 0,
+    end_lnum = line,
+    end_col = end_col,
+    severity = vim.diagnostic.severity.ERROR,
+    source = DIRTY_FILE_DIAGNOSTIC_SOURCE,
+    message = DIRTY_FILE_DIAGNOSTIC_MESSAGE,
+  })
+end
+
+local function push_dirty_warning(target, path, diagnostics)
+  local first_warning_line = #target.lines
+  for _, warning in ipairs(dirty_warning_rows(path)) do
+    local line = #target.lines
+    table.insert(target.lines, warning.line)
+    table.insert(target.rows, warning.row)
+    table.insert(target.highlights, {
+      line = line,
+      start_col = 0,
+      end_col = #warning.line,
+      group = warning.group,
+    })
+  end
+  push_dirty_diagnostic(diagnostics, first_warning_line, #(target.lines[first_warning_line + 1] or ""))
+end
+
+local function mask_dirty_file_diffs(root, render)
+  local dirty = dirty_paths_for_render(root, render)
+  if next(dirty) == nil then
+    render.diagnostics = {}
+    return render
+  end
+
+  local by_line = highlights_by_line(render.highlights)
+  local diagnostics = {}
+  local masked = {
+    lines = {},
+    rows = {},
+    highlights = {},
+    diagnostics = diagnostics,
+  }
+  local index = 1
+
+  while index <= #(render.rows or {}) do
+    local row = render.rows[index]
+    local line = render.lines[index] or ""
+    if row and row.kind == ROW_KIND_FILE_HEADER and row.path and dirty[row.path] then
+      push_render_line(masked, index - 1, line, row, by_line)
+      push_dirty_warning(masked, row.path, diagnostics)
+      index = index + 1
+      while index <= #(render.rows or {}) do
+        local next_row = render.rows[index]
+        if next_row and next_row.kind == ROW_KIND_FILE_HEADER then
+          break
+        end
+        index = index + 1
+      end
+    else
+      push_render_line(masked, index - 1, line, row or {}, by_line)
+      index = index + 1
+    end
+  end
+
+  return masked
+end
+
 local function apply_structural_highlights(buf, highlights)
   vim.api.nvim_buf_clear_namespace(buf, NAMESPACE, 0, -1)
   for _, highlight in ipairs(highlights or {}) do
@@ -238,6 +392,10 @@ local function apply_structural_highlights(buf, highlights)
       hl_group = highlight.group,
     })
   end
+end
+
+local function apply_diagnostics(buf, diagnostics)
+  vim.diagnostic.set(DIAGNOSTIC_NAMESPACE, buf, diagnostics or {}, {})
 end
 
 local function source_buffer(root, path)
@@ -609,8 +767,10 @@ function apply_render(root, buf, render, client_id)
     close_composer(existing)
   end
 
+  render = mask_dirty_file_diffs(root, render)
   set_lines(buf, render.lines)
   apply_structural_highlights(buf, render.highlights)
+  apply_diagnostics(buf, render.diagnostics)
   RENDER_STATES[buf] = {
     root = root,
     client_id = client_id,
