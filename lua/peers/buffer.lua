@@ -61,6 +61,7 @@ local ROW_KIND_DIRTY = "dirty"
 local ROW_KIND_ADD = "add"
 local ROW_KIND_CONTEXT = "context"
 local ROW_KIND_DELETE = "delete"
+local ROW_KIND_COMMENT = "comment"
 local DIRTY_FILE_TITLE = "Unsaved changes in this file"
 local DIRTY_FILE_MESSAGE = "Peers is hiding this file diff because Neovim has a modified buffer for it."
 local DIRTY_FILE_HINT = "Write or reload the file, then refresh the review."
@@ -79,10 +80,14 @@ local COMPOSER_MAX_WIDTH = 88
 local COMPOSER_GUTTER_COL = 14
 local COMMENT_EMPTY_MESSAGE = "Peers comment is empty"
 local COMMENT_UNAVAILABLE_MESSAGE = "Peers comment is only available on diff lines for now"
+local OPEN_SOURCE_UNAVAILABLE_MESSAGE = "Peers can only open source files from file, diff, or comment rows"
+local OPEN_SOURCE_MISSING_MESSAGE = "Peers source file does not exist: "
 local COMMENT_REPLY_UNAVAILABLE_MESSAGE = "Peers reply is only available on comment threads"
 local COMMENT_EDIT_UNAVAILABLE_MESSAGE = "Peers edit is only available on editable comments"
 local COMMENT_DELETE_UNAVAILABLE_MESSAGE = "Peers delete is only available on editable comments"
 local COMMENT_THREAD_UNAVAILABLE_MESSAGE = "Peers thread action is only available on comment threads"
+local OPEN_SOURCE_KEY = "<CR>"
+local OPEN_SOURCE_DESC = "Open source file"
 local COMMENT_CONFIRM_CHOICES = "&Proceed\n&Cancel"
 local COMMENT_CONFIRM_DEFAULT = 2
 local COMMENT_CONFIRM_DANGER = "WarningMsg"
@@ -104,6 +109,10 @@ local VIEW_SAVE_EVENTS = {
   "WinScrolled",
 }
 local CACHE_KEY_SEPARATOR = ":"
+local UNKNOWN_FILE_TIME = -1
+local UNKNOWN_FILE_SIZE = -1
+local SOURCE_HELPER_BUFFER_VAR = "peers_source_helper"
+local SOURCE_HELPER_SIGNATURE_VAR = "peers_source_signature"
 local RENDER_STATES = {}
 
 local function existing_buffer(name)
@@ -403,18 +412,52 @@ local function apply_diagnostics(buf, diagnostics)
   vim.diagnostic.set(DIAGNOSTIC_NAMESPACE, buf, diagnostics or {}, {})
 end
 
+local function source_file_signature(full_path)
+  local stat = vim.uv.fs_stat(full_path)
+  if not stat then
+    return table.concat({ UNKNOWN_FILE_TIME, UNKNOWN_FILE_SIZE }, CACHE_KEY_SEPARATOR)
+  end
+
+  local modified = stat.mtime or {}
+  return table.concat({
+    modified.sec or UNKNOWN_FILE_TIME,
+    modified.nsec or 0,
+    stat.size or UNKNOWN_FILE_SIZE,
+  }, CACHE_KEY_SEPARATOR)
+end
+
+local function reload_source_helper_if_stale(buf, signature)
+  if not vim.b[buf][SOURCE_HELPER_BUFFER_VAR] then
+    return
+  end
+  if vim.b[buf][SOURCE_HELPER_SIGNATURE_VAR] == signature then
+    return
+  end
+  if vim.bo[buf].modified then
+    return
+  end
+
+  pcall(vim.api.nvim_buf_call, buf, function()
+    vim.cmd("silent! edit!")
+  end)
+end
+
 local function source_buffer(root, path)
   local full_path = vim.fn.fnamemodify(root .. "/" .. path, ":p")
   if vim.fn.filereadable(full_path) ~= 1 then
     return nil
   end
 
+  local signature = source_file_signature(full_path)
   local existing = existing_buffer(full_path)
   local buf = vim.fn.bufadd(full_path)
   vim.fn.bufload(buf)
   if not existing then
     vim.bo[buf].buflisted = false
+    vim.b[buf][SOURCE_HELPER_BUFFER_VAR] = true
   end
+  reload_source_helper_if_stale(buf, signature)
+  vim.b[buf][SOURCE_HELPER_SIGNATURE_VAR] = signature
 
   if vim.bo[buf].filetype == "" then
     local filetype = vim.filetype.match({ filename = full_path })
@@ -506,6 +549,23 @@ local function row_is_commentable(row)
     and (row.kind == ROW_KIND_ADD or row.kind == ROW_KIND_CONTEXT or row.kind == ROW_KIND_DELETE)
 end
 
+local function row_is_source_jumpable(row)
+  return row
+    and row.path
+    and (
+      row.kind == ROW_KIND_ADD
+      or row.kind == ROW_KIND_CONTEXT
+      or row.kind == ROW_KIND_DELETE
+      or row.kind == ROW_KIND_COMMENT
+      or row.kind == ROW_KIND_FILE_HEADER
+      or row.kind == ROW_KIND_DIRTY
+    )
+end
+
+local function row_jump_line(row)
+  return math.max(1, row.source_line or 1)
+end
+
 local function source_for_proxy_row(state, row)
   local source = state.source_lsp_buffers[row.path]
   if source == nil then
@@ -535,25 +595,38 @@ local function source_for_row(state, row)
   return source
 end
 
-local function cache_key(row)
-  return row.path .. CACHE_KEY_SEPARATOR .. tostring(row.source_line)
+local function cache_for_file(state, row)
+  local source = source_for_row(state, row)
+  if not source then
+    return nil, nil
+  end
+
+  local full_path = file_buffer_name(state.root, row.path)
+  local signature = source_file_signature(full_path)
+  local file_cache = state.source_segments[row.path]
+  if not file_cache or file_cache.signature ~= signature then
+    file_cache = {
+      signature = signature,
+      lines = {},
+    }
+    state.source_segments[row.path] = file_cache
+  end
+  return source, file_cache.lines
 end
 
 local function segments_for_row(state, row)
-  local key = cache_key(row)
-  local cached = state.source_segments[key]
+  local source, lines = cache_for_file(state, row)
+  if not source or not lines then
+    return {}
+  end
+
+  local cached = lines[row.source_line]
   if cached then
     return cached
   end
 
-  local source = source_for_row(state, row)
-  if not source then
-    state.source_segments[key] = {}
-    return state.source_segments[key]
-  end
-
-  state.source_segments[key] = source_line_segments(source, row.source_line)
-  return state.source_segments[key]
+  lines[row.source_line] = source_line_segments(source, row.source_line)
+  return lines[row.source_line]
 end
 
 local function apply_line_segments(buf, review_row, code_start_col, segments)
@@ -1034,6 +1107,32 @@ function M.is_review_buffer(buf)
   return RENDER_STATES[buf or vim.api.nvim_get_current_buf()] ~= nil
 end
 
+function M.open_source_at_cursor(buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local row = state.rows[cursor[1]]
+  if not row_is_source_jumpable(row) then
+    vim.notify(OPEN_SOURCE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+
+  local full_path = file_buffer_name(state.root, row.path)
+  if vim.fn.filereadable(full_path) ~= 1 then
+    vim.notify(OPEN_SOURCE_MISSING_MESSAGE .. row.path, vim.log.levels.WARN)
+    return
+  end
+
+  vim.cmd.edit(vim.fn.fnameescape(full_path))
+  vim.bo.buflisted = true
+  local line = math.min(row_jump_line(row), vim.api.nvim_buf_line_count(0))
+  vim.api.nvim_win_set_cursor(0, { line, 0 })
+end
+
 function M.refresh_from_client(client_id)
   for buf, state in pairs(RENDER_STATES) do
     if state.client_id == client_id and vim.api.nvim_buf_is_valid(buf) then
@@ -1086,6 +1185,16 @@ function M.source_location(buf)
   }
 end
 
+local function set_review_keymaps(buf)
+  vim.keymap.set("n", OPEN_SOURCE_KEY, function()
+    M.open_source_at_cursor(buf)
+  end, {
+    buffer = buf,
+    desc = OPEN_SOURCE_DESC,
+    nowait = true,
+  })
+end
+
 function M.open(root, review_id, session)
   local name = BUFFER_PREFIX .. review_id
   local buf = existing_buffer(name)
@@ -1099,6 +1208,7 @@ function M.open(root, review_id, session)
   end
 
   set_review_options(buf)
+  set_review_keymaps(buf)
   define_highlights()
   define_diff_gutter_highlights()
   set_lines(buf, {
