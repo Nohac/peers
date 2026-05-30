@@ -9,7 +9,7 @@ local COMMAND_STOP = "PeersStop"
 
 local defaults = {
   binary = "peers",
-  start_timeout_ms = 3000,
+  start_timeout_ms = 10000,
   poll_interval_ms = 100,
   stop_on_exit = true,
 }
