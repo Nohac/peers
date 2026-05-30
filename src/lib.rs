@@ -1,7 +1,9 @@
 pub mod cli;
 pub mod comments;
 pub mod diff;
+pub mod nvim;
 pub mod review;
+pub mod review_provider;
 pub mod rpc;
 pub mod server;
 pub mod ui_assets;

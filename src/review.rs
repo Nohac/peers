@@ -114,6 +114,7 @@ pub struct ReviewPaths {
     pub events: PathBuf,
     pub review_md: PathBuf,
     pub agent_context: PathBuf,
+    pub session: PathBuf,
 }
 
 pub fn storage_root(repo_root: &Path) -> PathBuf {
@@ -130,6 +131,7 @@ pub fn review_paths(repo_root: &Path, review_id: &str) -> ReviewPaths {
         events: dir.join("events.jsonl"),
         review_md: dir.join("review.md"),
         agent_context: dir.join("agent-context.md"),
+        session: dir.join("session.json"),
         dir,
     }
 }

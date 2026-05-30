@@ -20,6 +20,7 @@ This project is in early development. See [spec.md](./spec.md) for the full impl
 - Clap derive for the CLI
 - gitoxide / `gix` for Git operations
 - Vox for local RPC
+- `tower-lsp-server` for the planned Neovim `peersdiff` LSP
 - `facet` and `facet-json` for serialization
 - Arborium for server-side syntax highlighting
 - TanStack Start frontend
@@ -57,6 +58,52 @@ Agent-oriented usage:
 ```bash
 peers --agent comment add --path src/foo.rs --side new --lines 42:47 --body-file -
 peers agent-context
+```
+
+Neovim session usage:
+
+```bash
+peers nvim
+peers nvim --review rev_123
+```
+
+This starts the local Peers session for a review and prints the Vox and `peersdiff` LSP endpoints that a Neovim integration can attach to.
+The same connection details are written to `.peers/reviews/<review-id>/session.json` while the session is running.
+
+Neovim plugin usage:
+
+The bundled Neovim plugin targets Neovim 0.12.
+
+```lua
+vim.pack.add({
+  { src = "https://github.com/<owner>/peers", name = "peers" },
+})
+
+require("peers").setup({
+  binary = "peers",
+  stop_on_exit = true,
+})
+```
+
+Then run:
+
+```vim
+:PeersReview
+```
+
+During local development from this checkout, point `binary` at Cargo:
+
+```lua
+require("peers").setup({
+  binary = {
+    "cargo",
+    "run",
+    "--manifest-path",
+    "/home/jonas/Development/Rust/committeer/Cargo.toml",
+    "--",
+  },
+  stop_on_exit = true,
+})
 ```
 
 ## Review Storage

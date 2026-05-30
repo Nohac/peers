@@ -24,6 +24,7 @@ Backend stack:
 - gitoxide / `gix` for Git operations.
 - Vox for local RPC.
 - `facet` and `facet-json` for serialization.
+- `thiserror` for custom/domain errors.
 - Arborium for server-side syntax highlighting.
 
 Backend organization should be behavior-oriented:
@@ -32,7 +33,8 @@ Backend organization should be behavior-oriented:
 - `diff.rs`: review target resolution, diff loading, diff normalization, highlighting integration.
 - `review.rs`: review creation, review metadata, review lifecycle, current review selection.
 - `comments.rs`: event model, JSONL parsing/encoding, replay, comment commands, agent context rendering.
-- `rpc.rs`: Vox service trait and RPC-specific request/response DTOs.
+- `review_provider.rs`: cloneable async review provider shared by web RPC, Neovim LSP, and future local clients.
+- `rpc.rs`: Vox service trait and token-checking wrapper around the review provider.
 - `server.rs`: local HTTP server, Vox endpoint, token handling, static/frontend serving.
 - `ui_assets.rs`: embedded frontend assets.
 
@@ -74,6 +76,8 @@ Apply the same rule to Git access:
 - If a concurrent mutable map is truly needed, prefer a purpose-built structure such as `DashMap`.
 - Avoid `tokio::spawn` unless there is a clear lifecycle reason.
 - Prefer local async blocks with `tokio::select!`, `tokio::join!`, `futures::future::join_all`, or similar helpers.
+- Define static protocol names, command names, scope names, labels, local host strings, and repeated messages as top-of-file constants instead of scattering hardcoded strings inline.
+- Use `thiserror` for custom/domain error enums. Keep `anyhow` for application-level propagation and IO/context boundaries.
 
 ## Review Storage
 

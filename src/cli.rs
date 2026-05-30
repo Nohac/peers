@@ -11,6 +11,13 @@ use crate::review::{
     list_reviews, load_review_state, new_comment_id, new_thread_id, now_rfc3339, review_paths,
 };
 
+const VOX_RPC_LABEL: &str = "Vox RPC";
+const NEOVIM_LSP_LABEL: &str = "Neovim LSP";
+const REVIEW_UI_LABEL: &str = "Review UI";
+const FRONTEND_DEV_HINT: &str =
+    "Run `cd frontend && bun run dev` in another terminal, then open the Review UI URL.";
+const SESSION_STOP_HINT: &str = "Press Ctrl-C to stop the local Peers session.";
+
 #[derive(Parser)]
 #[command(name = "peers")]
 #[command(about = "Local Git review tool")]
@@ -36,6 +43,7 @@ enum Command {
         command: CommentCommand,
     },
     AgentContext(AgentContextArgs),
+    Nvim(NvimArgs),
 }
 
 #[derive(Args)]
@@ -138,6 +146,12 @@ struct AgentContextArgs {
     review: Option<String>,
 }
 
+#[derive(Args)]
+struct NvimArgs {
+    #[arg(long)]
+    review: Option<String>,
+}
+
 #[derive(Clone, ValueEnum)]
 enum AuthorKindArg {
     Human,
@@ -193,7 +207,7 @@ pub async fn run() -> Result<()> {
                 ReviewTarget::WorkingTree
             };
             let review_id = create_review(&repo.root, repo.author.clone(), target.clone()).await?;
-            open_review_ui(&repo.root, &review_id, repo.author).await?;
+            open_review_session(&repo.root, &review_id, repo.author).await?;
         }
         Command::Review(args) => match args.command {
             Some(ReviewCommand::Create(create_args)) => {
@@ -218,7 +232,7 @@ pub async fn run() -> Result<()> {
                 };
                 let review_id =
                     create_review(&repo.root, repo.author.clone(), target.clone()).await?;
-                open_review_ui(&repo.root, &review_id, repo.author).await?;
+                open_review_session(&repo.root, &review_id, repo.author).await?;
             }
         },
         Command::Comment { command } => handle_comment(command, &repo.root, repo.author).await?,
@@ -230,12 +244,19 @@ pub async fn run() -> Result<()> {
             let paths = review_paths(&repo.root, &review_id);
             println!("{}", paths.agent_context.display());
         }
+        Command::Nvim(args) => {
+            let review_id = match args.review {
+                Some(review_id) => review_id,
+                None => current_review_id(&repo.root).await?,
+            };
+            open_review_session(&repo.root, &review_id, repo.author).await?;
+        }
     }
 
     Ok(())
 }
 
-async fn open_review_ui(
+async fn open_review_session(
     repo_root: &std::path::Path,
     review_id: &str,
     author: crate::comments::Author,
@@ -243,10 +264,11 @@ async fn open_review_ui(
     let server =
         crate::server::LocalServer::bind(repo_root.to_path_buf(), review_id.to_string(), author)
             .await?;
-    println!("Vox RPC: {}", server.vox_url());
-    println!("Review UI: {}", server.frontend_url());
-    println!("Run `cd frontend && bun run dev` in another terminal, then open the Review UI URL.");
-    println!("Press Ctrl-C to stop the local Vox server.");
+    println!("{VOX_RPC_LABEL}: {}", server.vox_url());
+    println!("{NEOVIM_LSP_LABEL}: {}", server.nvim_lsp_url());
+    println!("{REVIEW_UI_LABEL}: {}", server.frontend_url());
+    println!("{FRONTEND_DEV_HINT}");
+    println!("{SESSION_STOP_HINT}");
     server.run_until_shutdown().await
 }
 
