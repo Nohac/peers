@@ -62,6 +62,10 @@ const HIGHLIGHT_FILE_HEADER: &str = "PeersDiffFileHeader";
 const HIGHLIGHT_HUNK_HEADER: &str = "PeersDiffHunkHeader";
 const HIGHLIGHT_ADD_GUTTER: &str = "PeersDiffAddGutter";
 const HIGHLIGHT_DELETE_GUTTER: &str = "PeersDiffDeleteGutter";
+const HIGHLIGHT_ADD_GUTTER_BACKGROUND: &str = "PeersDiffAddGutterBackground";
+const HIGHLIGHT_DELETE_GUTTER_BACKGROUND: &str = "PeersDiffDeleteGutterBackground";
+const HIGHLIGHT_ADD_LINE_BACKGROUND: &str = "PeersDiffAddLineBackground";
+const HIGHLIGHT_DELETE_LINE_BACKGROUND: &str = "PeersDiffDeleteLineBackground";
 const HIGHLIGHT_LINE_NUMBER: &str = "PeersDiffLineNumber";
 const HIGHLIGHT_COMMENT: &str = "PeersDiffComment";
 const HUNK_HEADER_PREFIX: &str = "@@";
@@ -611,6 +615,13 @@ fn push_source_line(
         ),
         RenderedRow::source(kind, path, side, line_number),
     );
+    if let Some(background_group) = gutter_background_group(kind) {
+        rendered.push_highlight(line, 0, LINE_PREFIX_WIDTH, background_group);
+    }
+    if let Some(background_group) = line_background_group(kind) {
+        let end_col = rendered.lines[line as usize].len() as u32;
+        rendered.push_highlight(line, LINE_PREFIX_WIDTH, end_col, background_group);
+    }
     rendered.push_highlight(line, 0, 5, HIGHLIGHT_LINE_NUMBER);
     rendered.push_highlight(line, 6, 11, HIGHLIGHT_LINE_NUMBER);
     let gutter_group = match kind {
@@ -619,6 +630,22 @@ fn push_source_line(
         _ => HIGHLIGHT_LINE_NUMBER,
     };
     rendered.push_highlight(line, 12, 13, gutter_group);
+}
+
+fn gutter_background_group(kind: &str) -> Option<&'static str> {
+    match kind {
+        ROW_KIND_ADD => Some(HIGHLIGHT_ADD_GUTTER_BACKGROUND),
+        ROW_KIND_DELETE => Some(HIGHLIGHT_DELETE_GUTTER_BACKGROUND),
+        _ => None,
+    }
+}
+
+fn line_background_group(kind: &str) -> Option<&'static str> {
+    match kind {
+        ROW_KIND_ADD => Some(HIGHLIGHT_ADD_LINE_BACKGROUND),
+        ROW_KIND_DELETE => Some(HIGHLIGHT_DELETE_LINE_BACKGROUND),
+        _ => None,
+    }
 }
 
 fn format_line_number(line: Option<u32>) -> String {

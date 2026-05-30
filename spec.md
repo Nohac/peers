@@ -571,7 +571,7 @@ Expected behavior:
 - Peers owns the render model. The `peersdiff` LSP exposes a custom `peers/renderReview` request that returns synthetic lines, row metadata, structural highlights, and symbol metadata derived from the shared review provider.
 - The Lua attachment layer applies rendered lines and extmarks to the synthetic buffer, while Rust remains the source of truth for row semantics and review data.
 - Structural highlights cover file headers, hunk headers, line numbers, add/delete gutter markers, and comment rows. Prefer gutter/prefix color over full-line color unless a stronger visual treatment is required.
-- Current-side added and context rows should mirror Tree-sitter capture highlights from hidden real file buffers so the review buffer follows the user's Neovim theme and language setup. Deleted/base-side rows may start with structural diff coloring only.
+- Current-side added and context rows should mirror Tree-sitter capture highlights from hidden real file buffers so the review buffer follows the user's Neovim theme and language setup. This mirroring must be viewport-scoped for performance on large reviews. Deleted/base-side rows may start with structural diff coloring only.
 - Do not depend on Neovim folds or persistent split sidebars for the primary workflow.
 - The review buffer remains read-only. Comment bodies are entered through a focused writable composer, such as a temporary floating buffer.
 
