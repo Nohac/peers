@@ -40,6 +40,8 @@ local HIGHLIGHT_GROUPS = {
   PeersDiffFileHeader = { link = "Title" },
   PeersDiffHunkHeader = { link = "DiffChange" },
   PeersDiffLineNumber = { link = "LineNr" },
+  PeersDiffEmptyTitle = { link = "Title" },
+  PeersDiffEmptyText = { link = "Normal" },
 }
 local ROW_SIDE_NEW = "new"
 local ROW_SCOPE_LINE = "line"
@@ -347,11 +349,21 @@ local function segments_for_row(state, row)
 end
 
 local function apply_line_segments(buf, review_row, code_start_col, segments)
+  local line = vim.api.nvim_buf_get_lines(buf, review_row, review_row + 1, false)[1]
+  if not line then
+    return
+  end
+
+  local line_len = #line
   for _, segment in ipairs(segments) do
-    vim.api.nvim_buf_set_extmark(buf, SOURCE_NAMESPACE, review_row, code_start_col + segment.start_col, {
-      end_col = code_start_col + segment.end_col,
-      hl_group = segment.group,
-    })
+    local start_col = math.min(line_len, code_start_col + segment.start_col)
+    local end_col = math.min(line_len, code_start_col + segment.end_col)
+    if start_col < end_col then
+      vim.api.nvim_buf_set_extmark(buf, SOURCE_NAMESPACE, review_row, start_col, {
+        end_col = end_col,
+        hl_group = segment.group,
+      })
+    end
   end
 end
 
@@ -436,7 +448,7 @@ local apply_render
 
 local function close_composer(state)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
-    vim.api.nvi_win_close(state.composer_win, true)
+    vim.api.nvim_win_close(state.composer_win, true)
   end
   if state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf) then
     vim.api.nvim_buf_delete(state.composer_buf, { force = true })

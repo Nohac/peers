@@ -75,6 +75,7 @@ const ROW_KIND_CONTEXT: &str = "context";
 const ROW_KIND_ADD: &str = "add";
 const ROW_KIND_DELETE: &str = "delete";
 const ROW_KIND_COMMENT: &str = "comment";
+const ROW_KIND_EMPTY: &str = "empty";
 const SIDE_NEW: &str = "new";
 const SIDE_OLD: &str = "old";
 const HIGHLIGHT_FILE_HEADER: &str = "PeersDiffFileHeader";
@@ -87,11 +88,20 @@ const HIGHLIGHT_ADD_LINE_BACKGROUND: &str = "PeersDiffAddLineBackground";
 const HIGHLIGHT_DELETE_LINE_BACKGROUND: &str = "PeersDiffDeleteLineBackground";
 const HIGHLIGHT_LINE_NUMBER: &str = "PeersDiffLineNumber";
 const HIGHLIGHT_COMMENT: &str = "PeersDiffComment";
+const HIGHLIGHT_EMPTY_TITLE: &str = "PeersDiffEmptyTitle";
+const HIGHLIGHT_EMPTY_TEXT: &str = "PeersDiffEmptyText";
 const HUNK_HEADER_PREFIX: &str = "@@";
 const COMMENT_PREFIX: &str = "      | ";
 const FILE_HEADER_PREFIX: &str = "diff -- ";
 const LINE_NUMBER_WIDTH: usize = 5;
 const LINE_PREFIX_WIDTH: u32 = 14;
+const EMPTY_CARD_MARGIN: &str = "  ";
+const EMPTY_CARD_WIDTH: usize = 62;
+const EMPTY_TITLE: &str = "No file changes";
+const EMPTY_BODY: &str = "This review has no diffs to show.";
+const EMPTY_REFRESH: &str = "Run :PeersReview if you expected local edits to appear.";
+const EMPTY_SYMBOL_NAME: &str = "No file changes";
+const EMPTY_SYMBOL_DETAIL: &str = "empty review";
 
 pub struct NvimLspServer {
     listener: TcpListener,
@@ -381,6 +391,20 @@ struct RenderedRow {
 }
 
 impl RenderedRow {
+    fn meta(kind: &'static str) -> Self {
+        Self {
+            kind,
+            path: None,
+            side: None,
+            source_line: None,
+            code_start_col: None,
+            thread_id: None,
+            comment_id: None,
+            can_edit: None,
+            resolved: None,
+        }
+    }
+
     fn file_meta(kind: &'static str, path: &str) -> Self {
         Self {
             kind,
@@ -495,7 +519,16 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
         symbols: Vec::new(),
     };
 
+    if !review.files.iter().any(|file| file.is_changed) {
+        render_empty_review(&mut rendered);
+        return rendered;
+    }
+
     for file in &review.files {
+        if !file.is_changed {
+            continue;
+        }
+
         let file_line = rendered.push_line(
             format!(
                 "{FILE_HEADER_PREFIX}{}  {:?}  +{} -{}",
@@ -651,6 +684,66 @@ fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
     }
 
     rendered
+}
+
+fn render_empty_review(rendered: &mut RenderedReview) {
+    let start_line = rendered.push_line(empty_border(), RenderedRow::meta(ROW_KIND_EMPTY));
+    rendered.push_line(empty_card_line(""), RenderedRow::meta(ROW_KIND_EMPTY));
+    let title_line = rendered.push_line(
+        empty_card_line(EMPTY_TITLE),
+        RenderedRow::meta(ROW_KIND_EMPTY),
+    );
+    rendered.push_line(
+        empty_card_line(EMPTY_BODY),
+        RenderedRow::meta(ROW_KIND_EMPTY),
+    );
+    rendered.push_line(
+        empty_card_line(EMPTY_REFRESH),
+        RenderedRow::meta(ROW_KIND_EMPTY),
+    );
+    rendered.push_line(empty_card_line(""), RenderedRow::meta(ROW_KIND_EMPTY));
+    let end_line = rendered.push_line(empty_border(), RenderedRow::meta(ROW_KIND_EMPTY));
+
+    rendered.push_highlight(
+        title_line,
+        0,
+        rendered.lines[title_line as usize].len() as u32,
+        HIGHLIGHT_EMPTY_TITLE,
+    );
+    for line in start_line..=end_line {
+        if line != title_line {
+            rendered.push_highlight(
+                line,
+                0,
+                rendered.lines[line as usize].len() as u32,
+                HIGHLIGHT_EMPTY_TEXT,
+            );
+        }
+    }
+    rendered.symbols.push(RenderedSymbol {
+        name: EMPTY_SYMBOL_NAME.to_string(),
+        detail: EMPTY_SYMBOL_DETAIL,
+        kind: SymbolKind::FILE,
+        start_line,
+        end_line,
+        parent: None,
+    });
+}
+
+fn empty_border() -> String {
+    format!(
+        "{EMPTY_CARD_MARGIN}+{}+",
+        "-".repeat(EMPTY_CARD_WIDTH.saturating_sub(2))
+    )
+}
+
+fn empty_card_line(text: &str) -> String {
+    let inner_width = EMPTY_CARD_WIDTH.saturating_sub(4);
+    let truncated: String = text.chars().take(inner_width).collect();
+    format!(
+        "{EMPTY_CARD_MARGIN}| {truncated:<inner_width$} |",
+        inner_width = inner_width
+    )
 }
 
 fn push_source_line(
