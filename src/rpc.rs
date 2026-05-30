@@ -3,6 +3,7 @@ use thiserror::Error;
 
 use crate::review_provider::ReviewProvider;
 
+pub use crate::realtime::ReviewUpdate;
 pub use crate::review_provider::{
     ApiCommentThread, ApiCommit, ApiReviewComment, ApiReviewPayload, ApiThreadAnchor,
     CommentRequest, CreateThreadRequest, EditCommentRequest, MarkFileViewedRequest,
@@ -18,6 +19,11 @@ enum ReviewApiError {
 #[vox::service]
 pub trait PeersReview {
     async fn get_review(&self, token: String) -> std::result::Result<ApiReviewPayload, String>;
+    async fn subscribe_updates(
+        &self,
+        token: String,
+        updates: vox::Tx<ReviewUpdate>,
+    ) -> std::result::Result<(), String>;
     async fn refresh_diff(&self, token: String) -> std::result::Result<ApiReviewPayload, String>;
     async fn create_thread(
         &self,
@@ -89,6 +95,23 @@ impl PeersReview for ReviewApi {
     async fn get_review(&self, token: String) -> std::result::Result<ApiReviewPayload, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider.get_review().await.map_err(format_error)
+    }
+
+    async fn subscribe_updates(
+        &self,
+        token: String,
+        updates: vox::Tx<ReviewUpdate>,
+    ) -> std::result::Result<(), String> {
+        self.check_token(&token).map_err(format_error)?;
+        let mut receiver = self.provider.updates().subscribe();
+        tokio::spawn(async move {
+            while let Ok(update) = receiver.recv().await {
+                if updates.send(update).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(())
     }
 
     async fn refresh_diff(&self, token: String) -> std::result::Result<ApiReviewPayload, String> {
@@ -208,3 +231,5 @@ impl PeersReview for ReviewApi {
 fn format_error(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
+//test
+// peers realtime manual rpc

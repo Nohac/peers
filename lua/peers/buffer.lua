@@ -98,6 +98,11 @@ local AUTOCMD_EVENTS = {
   "WinResized",
   "WinScrolled",
 }
+local VIEW_SAVE_EVENTS = {
+  "BufLeave",
+  "WinLeave",
+  "WinScrolled",
+}
 local CACHE_KEY_SEPARATOR = ":"
 local RENDER_STATES = {}
 
@@ -113,7 +118,7 @@ end
 local function set_review_options(buf)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "hide"
-  vim.bo[buf].buflisted = false
+  vim.bo[buf].buflisted = true
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = FILETYPE
 end
@@ -399,14 +404,17 @@ local function apply_diagnostics(buf, diagnostics)
 end
 
 local function source_buffer(root, path)
-  local full_path = root .. "/" .. path
+  local full_path = vim.fn.fnamemodify(root .. "/" .. path, ":p")
   if vim.fn.filereadable(full_path) ~= 1 then
     return nil
   end
 
+  local existing = existing_buffer(full_path)
   local buf = vim.fn.bufadd(full_path)
   vim.fn.bufload(buf)
-  vim.bo[buf].buflisted = false
+  if not existing then
+    vim.bo[buf].buflisted = false
+  end
 
   if vim.bo[buf].filetype == "" then
     local filetype = vim.filetype.match({ filename = full_path })
@@ -583,6 +591,64 @@ local function visible_row_ranges(buf)
   return ranges
 end
 
+local function buffer_windows(buf)
+  local windows = {}
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+      table.insert(windows, win)
+    end
+  end
+  return windows
+end
+
+local function save_win_view(win)
+  local ok, view = pcall(vim.api.nvim_win_call, win, vim.fn.winsaveview)
+  if ok then
+    return view
+  end
+  return nil
+end
+
+local function save_buffer_views(buf)
+  local views = {}
+  for _, win in ipairs(buffer_windows(buf)) do
+    views[win] = save_win_view(win)
+  end
+  return views
+end
+
+local function restore_win_view(win, view)
+  if not view or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.fn.winrestview(view)
+  end)
+end
+
+local function restore_buffer_views(views)
+  for win, view in pairs(views or {}) do
+    restore_win_view(win, view)
+  end
+end
+
+local function save_current_view(buf)
+  local state = RENDER_STATES[buf]
+  if not state or vim.api.nvim_get_current_buf() ~= buf then
+    return
+  end
+  state.view = vim.fn.winsaveview()
+end
+
+local function restore_current_view(buf)
+  local state = RENDER_STATES[buf]
+  if not state or not state.view or vim.api.nvim_get_current_buf() ~= buf then
+    return
+  end
+  pcall(vim.fn.winrestview, state.view)
+end
+
 local function mirror_visible_treesitter(buf)
   local state = RENDER_STATES[buf]
   if not state or not vim.api.nvim_buf_is_valid(buf) then
@@ -633,6 +699,20 @@ local function setup_mirror_autocmds(buf)
     group = state.augroup,
     callback = function()
       schedule_visible_mirror(buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd(VIEW_SAVE_EVENTS, {
+    group = state.augroup,
+    buffer = buf,
+    callback = function()
+      save_current_view(buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = state.augroup,
+    buffer = buf,
+    callback = function()
+      restore_current_view(buf)
     end,
   })
   vim.api.nvim_create_autocmd("BufWipeout", {
@@ -763,6 +843,8 @@ function apply_render(root, buf, render, client_id)
   end
 
   local existing = RENDER_STATES[buf]
+  local visible_views = save_buffer_views(buf)
+  local remembered_view = existing and existing.view or nil
   if existing then
     close_composer(existing)
   end
@@ -779,7 +861,9 @@ function apply_render(root, buf, render, client_id)
     source_lsp_buffers = {},
     source_segments = {},
     scheduled = false,
+    view = remembered_view,
   }
+  restore_buffer_views(visible_views)
   setup_mirror_autocmds(buf)
   mirror_visible_treesitter(buf)
 end
@@ -948,6 +1032,26 @@ end
 
 function M.is_review_buffer(buf)
   return RENDER_STATES[buf or vim.api.nvim_get_current_buf()] ~= nil
+end
+
+function M.refresh_from_client(client_id)
+  for buf, state in pairs(RENDER_STATES) do
+    if state.client_id == client_id and vim.api.nvim_buf_is_valid(buf) then
+      lsp.render_now(client_id, buf, function(render)
+        apply_render(state.root, buf, render, client_id)
+      end)
+    end
+  end
+end
+
+function M.refresh_all()
+  for buf, state in pairs(RENDER_STATES) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      lsp.render_now(state.client_id, buf, function(render)
+        apply_render(state.root, buf, render, state.client_id)
+      end)
+    end
+  end
 end
 
 function M.source_location(buf)

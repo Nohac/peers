@@ -5,6 +5,7 @@ local MIN_NVIM_VERSION = { 0, 12, 0 }
 local SESSION_FILE_NAME = "session.json"
 local SESSION_DECODE_WARNING = "Could not decode Peers session.json"
 local STALE_SESSION_MESSAGE = "Discarded stale Peers session"
+local NON_REALTIME_SESSION_MESSAGE = "Discarded Peers session without realtime support"
 local NO_GIT_REPO_ERROR = "Not inside a git repo"
 local NO_CURRENT_REVIEW_ERROR = "No current Peers review. Run `peers diff` or `peers review` first."
 local START_FAILURE_ERROR = "Failed to start `peers nvim`"
@@ -14,7 +15,14 @@ local BINARY_NOT_EXECUTABLE_ERROR = "Peers binary is not executable"
 local CARGO_BINARY = "cargo"
 local CARGO_MANIFEST_FILE = "Cargo.toml"
 local CARGO_RUN_ARGS = { "run", "--manifest-path" }
+local ARG_NVIM_LISTEN = "--nvim-listen"
+local DOT_PEERS_DIR = ".peers"
+local NVIM_SOCKET_PREFIX = "nvim-"
+local NVIM_SOCKET_SUFFIX = ".sock"
+local MKDIR_PARENTS = "p"
 local STOP_TIMEOUT_MS = 1000
+
+local nvim_servername = nil
 
 local function read_file(path)
   local file = io.open(path, "r")
@@ -46,7 +54,7 @@ local function discard_session(root, review_id, active)
   end
 end
 
-local function command_for_review(config, review_id)
+local function command_for_review(config, root, review_id)
   local command
   if type(config.binary) == "table" then
     command = vim.deepcopy(config.binary)
@@ -55,6 +63,7 @@ local function command_for_review(config, review_id)
   end
 
   vim.list_extend(command, { "nvim", "--review", review_id })
+  vim.list_extend(command, { ARG_NVIM_LISTEN, M.nvim_server(root) })
   return command
 end
 
@@ -120,6 +129,19 @@ function M.current_review_id(root)
   return vim.trim(body)
 end
 
+function M.nvim_server(root)
+  if nvim_servername then
+    return nvim_servername
+  end
+
+  local socket_dir = root .. "/" .. DOT_PEERS_DIR
+  vim.fn.mkdir(socket_dir, MKDIR_PARENTS)
+  local socket = socket_dir .. "/" .. NVIM_SOCKET_PREFIX .. tostring(vim.uv.os_getpid()) .. NVIM_SOCKET_SUFFIX
+  os.remove(socket)
+  nvim_servername = vim.fn.serverstart(socket)
+  return nvim_servername
+end
+
 function M.read_session(root, review_id)
   local body = read_file(session_path(root, review_id))
   if not body then
@@ -137,6 +159,11 @@ end
 
 function M.read_live_session(root, review_id)
   local active = M.read_session(root, review_id)
+  if active and active.realtime ~= true then
+    discard_session(root, review_id, active)
+    vim.notify(NON_REALTIME_SESSION_MESSAGE, vim.log.levels.INFO)
+    return nil
+  end
   if active and pid_is_live(active.pid) then
     return active
   end
@@ -151,7 +178,7 @@ function M.start(config, root, review_id)
     return
   end
 
-  active_job = vim.fn.jobstart(executable_command(command_for_review(config, review_id)), {
+  active_job = vim.fn.jobstart(executable_command(command_for_review(config, root, review_id)), {
     cwd = root,
     stdout_buffered = false,
     stderr_buffered = false,

@@ -8,6 +8,8 @@ use tokio::net::TcpListener;
 
 use crate::comments::Author;
 use crate::nvim::NvimLspServer;
+use crate::nvim_rpc::spawn_nvim_refresh_notifier;
+use crate::realtime::{ReviewUpdateBroadcaster, run_realtime_watcher};
 use crate::review::{now_rfc3339, review_paths};
 use crate::review_provider::ReviewProvider;
 use crate::rpc::{PeersReviewDispatcher, ReviewApi};
@@ -21,22 +23,30 @@ const VOX_BIND_ERROR: &str = "failed to bind local Peers Vox server";
 const SESSION_ENCODE_ERROR: &str = "failed to encode Peers session info";
 const SIGTERM_HANDLER_ERROR: &str = "failed to install SIGTERM handler";
 const CTRL_C_LISTEN_ERROR: &str = "failed to listen for Ctrl-C";
+const REALTIME_WATCHER_ERROR: &str = "Peers realtime watcher stopped";
 
 pub struct LocalServer {
     listener: TcpListener,
     addr: SocketAddr,
     nvim_lsp: NvimLspServer,
     token: String,
+    nvim_listen: Option<String>,
     provider: ReviewProvider,
 }
 
 impl LocalServer {
-    pub async fn bind(repo_root: PathBuf, review_id: String, author: Author) -> Result<Self> {
+    pub async fn bind(
+        repo_root: PathBuf,
+        review_id: String,
+        author: Author,
+        nvim_listen: Option<String>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind((LOOPBACK_BIND_HOST, 0))
             .await
             .context(VOX_BIND_ERROR)?;
         let addr = listener.local_addr()?;
-        let provider = ReviewProvider::new(repo_root, review_id, author);
+        let updates = ReviewUpdateBroadcaster::new();
+        let provider = ReviewProvider::new(repo_root, review_id, author, updates);
         let nvim_lsp = NvimLspServer::bind(provider.clone()).await?;
 
         Ok(Self {
@@ -44,6 +54,7 @@ impl LocalServer {
             addr,
             nvim_lsp,
             token: new_token(),
+            nvim_listen,
             provider,
         })
     }
@@ -69,6 +80,7 @@ impl LocalServer {
             listener,
             nvim_lsp,
             token,
+            nvim_listen,
             provider,
             ..
         } = self;
@@ -87,14 +99,22 @@ impl LocalServer {
                 token
             ),
             token: token.clone(),
+            realtime: true,
+            nvim_listen: nvim_listen.clone(),
             started_at: now_rfc3339()?,
         };
         write_session_info(&session_path, &session_info).await?;
 
         let ws_listener = vox::WsListener::from_tcp(listener);
-        let api = ReviewApi::new(provider, token);
+        let api = ReviewApi::new(provider.clone(), token);
         let server = vox::serve_listener(ws_listener, PeersReviewDispatcher::new(api));
         let lsp_server = nvim_lsp.run();
+        spawn_realtime_watcher(
+            provider.repo_root().to_path_buf(),
+            provider.review_id().to_string(),
+            provider.updates(),
+        );
+        spawn_nvim_refresh_notifier(provider.updates(), nvim_listen);
 
         let result = tokio::select! {
             result = server => {
@@ -111,6 +131,14 @@ impl LocalServer {
     }
 }
 
+fn spawn_realtime_watcher(repo_root: PathBuf, review_id: String, updates: ReviewUpdateBroadcaster) {
+    tokio::spawn(async move {
+        if let Err(error) = run_realtime_watcher(repo_root, review_id, updates).await {
+            eprintln!("{REALTIME_WATCHER_ERROR}: {error:#}");
+        }
+    });
+}
+
 #[derive(Debug, Facet)]
 struct ReviewSessionInfo {
     pid: u32,
@@ -119,6 +147,8 @@ struct ReviewSessionInfo {
     nvim_lsp_url: String,
     frontend_url: String,
     token: String,
+    realtime: bool,
+    nvim_listen: Option<String>,
     started_at: String,
 }
 

@@ -5,6 +5,7 @@ import type { Caller, MethodDescriptor, ServiceDescriptor, VoxCall, Dispatcher, 
 import { session, voxServiceMetadata } from "@bearcove/vox-core";
 import { wsConnector } from "@bearcove/vox-ws";
 import { RpcError } from "@bearcove/vox-core";
+import { Tx, argElementRefsForMethod, bindChannelsForTypeRefs, finalizeBoundChannelsForTypeRefs } from "@bearcove/vox-core";
 
 // Named type definitions
 export type FileStatus =
@@ -108,6 +109,11 @@ export interface ApiReviewPayload {
   commits: ApiCommit[];
 }
 
+export interface ReviewUpdate {
+  kind: string;
+  sequence: bigint;
+}
+
 export type FileSide =
   | { tag: 'Old' }
   | { tag: 'New' };
@@ -151,6 +157,12 @@ export interface SubmitReviewRequest {
 // Request/Response type aliases
 export type GetReviewRequest = [string];
 export type GetReviewResponse = { ok: true; value: ApiReviewPayload } | { ok: false; error: string };
+
+export type SubscribeUpdatesRequest = [
+  string, // token
+  Tx<ReviewUpdate>, // updates
+];
+export type SubscribeUpdatesResponse = { ok: true; value: void } | { ok: false; error: string };
 
 export type RefreshDiffRequest = [string];
 export type RefreshDiffResponse = { ok: true; value: ApiReviewPayload } | { ok: false; error: string };
@@ -196,6 +208,7 @@ export type SubmitReviewResponse = { ok: true; value: ApiReviewPayload } | { ok:
 // Caller interface for PeersReview
 export interface PeersReviewCaller {
   getReview(token: string): Promise<{ ok: true; value: ApiReviewPayload } | { ok: false; error: string }>;
+  subscribeUpdates(token: string, updates: Tx<ReviewUpdate>): Promise<{ ok: true; value: void } | { ok: false; error: string }>;
   refreshDiff(token: string): Promise<{ ok: true; value: ApiReviewPayload } | { ok: false; error: string }>;
   createThread(token: string, request: CreateThreadRequest): Promise<{ ok: true; value: ApiReviewPayload } | { ok: false; error: string }>;
   replyToThread(token: string, request: ThreadBodyRequest): Promise<{ ok: true; value: ApiReviewPayload } | { ok: false; error: string }>;
@@ -230,6 +243,39 @@ export class PeersReviewClient implements PeersReviewCaller {
       } catch (e: any) {
         if (e instanceof RpcError && e.isUserError()) {
           return { ok: false, error: e.userError } as { ok: true; value: ApiReviewPayload } | { ok: false; error: string };
+        }
+        throw e;
+      }
+  }
+
+  async subscribeUpdates(token: string, updates: Tx<ReviewUpdate>): Promise<{ ok: true; value: void } | { ok: false; error: string }> {
+    const descriptor = peersReview_subscribeUpdates_method;
+    const sendSchemas = peersReview_descriptor.send_schemas;
+    const argTypeRefs = argElementRefsForMethod(descriptor.id, sendSchemas);
+    const prepareRetry = () => {
+      const channels = bindChannelsForTypeRefs(
+        argTypeRefs,
+        [token, updates],
+        this.caller.getChannelAllocator(),
+        this.caller.getChannelRegistry(),
+        sendSchemas.schemas,
+      );
+      const payload = new Uint8Array(0);
+      return { payload, channels };
+    };
+      try {
+        const value = await this.caller.call({
+          method: "PeersReview.subscribeUpdates",
+          args: { token, updates },
+          descriptor,
+          sendSchemas,
+          prepareRetry,
+          finalizeChannels: () => finalizeBoundChannelsForTypeRefs(argTypeRefs, [token, updates], sendSchemas.schemas),
+        });
+        return { ok: true, value } as { ok: true; value: void } | { ok: false; error: string };
+      } catch (e: any) {
+        if (e instanceof RpcError && e.isUserError()) {
+          return { ok: false, error: e.userError } as { ok: true; value: void } | { ok: false; error: string };
         }
         throw e;
       }
@@ -443,6 +489,7 @@ export async function connectPeersReview(
 // Handler interface for PeersReview
 export interface PeersReviewHandler {
   getReview(token: string): Promise<{ ok: true; value: ApiReviewPayload } | { ok: false; error: string }> | { ok: true; value: ApiReviewPayload } | { ok: false; error: string };
+  subscribeUpdates(token: string, updates: Tx<ReviewUpdate>): Promise<{ ok: true; value: void } | { ok: false; error: string }> | { ok: true; value: void } | { ok: false; error: string };
   refreshDiff(token: string): Promise<{ ok: true; value: ApiReviewPayload } | { ok: false; error: string }> | { ok: true; value: ApiReviewPayload } | { ok: false; error: string };
   createThread(token: string, request: CreateThreadRequest): Promise<{ ok: true; value: ApiReviewPayload } | { ok: false; error: string }> | { ok: true; value: ApiReviewPayload } | { ok: false; error: string };
   replyToThread(token: string, request: ThreadBodyRequest): Promise<{ ok: true; value: ApiReviewPayload } | { ok: false; error: string }> | { ok: true; value: ApiReviewPayload } | { ok: false; error: string };
@@ -471,6 +518,13 @@ export class PeersReviewDispatcher implements Dispatcher {
     if (method.id === 0xa744d74a9d4feccan) {
       try {
         const result = await this.handler.getReview(args[0] as string);
+        if (result.ok) call.reply(result.value); else call.replyErr(result.error);
+      } catch (error) {
+        call.replyInternalError(error instanceof Error ? error.message : String(error));
+      }
+    } else if (method.id === 0xf2b27e634797227an) {
+      try {
+        const result = await this.handler.subscribeUpdates(args[0] as string, args[1] as Tx<ReviewUpdate>);
         if (result.ok) call.reply(result.value); else call.replyErr(result.error);
       } catch (error) {
         call.replyInternalError(error instanceof Error ? error.message : String(error));
@@ -578,9 +632,13 @@ export const peersReview_send_schemas: import("@bearcove/vox-core").ServiceSendS
     [0xf480e182ef0815f5n, { id: 0xf480e182ef0815f5n, type_params: [], kind: { tag: 'struct', name: 'ApiCommentThread', fields: [{ name: 'id', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'scope', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'path', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'line_label', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'anchor', type_ref: { tag: 'concrete', type_id: 0xaf66cc6f4de6af5an, args: [] }, required: true }, { name: 'resolved', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'comments', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xda9807692e9b64b3n, args: [] }] }, required: true }] } }],
     [0x760638aaadca4400n, { id: 0x760638aaadca4400n, type_params: [], kind: { tag: 'struct', name: 'ApiCommit', fields: [{ name: 'oid', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'summary', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }],
     [0x8d30dce9bc2af470n, { id: 0x8d30dce9bc2af470n, type_params: [], kind: { tag: 'struct', name: 'ApiReviewPayload', fields: [{ name: 'review_id', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'target_label', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'is_branch_review', type_ref: { tag: 'concrete', type_id: 0x178367a87f66fb46n, args: [] }, required: true }, { name: 'files', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xb02b01faff3dcd5cn, args: [] }] }, required: true }, { name: 'file_contents_by_path', type_ref: { tag: 'concrete', type_id: 0xd2090ac76e20f7e9n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, { tag: 'concrete', type_id: 0x0cc4f73ac3531f6dn, args: [] }] }, required: true }, { name: 'file_diffs_by_path', type_ref: { tag: 'concrete', type_id: 0xd2090ac76e20f7e9n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, { tag: 'concrete', type_id: 0x00948c0df63c1a01n, args: [] }] }, required: true }, { name: 'threads', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xf480e182ef0815f5n, args: [] }] }, required: true }, { name: 'review_threads', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0xf480e182ef0815f5n, args: [] }] }, required: true }, { name: 'commits', type_ref: { tag: 'concrete', type_id: 0x0a96b404b4d79d67n, args: [{ tag: 'concrete', type_id: 0x760638aaadca4400n, args: [] }] }, required: true }] } }],
+    [0xd9356298b81639acn, { id: 0xd9356298b81639acn, type_params: [], kind: { tag: 'primitive', primitive_type: 'u64' } }],
+    [0x39e64c4dbae3fd74n, { id: 0x39e64c4dbae3fd74n, type_params: [], kind: { tag: 'struct', name: 'ReviewUpdate', fields: [{ name: 'kind', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'sequence', type_ref: { tag: 'concrete', type_id: 0xd9356298b81639acn, args: [] }, required: true }] } }],
+    [0xc886545a493d06ebn, { id: 0xc886545a493d06ebn, type_params: ['T'], kind: { tag: 'channel', direction: 'tx', element: { tag: 'var', name: 'T' } } }],
+    [0xba0496aa8cee7a4cn, { id: 0xba0496aa8cee7a4cn, type_params: ['T0', 'T1'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }] } }],
+    [0xbc5c33249a2dc720n, { id: 0xbc5c33249a2dc720n, type_params: [], kind: { tag: 'primitive', primitive_type: 'unit' } }],
     [0xdddb435492d4bfd9n, { id: 0xdddb435492d4bfd9n, type_params: [], kind: { tag: 'enum', name: 'FileSide', variants: [{ name: 'Old', index: 0, payload: { tag: 'unit' } }, { name: 'New', index: 1, payload: { tag: 'unit' } }] } }],
     [0xc35b49af6d0da0fcn, { id: 0xc35b49af6d0da0fcn, type_params: [], kind: { tag: 'struct', name: 'CreateThreadRequest', fields: [{ name: 'scope', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'path', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, required: true }, { name: 'side', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0xdddb435492d4bfd9n, args: [] }] }, required: true }, { name: 'start_line', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'end_line', type_ref: { tag: 'concrete', type_id: 0xdcafd4de6b7969bbn, args: [{ tag: 'concrete', type_id: 0x281c5be4f2ee63b4n, args: [] }] }, required: true }, { name: 'body', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }],
-    [0xba0496aa8cee7a4cn, { id: 0xba0496aa8cee7a4cn, type_params: ['T0', 'T1'], kind: { tag: 'tuple', elements: [{ tag: 'var', name: 'T0' }, { tag: 'var', name: 'T1' }] } }],
     [0x82e1acaf19080929n, { id: 0x82e1acaf19080929n, type_params: [], kind: { tag: 'struct', name: 'ThreadBodyRequest', fields: [{ name: 'thread_id', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'body', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }],
     [0xde9b14585005eddbn, { id: 0xde9b14585005eddbn, type_params: [], kind: { tag: 'struct', name: 'EditCommentRequest', fields: [{ name: 'comment_id', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }, { name: 'body', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }],
     [0x2f01e891755fde36n, { id: 0x2f01e891755fde36n, type_params: [], kind: { tag: 'struct', name: 'CommentRequest', fields: [{ name: 'comment_id', type_ref: { tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, required: true }] } }],
@@ -590,6 +648,7 @@ export const peersReview_send_schemas: import("@bearcove/vox-core").ServiceSendS
   ]),
   methods: new Map<bigint, import("@bearcove/vox-core").MethodSendSchemas>([
     [0xa744d74a9d4feccan, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x8d30dce9bc2af470n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }] } }],
+    [0xf2b27e634797227an, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, { tag: 'concrete', type_id: 0xc886545a493d06ebn, args: [{ tag: 'concrete', type_id: 0x39e64c4dbae3fd74n, args: [] }] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0xbc5c33249a2dc720n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }] } }],
     [0xd5a6f04da6d80aden, { argsRootRef: { tag: 'concrete', type_id: 0x6847ab90feda71c1n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x8d30dce9bc2af470n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }] } }],
     [0x0232da353c47a76cn, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, { tag: 'concrete', type_id: 0xc35b49af6d0da0fcn, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x8d30dce9bc2af470n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }] } }],
     [0xd98f694a3ac8ad18n, { argsRootRef: { tag: 'concrete', type_id: 0xba0496aa8cee7a4cn, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }, { tag: 'concrete', type_id: 0x82e1acaf19080929n, args: [] }] }, responseRootRef: { tag: 'concrete', type_id: 0x42046de663beeef0n, args: [{ tag: 'concrete', type_id: 0x8d30dce9bc2af470n, args: [] }, { tag: 'concrete', type_id: 0x4cf4b2aeb98a1939n, args: [{ tag: 'concrete', type_id: 0x6d7dce914ee150e8n, args: [] }] }] } }],
@@ -606,6 +665,12 @@ export const peersReview_send_schemas: import("@bearcove/vox-core").ServiceSendS
 export const peersReview_getReview_method: MethodDescriptor = {
   name: 'getReview',
   id: 0xa744d74a9d4feccan,
+  retry: { persist: false, idem: false },
+};
+
+export const peersReview_subscribeUpdates_method: MethodDescriptor = {
+  name: 'subscribeUpdates',
+  id: 0xf2b27e634797227an,
   retry: { persist: false, idem: false },
 };
 
@@ -675,6 +740,7 @@ export const peersReview_descriptor: ServiceDescriptor = {
   send_schemas: peersReview_send_schemas,
   methods: new Map<bigint, MethodDescriptor>([
     [peersReview_getReview_method.id, peersReview_getReview_method],
+    [peersReview_subscribeUpdates_method.id, peersReview_subscribeUpdates_method],
     [peersReview_refreshDiff_method.id, peersReview_refreshDiff_method],
     [peersReview_createThread_method.id, peersReview_createThread_method],
     [peersReview_replyToThread_method.id, peersReview_replyToThread_method],

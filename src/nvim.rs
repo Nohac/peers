@@ -67,6 +67,7 @@ const ACTION_EDIT_COMMENT: &str = "Peers: Edit comment";
 const ACTION_DELETE_COMMENT: &str = "Peers: Delete comment";
 const ACTION_RESOLVE_THREAD: &str = "Peers: Resolve thread";
 const ACTION_REOPEN_THREAD: &str = "Peers: Reopen thread";
+const NOTIFICATION_REVIEW_UPDATED: &str = "peers/reviewUpdated";
 const METHOD_RENDER_REVIEW: &str = "peers/renderReview";
 const METHOD_CREATE_THREAD: &str = "peers/createThread";
 const METHOD_REPLY_TO_THREAD: &str = "peers/replyToThread";
@@ -132,6 +133,14 @@ const THREAD_BODY_PREFIX: &str = "│ │ ";
 const THREAD_FOOTER: &str = "│ ╰─";
 const THREAD_COUNT_SEPARATOR: &str = " ";
 const THREAD_BLANK: &str = "│ │";
+
+struct ReviewUpdatedNotification;
+
+impl notification::Notification for ReviewUpdatedNotification {
+    type Params = LSPAny;
+
+    const METHOD: &'static str = NOTIFICATION_REVIEW_UPDATED;
+}
 
 pub struct NvimLspServer {
     listener: TcpListener,
@@ -316,6 +325,18 @@ impl LanguageServer for PeersDiffLanguageServer {
         self.client
             .log_message(MessageType::INFO, LSP_ATTACHED_MESSAGE)
             .await;
+        let client = self.client.clone();
+        let mut receiver = self.provider.updates().subscribe();
+        tokio::spawn(async move {
+            while let Ok(update) = receiver.recv().await {
+                client
+                    .send_notification::<ReviewUpdatedNotification>(review_update_param(
+                        update.kind,
+                        update.sequence,
+                    ))
+                    .await;
+            }
+        });
     }
 
     async fn shutdown(&self) -> LspResult<()> {
@@ -1620,4 +1641,11 @@ fn invalid_field(field: &str) -> LspError {
 
 fn lsp_number(value: u32) -> LSPAny {
     LSPAny::Number(value.into())
+}
+
+fn review_update_param(kind: String, sequence: u64) -> LSPAny {
+    let mut object = LSPObject::new();
+    object.insert("kind".to_string(), LSPAny::String(kind));
+    object.insert("sequence".to_string(), LSPAny::Number(sequence.into()));
+    LSPAny::Object(object)
 }

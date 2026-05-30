@@ -1,0 +1,465 @@
+use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use facet::Facet;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::sync::{broadcast, mpsc};
+use tokio::time;
+
+use crate::review::{regenerate_outputs, review_paths};
+
+const REVIEW_CHANGED: &str = "review_changed";
+const DIFF_CHANGED: &str = "diff_changed";
+const BROADCAST_CAPACITY: usize = 256;
+const WATCH_CHANNEL_CAPACITY: usize = 256;
+const WATCH_DEBOUNCE_MS: u64 = 120;
+const WATCHER_CREATE_ERROR: &str = "failed to create Peers realtime watcher";
+const WATCH_REPO_ERROR: &str = "failed to watch repository for Peers realtime updates";
+const WATCH_EVENTS_ERROR: &str = "failed to watch Peers review event log";
+const WATCH_EVENT_WARNING: &str = "Peers realtime watch event failed";
+const WATCH_REFRESH_WARNING: &str = "Peers realtime watch refresh failed";
+const WATCHER_START_ERROR: &str = "Peers realtime notify watcher unavailable";
+const GITIGNORE_BUILD_ERROR: &str = "failed to build Peers realtime gitignore matcher";
+const REGENERATE_OUTPUTS_ERROR: &str = "failed to regenerate review outputs after event log change";
+const DOT_GIT_DIR: &str = ".git";
+const DOT_PEERS_DIR: &str = ".peers";
+const GITIGNORE_FILE: &str = ".gitignore";
+const GIT_INDEX_FILE: &str = "index";
+const GIT_BINARY: &str = "git";
+const GIT_LS_FILES_ARG: &str = "ls-files";
+const GIT_CACHED_OTHERS_ARG: &str = "-co";
+const GIT_EXCLUDE_STANDARD_ARG: &str = "--exclude-standard";
+const GIT_NULL_ARG: &str = "-z";
+
+#[derive(Clone, Debug, Facet)]
+pub struct ReviewUpdate {
+    pub kind: String,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviewUpdateBroadcaster {
+    sender: broadcast::Sender<ReviewUpdate>,
+    sequence: Arc<AtomicU64>,
+}
+
+impl ReviewUpdateBroadcaster {
+    pub fn new() -> Self {
+        let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            sender,
+            sequence: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ReviewUpdate> {
+        self.sender.subscribe()
+    }
+
+    pub fn notify_review_changed(&self) {
+        self.notify(REVIEW_CHANGED);
+    }
+
+    pub fn notify_diff_changed(&self) {
+        self.notify(DIFF_CHANGED);
+    }
+
+    fn notify(&self, kind: &str) {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.sender.send(ReviewUpdate {
+            kind: kind.to_string(),
+            sequence,
+        });
+    }
+}
+
+impl Default for ReviewUpdateBroadcaster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub async fn run_realtime_watcher(
+    repo_root: PathBuf,
+    review_id: String,
+    updates: ReviewUpdateBroadcaster,
+) -> Result<()> {
+    let paths = review_paths(&repo_root, &review_id);
+    let events_path = paths.events;
+    let peers_dir = repo_root.join(DOT_PEERS_DIR);
+    let git_dir = repo_root.join(DOT_GIT_DIR);
+    let gitignore = build_gitignore(&repo_root).context(GITIGNORE_BUILD_ERROR)?;
+    let (mut watcher, mut watch_rx, mut watched_dirs) =
+        start_notify_watcher(&repo_root, &events_path).context(WATCHER_START_ERROR)?;
+
+    let mut snapshot = WatchSnapshot::capture(&repo_root, &events_path);
+
+    loop {
+        let mut pending = PendingUpdate::default();
+
+        let Some(event) = watch_rx.recv().await else {
+            return Ok(());
+        };
+        classify_watch_result(
+            event,
+            &events_path,
+            &repo_root,
+            &peers_dir,
+            &git_dir,
+            &gitignore,
+            &mut pending,
+        );
+
+        time::sleep(Duration::from_millis(WATCH_DEBOUNCE_MS)).await;
+        while let Ok(event) = watch_rx.try_recv() {
+            classify_watch_result(
+                event,
+                &events_path,
+                &repo_root,
+                &peers_dir,
+                &git_dir,
+                &gitignore,
+                &mut pending,
+            );
+        }
+        snapshot.capture_changes(&repo_root, &events_path, &mut pending);
+        if pending.diff_changed {
+            if let Err(error) = watch_repo_paths(&mut watcher, &repo_root, &mut watched_dirs) {
+                eprintln!("{WATCH_REFRESH_WARNING}: {error:#}");
+            }
+        }
+
+        publish_pending(&repo_root, &review_id, &updates, pending).await?;
+    }
+}
+
+async fn publish_pending(
+    repo_root: &Path,
+    review_id: &str,
+    updates: &ReviewUpdateBroadcaster,
+    pending: PendingUpdate,
+) -> Result<()> {
+    if pending.review_changed {
+        regenerate_outputs(repo_root, review_id)
+            .await
+            .context(REGENERATE_OUTPUTS_ERROR)?;
+        updates.notify_review_changed();
+    }
+    if pending.diff_changed {
+        updates.notify_diff_changed();
+    }
+    Ok(())
+}
+
+fn start_notify_watcher(
+    repo_root: &Path,
+    events_path: &Path,
+) -> Result<(
+    RecommendedWatcher,
+    mpsc::Receiver<notify::Result<Event>>,
+    BTreeSet<PathBuf>,
+)> {
+    let (watch_tx, watch_rx) = mpsc::channel(WATCH_CHANNEL_CAPACITY);
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = watch_tx.blocking_send(event);
+    })
+    .context(WATCHER_CREATE_ERROR)?;
+    let mut watched_dirs = BTreeSet::new();
+    watch_repo_paths(&mut watcher, repo_root, &mut watched_dirs).context(WATCH_REPO_ERROR)?;
+    watcher
+        .watch(events_path, RecursiveMode::NonRecursive)
+        .context(WATCH_EVENTS_ERROR)?;
+    Ok((watcher, watch_rx, watched_dirs))
+}
+
+fn watch_repo_paths(
+    watcher: &mut RecommendedWatcher,
+    repo_root: &Path,
+    watched_dirs: &mut BTreeSet<PathBuf>,
+) -> notify::Result<()> {
+    let directories = git_visible_directories(repo_root);
+    if directories.is_empty() {
+        watcher.watch(repo_root, RecursiveMode::Recursive)?;
+        return Ok(());
+    }
+
+    for directory in directories {
+        if !directory.is_dir() || watched_dirs.contains(&directory) {
+            continue;
+        }
+        watcher.watch(&directory, RecursiveMode::NonRecursive)?;
+        watched_dirs.insert(directory);
+    }
+    Ok(())
+}
+
+fn git_visible_directories(repo_root: &Path) -> BTreeSet<PathBuf> {
+    let mut directories = BTreeSet::from([repo_root.to_path_buf()]);
+    for relative_path in git_visible_paths(repo_root) {
+        let mut path = repo_root.join(relative_path);
+        while path.pop() && path.starts_with(repo_root) {
+            directories.insert(path.clone());
+            if path == repo_root {
+                break;
+            }
+        }
+    }
+    directories
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct WatchSnapshot {
+    tree: RepoFingerprint,
+    events: FileFingerprint,
+}
+
+impl WatchSnapshot {
+    fn capture(repo_root: &Path, events_path: &Path) -> Self {
+        Self {
+            tree: RepoFingerprint::capture(repo_root),
+            events: FileFingerprint::capture(events_path),
+        }
+    }
+
+    fn capture_changes(
+        &mut self,
+        repo_root: &Path,
+        events_path: &Path,
+        pending: &mut PendingUpdate,
+    ) {
+        let next = Self::capture(repo_root, events_path);
+        if self.events != next.events {
+            pending.review_changed = true;
+        }
+        if self.tree != next.tree {
+            pending.diff_changed = true;
+        }
+        *self = next;
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RepoFingerprint {
+    hash: u64,
+}
+
+impl RepoFingerprint {
+    fn capture(repo_root: &Path) -> Self {
+        let mut hasher = DefaultHasher::new();
+
+        FileFingerprint::capture(&repo_root.join(DOT_GIT_DIR).join(GIT_INDEX_FILE))
+            .hash(&mut hasher);
+
+        let visible_paths = git_visible_paths(repo_root);
+        visible_paths.hash(&mut hasher);
+        for relative_path in visible_paths {
+            FileFingerprint::capture(&repo_root.join(relative_path)).hash(&mut hasher);
+        }
+
+        Self {
+            hash: hasher.finish(),
+        }
+    }
+}
+
+fn git_visible_paths(repo_root: &Path) -> Vec<PathBuf> {
+    let Ok(output) = Command::new(GIT_BINARY)
+        .arg(GIT_LS_FILES_ARG)
+        .arg(GIT_CACHED_OTHERS_ARG)
+        .arg(GIT_EXCLUDE_STANDARD_ARG)
+        .arg(GIT_NULL_ARG)
+        .current_dir(repo_root)
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .map(PathBuf::from)
+        .filter(|path| !path.starts_with(DOT_PEERS_DIR))
+        .collect()
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+struct FileFingerprint {
+    exists: bool,
+    len: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+}
+
+impl FileFingerprint {
+    fn capture(path: &Path) -> Self {
+        let Ok(metadata) = path.metadata() else {
+            return Self::default();
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        Self {
+            exists: true,
+            len: metadata.len(),
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingUpdate {
+    review_changed: bool,
+    diff_changed: bool,
+}
+
+fn classify_watch_result(
+    event: notify::Result<Event>,
+    events_path: &Path,
+    repo_root: &Path,
+    peers_dir: &Path,
+    git_dir: &Path,
+    gitignore: &Gitignore,
+    pending: &mut PendingUpdate,
+) {
+    match event {
+        Ok(event) => classify_event(
+            event,
+            events_path,
+            repo_root,
+            peers_dir,
+            git_dir,
+            gitignore,
+            pending,
+        ),
+        Err(error) => eprintln!("{WATCH_EVENT_WARNING}: {error:#}"),
+    }
+}
+
+fn classify_event(
+    event: Event,
+    events_path: &Path,
+    repo_root: &Path,
+    peers_dir: &Path,
+    git_dir: &Path,
+    gitignore: &Gitignore,
+    pending: &mut PendingUpdate,
+) {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return;
+    }
+
+    for path in event.paths {
+        if same_path(&path, events_path) {
+            pending.review_changed = true;
+            continue;
+        }
+        if path.starts_with(peers_dir) {
+            continue;
+        }
+        if path.starts_with(git_dir) {
+            continue;
+        }
+        let gitignore_path = path.strip_prefix(repo_root).unwrap_or(&path);
+        if gitignore
+            .matched_path_or_any_parents(gitignore_path, path.is_dir())
+            .is_ignore()
+        {
+            continue;
+        }
+        pending.diff_changed = true;
+    }
+}
+
+fn build_gitignore(repo_root: &Path) -> Result<Gitignore, ignore::Error> {
+    let mut builder = GitignoreBuilder::new(repo_root);
+    let gitignore_path = repo_root.join(GITIGNORE_FILE);
+    if gitignore_path.is_file() {
+        if let Some(error) = builder.add(gitignore_path) {
+            return Err(error);
+        }
+    }
+    builder.build()
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) else {
+        return false;
+    };
+    left == right
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process::Stdio;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    const TEST_REVIEW_ID: &str = "rev_test";
+    const TEST_FILE: &str = "src/rpc.rs";
+    const TEST_EVENTS: &str = ".peers/reviews/rev_test/events.jsonl";
+    const TEST_WATCHER_STARTUP_MS: u64 = 1000;
+    const TEST_GIT_INIT_ARG: &str = "init";
+
+    #[tokio::test]
+    async fn realtime_watcher_broadcasts_diff_change_after_snapshot() {
+        let root = test_root("diff_change");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join(".peers/reviews").join(TEST_REVIEW_ID)).unwrap();
+        Command::new(GIT_BINARY)
+            .arg(TEST_GIT_INIT_ARG)
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        fs::write(root.join(TEST_FILE), "before\n").unwrap();
+        fs::write(root.join(TEST_EVENTS), "").unwrap();
+
+        let updates = ReviewUpdateBroadcaster::new();
+        let mut receiver = updates.subscribe();
+        let watcher_updates = updates.clone();
+        let watcher_root = root.clone();
+        let watcher = tokio::spawn(async move {
+            let _ = run_realtime_watcher(watcher_root, TEST_REVIEW_ID.to_string(), watcher_updates)
+                .await;
+        });
+
+        time::sleep(Duration::from_millis(TEST_WATCHER_STARTUP_MS)).await;
+        fs::write(root.join(TEST_FILE), "after\n").unwrap();
+
+        let update = time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.kind, DIFF_CHANGED);
+
+        watcher.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("peers_realtime_{name}_{nonce}"))
+    }
+}

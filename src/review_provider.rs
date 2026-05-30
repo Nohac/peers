@@ -10,6 +10,7 @@ use crate::diff::{
     CommentAnchor, FileContent, FileDiff, FileSide, LineAnchor, ReviewDiffPayload, ReviewFile,
     ReviewTarget, load_review_diff,
 };
+use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
     append_review_event, load_review_state, new_comment_id, new_thread_id, now_rfc3339,
     regenerate_outputs,
@@ -44,14 +45,21 @@ pub struct ReviewProvider {
     repo_root: PathBuf,
     review_id: String,
     author: Author,
+    updates: ReviewUpdateBroadcaster,
 }
 
 impl ReviewProvider {
-    pub fn new(repo_root: PathBuf, review_id: String, author: Author) -> Self {
+    pub fn new(
+        repo_root: PathBuf,
+        review_id: String,
+        author: Author,
+        updates: ReviewUpdateBroadcaster,
+    ) -> Self {
         Self {
             repo_root,
             review_id,
             author,
+            updates,
         }
     }
 
@@ -65,6 +73,10 @@ impl ReviewProvider {
 
     pub fn author(&self) -> &Author {
         &self.author
+    }
+
+    pub fn updates(&self) -> ReviewUpdateBroadcaster {
+        self.updates.clone()
     }
 
     pub async fn get_review(&self) -> Result<ApiReviewPayload> {
@@ -81,7 +93,9 @@ impl ReviewProvider {
 
     pub async fn refresh_diff(&self) -> Result<ApiReviewPayload> {
         regenerate_outputs(&self.repo_root, &self.review_id).await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_diff_changed();
+        Ok(review)
     }
 
     pub async fn create_thread(&self, request: CreateThreadRequest) -> Result<ApiReviewPayload> {
@@ -102,7 +116,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 
     pub async fn reply_to_thread(&self, request: ThreadBodyRequest) -> Result<ApiReviewPayload> {
@@ -119,7 +135,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 
     pub async fn edit_comment(&self, request: EditCommentRequest) -> Result<ApiReviewPayload> {
@@ -135,7 +153,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 
     pub async fn delete_comment(&self, request: CommentRequest) -> Result<ApiReviewPayload> {
@@ -149,7 +169,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 
     pub async fn delete_thread(&self, request: ThreadRequest) -> Result<ApiReviewPayload> {
@@ -163,7 +185,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 
     pub async fn resolve_thread(&self, request: ThreadRequest) -> Result<ApiReviewPayload> {
@@ -177,7 +201,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 
     pub async fn reopen_thread(&self, request: ThreadRequest) -> Result<ApiReviewPayload> {
@@ -191,7 +217,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 
     pub async fn mark_file_viewed(
@@ -209,7 +237,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 
     pub async fn submit_review(&self, request: SubmitReviewRequest) -> Result<ApiReviewPayload> {
@@ -224,7 +254,9 @@ impl ReviewProvider {
             },
         )
         .await?;
-        self.get_review().await
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
     }
 }
 

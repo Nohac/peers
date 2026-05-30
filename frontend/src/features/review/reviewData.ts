@@ -1,6 +1,7 @@
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearch } from "@tanstack/react-router";
+import { channel } from "@bearcove/vox-core";
 import {
   connectPeersReview,
   type ApiCommentThread,
@@ -8,6 +9,7 @@ import {
   type DiffSection as WireDiffSection,
   type FileStatus as WireFileStatus,
   type PeersReviewClient,
+  type ReviewUpdate,
 } from "./peersReviewClient.gen";
 
 export type FileStatus = "modified" | "added" | "deleted" | "renamed" | "unchanged" | "binary";
@@ -98,6 +100,7 @@ export type CommentThread = {
 
 let latestPayload: ReviewPayload = emptyReviewPayload();
 const clientPromises = new Map<string, Promise<PeersReviewClient>>();
+const realtimeSubscriptions = new Set<string>();
 
 export function diffForPath(path: string) {
   return latestPayload.fileDiffsByPath[path];
@@ -215,6 +218,7 @@ export function useReviewCommentActions() {
 
 function useReviewPayload() {
   const config = usePeersConfig();
+  useReviewRealtimeUpdates(config);
   const query = useQuery({
     enabled: config !== undefined,
     queryKey: reviewQueryKey(config),
@@ -233,6 +237,48 @@ function useReviewPayload() {
   latestPayload = payload;
 
   return payload;
+}
+
+function useReviewRealtimeUpdates(config: PeersConfig | undefined) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (!config) {
+      return;
+    }
+
+    const subscriptionKey = realtimeSubscriptionKey(config);
+    if (realtimeSubscriptions.has(subscriptionKey)) {
+      return;
+    }
+    realtimeSubscriptions.add(subscriptionKey);
+
+    void subscribeReviewUpdates(config, queryClient).catch((error) => {
+      realtimeSubscriptions.delete(subscriptionKey);
+      console.error(error);
+    });
+  }, [config, queryClient]);
+}
+
+async function subscribeReviewUpdates(
+  config: PeersConfig,
+  queryClient: ReturnType<typeof useQueryClient>,
+) {
+  const [updates, receiver] = channel<ReviewUpdate>();
+  const client = await peersClient(config);
+  void client.subscribeUpdates(config.token, updates).then((result) => {
+    if (!result.ok) {
+      realtimeSubscriptions.delete(realtimeSubscriptionKey(config));
+      console.error(result.error);
+    }
+  });
+
+  for await (const update of receiver) {
+    if (!update) {
+      continue;
+    }
+    await queryClient.invalidateQueries({ queryKey: reviewQueryKey(config) });
+  }
 }
 
 type CommentOperation =
@@ -442,6 +488,10 @@ function requirePeersConfig(config: PeersConfig | undefined) {
 
 function reviewQueryKey(config: PeersConfig | undefined) {
   return ["review", config?.voxUrl ?? "missing", config?.token ?? "missing"] as const;
+}
+
+function realtimeSubscriptionKey(config: PeersConfig) {
+  return `${config.voxUrl}\n${config.token}`;
 }
 
 function emptyReviewPayload(): ReviewPayload {

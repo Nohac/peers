@@ -150,6 +150,8 @@ struct AgentContextArgs {
 struct NvimArgs {
     #[arg(long)]
     review: Option<String>,
+    #[arg(long)]
+    nvim_listen: Option<String>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -207,7 +209,7 @@ pub async fn run() -> Result<()> {
                 ReviewTarget::WorkingTree
             };
             let review_id = create_review(&repo.root, repo.author.clone(), target.clone()).await?;
-            open_review_session(&repo.root, &review_id, repo.author).await?;
+            open_review_session(&repo.root, &review_id, repo.author, None).await?;
         }
         Command::Review(args) => match args.command {
             Some(ReviewCommand::Create(create_args)) => {
@@ -232,7 +234,7 @@ pub async fn run() -> Result<()> {
                 };
                 let review_id =
                     create_review(&repo.root, repo.author.clone(), target.clone()).await?;
-                open_review_session(&repo.root, &review_id, repo.author).await?;
+                open_review_session(&repo.root, &review_id, repo.author, None).await?;
             }
         },
         Command::Comment { command } => handle_comment(command, &repo.root, repo.author).await?,
@@ -249,7 +251,7 @@ pub async fn run() -> Result<()> {
                 Some(review_id) => review_id,
                 None => current_review_id(&repo.root).await?,
             };
-            open_review_session(&repo.root, &review_id, repo.author).await?;
+            open_review_session(&repo.root, &review_id, repo.author, args.nvim_listen).await?;
         }
     }
 
@@ -260,10 +262,15 @@ async fn open_review_session(
     repo_root: &std::path::Path,
     review_id: &str,
     author: crate::comments::Author,
+    nvim_listen: Option<String>,
 ) -> Result<()> {
-    let server =
-        crate::server::LocalServer::bind(repo_root.to_path_buf(), review_id.to_string(), author)
-            .await?;
+    let server = crate::server::LocalServer::bind(
+        repo_root.to_path_buf(),
+        review_id.to_string(),
+        author,
+        nvim_listen,
+    )
+    .await?;
     println!("{VOX_RPC_LABEL}: {}", server.vox_url());
     println!("{NEOVIM_LSP_LABEL}: {}", server.nvim_lsp_url());
     println!("{REVIEW_UI_LABEL}: {}", server.frontend_url());

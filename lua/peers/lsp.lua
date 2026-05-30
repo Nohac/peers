@@ -9,6 +9,7 @@ local EDIT_COMMENT_METHOD = "peers/editComment"
 local DELETE_COMMENT_METHOD = "peers/deleteComment"
 local RESOLVE_THREAD_METHOD = "peers/resolveThread"
 local REOPEN_THREAD_METHOD = "peers/reopenThread"
+local REVIEW_UPDATED_NOTIFICATION = "peers/reviewUpdated"
 local COMMAND_ADD_COMMENT = "peers.addComment"
 local COMMAND_REPLY = "peers.reply"
 local COMMAND_EDIT_COMMENT = "peers.editComment"
@@ -18,6 +19,9 @@ local COMMAND_REOPEN_THREAD = "peers.reopenThread"
 local INVALID_LSP_URL_ERROR = "Invalid nvim_lsp_url: "
 local RENDER_READY_TIMEOUT = 5000
 local RENDER_READY_INTERVAL = 50
+local REFRESH_DEBOUNCE_MS = 75
+
+local pending_refreshes = {}
 
 local COMMAND_HANDLERS = {
   [COMMAND_ADD_COMMENT] = "comment_current",
@@ -51,6 +55,25 @@ local function build_command_handlers()
   return handlers
 end
 
+local function review_updated_handler(_, _, context)
+  if not context or not context.client_id then
+    return
+  end
+  if pending_refreshes[context.client_id] then
+    return
+  end
+
+  pending_refreshes[context.client_id] = true
+  vim.defer_fn(function()
+    pending_refreshes[context.client_id] = nil
+    require("peers.buffer").refresh_from_client(context.client_id)
+  end, REFRESH_DEBOUNCE_MS)
+end
+
+local function install_handlers()
+  vim.lsp.handlers[REVIEW_UPDATED_NOTIFICATION] = review_updated_handler
+end
+
 local function lsp_port(session)
   local port = tostring(session.nvim_lsp_url or ""):match(":(%d+)$")
   if not port then
@@ -77,6 +100,7 @@ end
 
 function M.attach(buf, root, session)
   local port = lsp_port(session)
+  install_handlers()
   M.stop_stale_clients(port)
 
   return vim.lsp.start({
@@ -85,6 +109,9 @@ function M.attach(buf, root, session)
     root_dir = root,
     peers_port = port,
     commands = build_command_handlers(),
+    handlers = {
+      [REVIEW_UPDATED_NOTIFICATION] = review_updated_handler,
+    },
   }, {
     bufnr = buf,
     reuse_client = function(client, config)
