@@ -809,11 +809,17 @@ fn removed_lines(file_diff: &FileDiff) -> u32 {
 }
 
 fn range_len(range: LineRange) -> u32 {
-    range.end.saturating_sub(range.start).saturating_add(1)
+    if range.end < range.start {
+        return 0;
+    }
+    range.end - range.start + 1
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -825,5 +831,31 @@ mod tests {
         assert_eq!(file.path, "src/lib.rs");
         assert_eq!(removed_lines(&file), 1);
         assert_eq!(added_lines(&file), 2);
+    }
+
+    #[tokio::test]
+    async fn loads_empty_repo_worktree_diff() {
+        let root = test_root("empty_repo_worktree");
+        fs::create_dir_all(root.join("src")).unwrap();
+        gix::init(&root).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let diff = load_review_diff(&root, &ReviewTarget::WorkingTree)
+            .await
+            .unwrap();
+
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].path, "src/main.rs");
+        assert_eq!(diff.files[0].status, FileStatus::Added);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("peers_diff_{name}_{nonce}"))
     }
 }

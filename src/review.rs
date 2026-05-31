@@ -210,6 +210,29 @@ pub async fn current_or_create_fresh_review_id(repo_root: &Path, author: Author)
     create_review(repo_root, author, target).await
 }
 
+pub async fn current_or_create_review_id(
+    repo_root: &Path,
+    author: Author,
+    target: ReviewTarget,
+) -> Result<String> {
+    let Ok(review_id) = current_review_id(repo_root).await else {
+        return create_review(repo_root, author, target).await;
+    };
+    let Ok(state) = load_review_state(repo_root, &review_id).await else {
+        return create_review(repo_root, author, target).await;
+    };
+    if state.target.as_ref() != Some(&target) {
+        return create_review(repo_root, author, target).await;
+    }
+    if review_needs_fresh_successor(repo_root, &state)
+        .await
+        .context(CURRENT_REVIEW_STALE_CONTEXT)?
+    {
+        return create_review(repo_root, author, target).await;
+    }
+    Ok(review_id)
+}
+
 pub async fn review_needs_fresh_successor(repo_root: &Path, state: &ReviewState) -> Result<bool> {
     let Some(target) = &state.target else {
         return Ok(false);

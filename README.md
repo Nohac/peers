@@ -64,6 +64,10 @@ Neovim session usage:
 
 ```bash
 peers nvim
+peers nvim diff
+peers nvim diff --cached
+peers nvim diff --all
+peers nvim review --base main --head HEAD
 peers nvim --review rev_123
 ```
 
@@ -88,6 +92,10 @@ require("peers").setup({
 Then run:
 
 ```vim
+:Peers diff
+:Peers diff cached
+:Peers diff all
+:Peers review
 :PeersReview
 ```
 

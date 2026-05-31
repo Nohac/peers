@@ -1,6 +1,7 @@
 local M = {}
 
 local active_job = nil
+local active_root = nil
 local MIN_NVIM_VERSION = { 0, 12, 0 }
 local SESSION_FILE_NAME = "session.json"
 local SESSION_DECODE_WARNING = "Could not decode Peers session.json"
@@ -15,7 +16,15 @@ local BINARY_NOT_EXECUTABLE_ERROR = "Peers binary is not executable"
 local CARGO_BINARY = "cargo"
 local CARGO_MANIFEST_FILE = "Cargo.toml"
 local CARGO_RUN_ARGS = { "run", "--manifest-path" }
+local COMMAND_NVIM = "nvim"
+local COMMAND_DIFF = "diff"
+local COMMAND_REVIEW = "review"
+local ARG_REVIEW = "--review"
 local ARG_NVIM_LISTEN = "--nvim-listen"
+local ARG_CACHED = "--cached"
+local ARG_ALL = "--all"
+local ARG_BASE = "--base"
+local ARG_HEAD = "--head"
 local DOT_PEERS_DIR = ".peers"
 local NVIM_SOCKET_PREFIX = "nvim-"
 local NVIM_SOCKET_SUFFIX = ".sock"
@@ -54,7 +63,7 @@ local function discard_session(root, review_id, active)
   end
 end
 
-local function command_for_review(config, root, review_id)
+local function command_for_launch(config, root, launch)
   local command
   if type(config.binary) == "table" then
     command = vim.deepcopy(config.binary)
@@ -62,8 +71,26 @@ local function command_for_review(config, root, review_id)
     command = { config.binary }
   end
 
-  vim.list_extend(command, { "nvim", "--review", review_id })
-  vim.list_extend(command, { ARG_NVIM_LISTEN, M.nvim_server(root) })
+  vim.list_extend(command, { COMMAND_NVIM, ARG_NVIM_LISTEN, M.nvim_server(root) })
+  if launch.review then
+    vim.list_extend(command, { ARG_REVIEW, launch.review })
+  elseif launch.mode == COMMAND_DIFF then
+    vim.list_extend(command, { COMMAND_DIFF })
+    if launch.cached then
+      vim.list_extend(command, { ARG_CACHED })
+    end
+    if launch.all then
+      vim.list_extend(command, { ARG_ALL })
+    end
+  elseif launch.mode == COMMAND_REVIEW then
+    vim.list_extend(command, { COMMAND_REVIEW })
+    if launch.base then
+      vim.list_extend(command, { ARG_BASE, launch.base })
+    end
+    if launch.head then
+      vim.list_extend(command, { ARG_HEAD, launch.head })
+    end
+  end
   return command
 end
 
@@ -114,7 +141,7 @@ end
 
 function M.repo_root()
   check_nvim_version()
-  local git = vim.fs.find(".git", { upward = true, type = "directory" })[1]
+  local git = vim.fs.find(".git", { upward = true })[1]
   if not git then
     error(NO_GIT_REPO_ERROR)
   end
@@ -127,6 +154,18 @@ function M.current_review_id(root)
     error(NO_CURRENT_REVIEW_ERROR)
   end
   return vim.trim(body)
+end
+
+function M.try_current_review_id(root)
+  local body = read_file(root .. "/.peers/current")
+  if not body then
+    return nil
+  end
+  local review_id = vim.trim(body)
+  if review_id == "" then
+    return nil
+  end
+  return review_id
 end
 
 function M.nvim_server(root)
@@ -173,24 +212,30 @@ function M.read_live_session(root, review_id)
   return nil
 end
 
-function M.start(config, root, review_id)
+function M.start(config, root, launch)
   if active_job then
-    return
+    M.stop()
+  end
+  if type(launch) == "string" then
+    launch = { review = launch }
   end
 
-  active_job = vim.fn.jobstart(executable_command(command_for_review(config, root, review_id)), {
+  active_job = vim.fn.jobstart(executable_command(command_for_launch(config, root, launch or {})), {
     cwd = root,
     stdout_buffered = false,
     stderr_buffered = false,
     on_exit = function()
       active_job = nil
+      active_root = nil
     end,
   })
 
   if active_job <= 0 then
     active_job = nil
+    active_root = nil
     error(START_FAILURE_ERROR)
   end
+  active_root = root
 end
 
 function M.started_by_nvim()
@@ -219,12 +264,36 @@ function M.wait_for_session(config, root, review_id, on_ready)
   poll()
 end
 
+function M.wait_for_current_session(config, root, on_ready)
+  local remaining = math.max(1, math.floor(config.start_timeout_ms / config.poll_interval_ms))
+
+  local function poll()
+    local review_id = M.try_current_review_id(root)
+    local active = review_id and M.read_live_session(root, review_id) or nil
+    if active then
+      on_ready(review_id, active)
+      return
+    end
+
+    remaining = remaining - 1
+    if remaining <= 0 then
+      vim.notify(START_TIMEOUT_ERROR, vim.log.levels.ERROR)
+      return
+    end
+
+    vim.defer_fn(poll, config.poll_interval_ms)
+  end
+
+  poll()
+end
+
 function M.stop()
   if active_job then
     local job = active_job
     vim.fn.jobstop(job)
     vim.fn.jobwait({ job }, STOP_TIMEOUT_MS)
     active_job = nil
+    active_root = nil
   end
 end
 

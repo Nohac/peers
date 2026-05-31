@@ -1413,9 +1413,24 @@ fn hunk_header(old: Option<LineRange>, new: Option<LineRange>) -> String {
 
 fn format_range(range: Option<LineRange>) -> String {
     match range {
-        Some(range) => format!("{},{}", range.start, range.end - range.start + 1),
+        Some(range) => {
+            let count = line_range_len(range);
+            let start = if count == 0 {
+                range.start.saturating_sub(1)
+            } else {
+                range.start
+            };
+            format!("{start},{count}")
+        }
         None => "0,0".to_string(),
     }
+}
+
+fn line_range_len(range: LineRange) -> u32 {
+    if range.end < range.start {
+        return 0;
+    }
+    range.end - range.start + 1
 }
 
 fn hunk_symbol_name(new: Option<LineRange>, old: Option<LineRange>) -> String {

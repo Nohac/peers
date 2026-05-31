@@ -1303,12 +1303,11 @@ function M.open(root, review_id, session)
     "  vim.lsp.buf.document_symbol()",
   })
 
-  local client_id = lsp.attach(buf, root, session)
-  if client_id then
+  lsp.attach_when_ready(buf, root, session, function(client_id)
     lsp.render(client_id, buf, function(render)
       apply_render(root, buf, render, client_id)
     end)
-  end
+  end)
 end
 
 return M

@@ -178,10 +178,14 @@ Neovim session command:
 
 ```bash
 peers nvim
+peers nvim diff
+peers nvim diff --cached
+peers nvim diff --all
+peers nvim review --base main --head HEAD
 peers nvim --review rev_123
 ```
 
-This starts or attaches to the current review session and exposes the local Vox and `peersdiff` LSP endpoints for Neovim.
+This starts or attaches to the selected review session and exposes the local Vox and `peersdiff` LSP endpoints for Neovim. Local diff modes should reuse the current matching review while the captured base commit is unchanged, and start a fresh review when the base commit changes.
 
 An active session should publish ephemeral connection information at:
 
@@ -616,6 +620,10 @@ Realtime updates are required in Neovim too. Manual refresh is only a fallback w
 Neovim commands should stay small:
 
 ```vim
+:Peers diff
+:Peers diff cached
+:Peers diff all
+:Peers review
 :PeersReview
 :PeersSubmit
 :PeersAskAgent
@@ -1001,11 +1009,11 @@ Current status:
 | Author detection and overrides | Complete | Git config, CLI flags, `PEERS_*` env vars, and agent fallback identity are implemented. |
 | CLI comment operations | Partial | Add/reply/edit/delete/resolve/reopen plumbing exists for line comments; file/review-level CLI creation is not implemented. |
 | Generated review and agent context files | Partial | Basic generated files exist and replay hides invalidated dependent activity; richer file/review-level coverage still needs polish. |
-| Git diff loading | Partial | Working tree, cached, all-changes, and branch targets load real Git diffs into the compact payload. This currently shells out to `git` for diff data rather than using `gix` end-to-end. |
+| Git diff loading | Partial | Working tree, cached, all-changes, and branch targets load real Git diffs into the compact payload through gitoxide snapshots and `gix-diff` hunk generation. Rename detection is currently exact-content only, and richer normalization fixtures remain. |
 | Arborium highlighting | Planned | Not implemented. |
 | Vox RPC service | Partial | Local WebSocket service exposes review load, refresh, comment mutations, viewed files, submit review, and a coarse update subscription channel; dev UI consumes generated TypeScript client. |
 | Realtime UI updates | Partial | The session broadcasts coarse `review_changed` and `diff_changed` updates through Vox channels, watches the review event log and repository tree with debounce plus polling fallback, invalidates TanStack Query in the web UI, and refreshes Neovim review buffers through a direct Neovim RPC callback. More precise update classification, composer draft preservation, and broader acceptance coverage remain. |
-| Neovim review mode | Partial | The local Peers session starts a `peersdiff` LSP endpoint using `tower-lsp-server`, `peers nvim` can launch the current review session, Vox/LSP share a cloneable review provider, and Lua `:PeersReview` opens a full-focus synthetic review buffer. Rust serves `peers/renderReview` with rendered diff rows, row metadata, structural highlights, document symbols, and an empty state when there are no changed files; Lua applies rows, mirrors viewport-scoped Tree-sitter highlights from hidden current-side source buffers, opens floating writable composers for add/reply/edit comment code actions, executes delete/resolve/reopen mutations, shows edit/delete invalidation confirmation through native Neovim prompts, masks file diffs when Neovim has unsaved changes in the corresponding source buffer, publishes diagnostics for those masked files, refreshes via direct Neovim RPC while a review session is active, and proxies hover/definition/declaration/type-definition/implementation/references from mapped current-side rows into hidden source buffer LSP clients. Line comments render inline at their anchor row with range rails and context-aware code actions for line/range/file/comment rows. Broader diagnostics are still missing. |
+| Neovim review mode | Partial | The local Peers session starts a `peersdiff` LSP endpoint using `tower-lsp-server`, `peers nvim` can launch current, diff, cached, all, branch, or explicit review sessions, Vox/LSP share a cloneable review provider, and Lua `:Peers`/`:PeersReview` open a full-focus synthetic review buffer. Rust serves `peers/renderReview` with rendered diff rows, row metadata, structural highlights, document symbols, and an empty state when there are no changed files; Lua applies rows, mirrors viewport-scoped Tree-sitter highlights from hidden current-side source buffers, opens floating writable composers for add/reply/edit comment code actions, executes delete/resolve/reopen mutations, shows edit/delete invalidation confirmation through native Neovim prompts, masks file diffs when Neovim has unsaved changes in the corresponding source buffer, publishes diagnostics for those masked files, refreshes via direct Neovim RPC while a review session is active, and proxies hover/definition/declaration/type-definition/implementation/references from mapped current-side rows into hidden source buffer LSP clients. Line comments render inline at their anchor row with range rails and context-aware code actions for line/range/file/comment rows. Broader diagnostics are still missing. |
 | Review workspace layout | Partial | Toolbar, sidebar, diff surface, full-file route, quick access, sticky diff headers, and empty-diff state exist. Conversation/Commits tabs are still missing. |
 | Frontend review payload shape | Complete | Frontend consumes server-provided files, per-path file content, per-path compact diffs, and thread data through TanStack Query. |
 | Inline comments in diff/full-file views | Partial | `git-diff-view` renders real diffs with inline composers, persisted threads, multi-line selection, and range rails. Full-file comments still rely on the current full-file route behavior rather than the same library surface. |

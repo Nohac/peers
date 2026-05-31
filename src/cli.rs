@@ -8,8 +8,8 @@ use crate::comments::{AuthorKind, ReviewEvent, hash_text};
 use crate::diff::{FileSide, LineAnchor, ReviewTarget};
 use crate::review::{
     AuthorOverride, append_review_event, create_review, current_or_create_fresh_review_id,
-    current_review_id, discover_repo, list_reviews, load_review_state, new_comment_id,
-    new_thread_id, now_rfc3339, review_paths,
+    current_or_create_review_id, current_review_id, discover_repo, list_reviews, load_review_state,
+    new_comment_id, new_thread_id, now_rfc3339, review_paths,
 };
 
 const VOX_RPC_LABEL: &str = "Vox RPC";
@@ -153,6 +153,22 @@ struct NvimArgs {
     review: Option<String>,
     #[arg(long)]
     nvim_listen: Option<String>,
+    #[command(subcommand)]
+    command: Option<NvimCommand>,
+}
+
+#[derive(Subcommand)]
+enum NvimCommand {
+    Diff(DiffArgs),
+    Review(NvimReviewArgs),
+}
+
+#[derive(Args)]
+struct NvimReviewArgs {
+    #[arg(long, default_value = "main")]
+    base: String,
+    #[arg(long, default_value = "HEAD")]
+    head: String,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -248,15 +264,50 @@ pub async fn run() -> Result<()> {
             println!("{}", paths.agent_context.display());
         }
         Command::Nvim(args) => {
-            let review_id = match args.review {
-                Some(review_id) => review_id,
-                None => current_or_create_fresh_review_id(&repo.root, repo.author.clone()).await?,
-            };
-            open_review_session(&repo.root, &review_id, repo.author, args.nvim_listen).await?;
+            let nvim_listen = args.nvim_listen.clone();
+            let review_id = nvim_review_id(&repo.root, repo.author.clone(), args).await?;
+            open_review_session(&repo.root, &review_id, repo.author, nvim_listen).await?;
         }
     }
 
     Ok(())
+}
+
+async fn nvim_review_id(
+    repo_root: &std::path::Path,
+    author: crate::comments::Author,
+    args: NvimArgs,
+) -> Result<String> {
+    if let Some(review_id) = args.review {
+        return Ok(review_id);
+    }
+
+    match args.command {
+        Some(NvimCommand::Diff(diff_args)) => {
+            current_or_create_review_id(repo_root, author, diff_target(diff_args)).await
+        }
+        Some(NvimCommand::Review(review_args)) => {
+            let target = ReviewTarget::Branch {
+                base: review_args.base,
+                head: review_args.head,
+            };
+            create_review(repo_root, author, target).await
+        }
+        None => match current_or_create_fresh_review_id(repo_root, author.clone()).await {
+            Ok(review_id) => Ok(review_id),
+            Err(_) => create_review(repo_root, author, ReviewTarget::WorkingTree).await,
+        },
+    }
+}
+
+fn diff_target(args: DiffArgs) -> ReviewTarget {
+    if args.all {
+        ReviewTarget::All
+    } else if args.cached {
+        ReviewTarget::Cached
+    } else {
+        ReviewTarget::WorkingTree
+    }
 }
 
 async fn open_review_session(

@@ -20,6 +20,10 @@ local INVALID_LSP_URL_ERROR = "Invalid nvim_lsp_url: "
 local RENDER_READY_TIMEOUT = 5000
 local RENDER_READY_INTERVAL = 50
 local REFRESH_DEBOUNCE_MS = 75
+local ATTACH_READY_TIMEOUT = 5000
+local ATTACH_READY_INTERVAL = 100
+local ATTACH_TIMEOUT_ERROR = "Peers LSP did not become ready"
+local RENDER_TIMEOUT_ERROR = "Peers render request timed out"
 
 local pending_refreshes = {}
 
@@ -120,6 +124,29 @@ function M.attach(buf, root, session)
   })
 end
 
+function M.attach_when_ready(buf, root, session, on_ready)
+  local remaining = math.max(1, math.floor(ATTACH_READY_TIMEOUT / ATTACH_READY_INTERVAL))
+
+  local function poll()
+    local client_id = M.attach(buf, root, session)
+    local client = client_id and vim.lsp.get_client_by_id(client_id) or nil
+    if client and client.initialized then
+      on_ready(client_id)
+      return
+    end
+
+    remaining = remaining - 1
+    if remaining <= 0 then
+      vim.notify(ATTACH_TIMEOUT_ERROR, vim.log.levels.ERROR)
+      return
+    end
+
+    vim.defer_fn(poll, ATTACH_READY_INTERVAL)
+  end
+
+  poll()
+end
+
 local function request_render(client, buf, on_render)
   client:request(RENDER_METHOD, nil, function(error, result)
     if error then
@@ -136,6 +163,12 @@ function M.render(client_id, buf, on_render)
   local function poll()
     local client = vim.lsp.get_client_by_id(client_id)
     if not client then
+      remaining = remaining - 1
+      if remaining <= 0 then
+        vim.notify(RENDER_TIMEOUT_ERROR, vim.log.levels.ERROR)
+        return
+      end
+      vim.defer_fn(poll, RENDER_READY_INTERVAL)
       return
     end
     if client.initialized then
