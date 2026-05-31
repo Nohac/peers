@@ -7,8 +7,9 @@ use tokio::io::AsyncReadExt;
 use crate::comments::{AuthorKind, ReviewEvent, hash_text};
 use crate::diff::{FileSide, LineAnchor, ReviewTarget};
 use crate::review::{
-    AuthorOverride, append_review_event, create_review, current_review_id, discover_repo,
-    list_reviews, load_review_state, new_comment_id, new_thread_id, now_rfc3339, review_paths,
+    AuthorOverride, append_review_event, create_review, current_or_create_fresh_review_id,
+    current_review_id, discover_repo, list_reviews, load_review_state, new_comment_id,
+    new_thread_id, now_rfc3339, review_paths,
 };
 
 const VOX_RPC_LABEL: &str = "Vox RPC";
@@ -249,7 +250,7 @@ pub async fn run() -> Result<()> {
         Command::Nvim(args) => {
             let review_id = match args.review {
                 Some(review_id) => review_id,
-                None => current_review_id(&repo.root).await?,
+                None => current_or_create_fresh_review_id(&repo.root, repo.author.clone()).await?,
             };
             open_review_session(&repo.root, &review_id, repo.author, args.nvim_listen).await?;
         }

@@ -28,6 +28,10 @@ impl ReviewTarget {
     pub fn is_branch(&self) -> bool {
         matches!(self, Self::Branch { .. })
     }
+
+    pub fn is_local_diff(&self) -> bool {
+        matches!(self, Self::WorkingTree | Self::Cached | Self::All)
+    }
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]

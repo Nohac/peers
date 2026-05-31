@@ -4,12 +4,20 @@ use anyhow::{Context, Result, anyhow};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::process::Command;
 
 use crate::comments::{
     Author, AuthorKind, ReviewEvent, ReviewState, encode_event, parse_events_from_reader,
     render_agent_context, render_review_markdown, replay_events,
 };
 use crate::diff::ReviewTarget;
+
+const GIT_BINARY: &str = "git";
+const GIT_REV_PARSE_ARG: &str = "rev-parse";
+const GIT_VERIFY_ARG: &str = "--verify";
+const GIT_HEAD_REF: &str = "HEAD";
+const CURRENT_REVIEW_STALE_CONTEXT: &str = "failed to inspect current review freshness";
+const CURRENT_HEAD_ERROR: &str = "failed to inspect current HEAD";
 
 pub struct RepoContext {
     pub root: PathBuf,
@@ -152,10 +160,21 @@ pub async fn create_review(
             review_id: review_id.clone(),
             created_at: now,
             author,
-            target,
+            target: target.clone(),
         },
     )
     .await?;
+    if target.is_local_diff() {
+        append_event_file(
+            &paths.events,
+            &ReviewEvent::ReviewDiffBaseCaptured {
+                review_id: review_id.clone(),
+                captured_at: now_rfc3339()?,
+                base_oid: current_head_oid(repo_root).await?,
+            },
+        )
+        .await?;
+    }
     write_current(repo_root, &review_id).await?;
     regenerate_outputs(repo_root, &review_id).await?;
 
@@ -177,6 +196,55 @@ pub async fn current_review_id(repo_root: &Path) -> Result<String> {
         return Err(anyhow!("current review file is empty"));
     }
     Ok(id.to_string())
+}
+
+pub async fn current_or_create_fresh_review_id(repo_root: &Path, author: Author) -> Result<String> {
+    let review_id = current_review_id(repo_root).await?;
+    let state = load_review_state(repo_root, &review_id).await?;
+    if !review_needs_fresh_successor(repo_root, &state)
+        .await
+        .context(CURRENT_REVIEW_STALE_CONTEXT)?
+    {
+        return Ok(review_id);
+    }
+
+    let target = state
+        .target
+        .ok_or_else(|| anyhow!("current review has no target"))?;
+    create_review(repo_root, author, target).await
+}
+
+pub async fn review_needs_fresh_successor(repo_root: &Path, state: &ReviewState) -> Result<bool> {
+    let Some(target) = &state.target else {
+        return Ok(false);
+    };
+    if !target.is_local_diff() {
+        return Ok(false);
+    }
+    let Some(captured_base) = &state.diff_base_oid else {
+        return Ok(false);
+    };
+    Ok(*captured_base != current_head_oid(repo_root).await?)
+}
+
+pub async fn current_head_oid(repo_root: &Path) -> Result<Option<String>> {
+    let output = Command::new(GIT_BINARY)
+        .arg(GIT_REV_PARSE_ARG)
+        .arg(GIT_VERIFY_ARG)
+        .arg(GIT_HEAD_REF)
+        .current_dir(repo_root)
+        .output()
+        .await
+        .context(CURRENT_HEAD_ERROR)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if oid.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(oid))
+    }
 }
 
 pub async fn list_reviews(repo_root: &Path) -> Result<Vec<String>> {
@@ -279,4 +347,99 @@ fn id_suffix() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     format!("{:x}{:x}", std::process::id(), nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process::{Command as StdCommand, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    const TEST_AUTHOR_NAME: &str = "Jonas";
+    const TEST_AUTHOR_EMAIL: &str = "jonas@example.com";
+    const TEST_FILE: &str = "file.txt";
+    const TEST_INITIAL_BODY: &str = "initial\n";
+    const TEST_NEXT_BODY: &str = "next\n";
+    const TEST_INITIAL_COMMIT: &str = "initial";
+    const TEST_NEXT_COMMIT: &str = "next";
+    const GIT_INIT_ARG: &str = "init";
+    const GIT_CONFIG_ARG: &str = "config";
+    const GIT_ADD_ARG: &str = "add";
+    const GIT_COMMIT_ARG: &str = "commit";
+    const GIT_MESSAGE_ARG: &str = "-m";
+    const GIT_USER_NAME_KEY: &str = "user.name";
+    const GIT_USER_EMAIL_KEY: &str = "user.email";
+
+    #[tokio::test]
+    async fn local_diff_current_review_rotates_when_head_changes() {
+        let root = test_root("head_change");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, [GIT_INIT_ARG]);
+        git(&root, [GIT_CONFIG_ARG, GIT_USER_NAME_KEY, TEST_AUTHOR_NAME]);
+        git(
+            &root,
+            [GIT_CONFIG_ARG, GIT_USER_EMAIL_KEY, TEST_AUTHOR_EMAIL],
+        );
+        fs::write(root.join(TEST_FILE), TEST_INITIAL_BODY).unwrap();
+        git(&root, [GIT_ADD_ARG, TEST_FILE]);
+        git(
+            &root,
+            [GIT_COMMIT_ARG, GIT_MESSAGE_ARG, TEST_INITIAL_COMMIT],
+        );
+
+        let review_id = create_review(&root, author(), ReviewTarget::WorkingTree)
+            .await
+            .unwrap();
+        let state = load_review_state(&root, &review_id).await.unwrap();
+        assert!(!review_needs_fresh_successor(&root, &state).await.unwrap());
+
+        fs::write(root.join(TEST_FILE), TEST_NEXT_BODY).unwrap();
+        git(&root, [GIT_ADD_ARG, TEST_FILE]);
+        git(&root, [GIT_COMMIT_ARG, GIT_MESSAGE_ARG, TEST_NEXT_COMMIT]);
+
+        let state = load_review_state(&root, &review_id).await.unwrap();
+        assert!(review_needs_fresh_successor(&root, &state).await.unwrap());
+
+        let next_review_id = current_or_create_fresh_review_id(&root, author())
+            .await
+            .unwrap();
+        assert_ne!(review_id, next_review_id);
+
+        let next_state = load_review_state(&root, &next_review_id).await.unwrap();
+        assert_eq!(
+            next_state.diff_base_oid,
+            Some(current_head_oid(&root).await.unwrap())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn author() -> Author {
+        Author {
+            kind: AuthorKind::Human,
+            display_name: TEST_AUTHOR_NAME.to_string(),
+            email: Some(TEST_AUTHOR_EMAIL.to_string()),
+        }
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("peers_review_{name}_{nonce}"))
+    }
+
+    fn git<const N: usize>(root: &Path, args: [&str; N]) {
+        let status = StdCommand::new(GIT_BINARY)
+            .args(args)
+            .current_dir(root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 }

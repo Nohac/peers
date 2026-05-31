@@ -97,6 +97,7 @@ local COMMENT_DELETE_CONFIRM_TITLE = "Delete comment?"
 local COMMENT_DELETE_CONFIRM_MESSAGE = "Deleting this comment will remove later replies and thread status changes from the visible review state."
 local MIRROR_DEBOUNCE_MS = 30
 local AUTOCMD_GROUP_PREFIX = "peers-review-source-"
+local SOURCE_CHANGE_AUGROUP = "peers-review-source-changes"
 local AUTOCMD_EVENTS = {
   "BufEnter",
   "WinEnter",
@@ -107,6 +108,12 @@ local VIEW_SAVE_EVENTS = {
   "BufLeave",
   "WinLeave",
   "WinScrolled",
+}
+local SOURCE_CHANGE_EVENTS = {
+  "TextChanged",
+  "TextChangedI",
+  "TextChangedP",
+  "BufWritePost",
 }
 local CACHE_KEY_SEPARATOR = ":"
 local UNKNOWN_FILE_TIME = -1
@@ -722,6 +729,12 @@ local function restore_current_view(buf)
   pcall(vim.fn.winrestview, state.view)
 end
 
+local function path_is_under(root, path)
+  local normalized_root = vim.fn.fnamemodify(root, ":p")
+  local normalized_path = vim.fn.fnamemodify(path, ":p")
+  return normalized_path:sub(1, #normalized_root) == normalized_root
+end
+
 local function mirror_visible_treesitter(buf)
   local state = RENDER_STATES[buf]
   if not state or not vim.api.nvim_buf_is_valid(buf) then
@@ -757,6 +770,54 @@ local function schedule_visible_mirror(buf)
   end, MIRROR_DEBOUNCE_MS)
 end
 
+local apply_render
+
+local function review_buffer_is_active(buf)
+  return vim.api.nvim_get_current_buf() == buf
+end
+
+local function render_review_now(buf, state)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  state.pending_refresh = false
+  lsp.render_now(state.client_id, buf, function(render)
+    apply_render(state.root, buf, render, state.client_id)
+  end)
+end
+
+local function request_review_refresh(buf, state)
+  if not state or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+
+  if review_buffer_is_active(buf) then
+    render_review_now(buf, state)
+  else
+    state.pending_refresh = true
+  end
+end
+
+local function mark_repo_reviews_pending(path)
+  if path == "" then
+    return
+  end
+
+  for buf, state in pairs(RENDER_STATES) do
+    if path_is_under(state.root, path) then
+      request_review_refresh(buf, state)
+    end
+  end
+end
+
+local function flush_pending_refresh(buf)
+  local state = RENDER_STATES[buf]
+  if state and state.pending_refresh then
+    render_review_now(buf, state)
+  end
+end
+
 local function setup_mirror_autocmds(buf)
   local state = RENDER_STATES[buf]
   if not state then
@@ -786,6 +847,7 @@ local function setup_mirror_autocmds(buf)
     buffer = buf,
     callback = function()
       restore_current_view(buf)
+      flush_pending_refresh(buf)
     end,
   })
   vim.api.nvim_create_autocmd("BufWipeout", {
@@ -797,7 +859,27 @@ local function setup_mirror_autocmds(buf)
   })
 end
 
-local apply_render
+local source_change_augroup = nil
+
+local function setup_source_change_autocmds()
+  if source_change_augroup then
+    return
+  end
+
+  source_change_augroup = vim.api.nvim_create_augroup(SOURCE_CHANGE_AUGROUP, { clear = true })
+  vim.api.nvim_create_autocmd(SOURCE_CHANGE_EVENTS, {
+    group = source_change_augroup,
+    callback = function(event)
+      if RENDER_STATES[event.buf] then
+        return
+      end
+      if vim.b[event.buf][SOURCE_HELPER_BUFFER_VAR] and not vim.bo[event.buf].buflisted then
+        return
+      end
+      mark_repo_reviews_pending(vim.api.nvim_buf_get_name(event.buf))
+    end,
+  })
+end
 
 local function close_composer(state)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
@@ -934,6 +1016,7 @@ function apply_render(root, buf, render, client_id)
     source_lsp_buffers = {},
     source_segments = {},
     scheduled = false,
+    pending_refresh = existing and existing.pending_refresh or false,
     view = remembered_view,
   }
   restore_buffer_views(visible_views)
@@ -1136,9 +1219,7 @@ end
 function M.refresh_from_client(client_id)
   for buf, state in pairs(RENDER_STATES) do
     if state.client_id == client_id and vim.api.nvim_buf_is_valid(buf) then
-      lsp.render_now(client_id, buf, function(render)
-        apply_render(state.root, buf, render, client_id)
-      end)
+      request_review_refresh(buf, state)
     end
   end
 end
@@ -1146,9 +1227,7 @@ end
 function M.refresh_all()
   for buf, state in pairs(RENDER_STATES) do
     if vim.api.nvim_buf_is_valid(buf) then
-      lsp.render_now(state.client_id, buf, function(render)
-        apply_render(state.root, buf, render, state.client_id)
-      end)
+      request_review_refresh(buf, state)
     end
   end
 end
@@ -1209,6 +1288,7 @@ function M.open(root, review_id, session)
 
   set_review_options(buf)
   set_review_keymaps(buf)
+  setup_source_change_autocmds()
   define_highlights()
   define_diff_gutter_highlights()
   set_lines(buf, {

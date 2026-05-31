@@ -50,6 +50,11 @@ pub enum ReviewEvent {
         author: Author,
         target: ReviewTarget,
     },
+    ReviewDiffBaseCaptured {
+        review_id: String,
+        captured_at: String,
+        base_oid: Option<String>,
+    },
     ReviewMetadataUpdated {
         review_id: String,
         updated_at: String,
@@ -152,6 +157,7 @@ pub struct CommentThread {
 pub struct ReviewState {
     pub review_id: Option<String>,
     pub target: Option<ReviewTarget>,
+    pub diff_base_oid: Option<Option<String>>,
     pub created_at: Option<String>,
     pub author: Option<Author>,
     pub title: Option<String>,
@@ -228,6 +234,9 @@ fn apply_event(state: &mut ReviewState, event: &ReviewEvent) -> Result<()> {
             state.created_at = Some(created_at.clone());
             state.author = Some(author.clone());
             state.target = Some(target.clone());
+        }
+        ReviewEvent::ReviewDiffBaseCaptured { base_oid, .. } => {
+            state.diff_base_oid = Some(base_oid.clone());
         }
         ReviewEvent::ReviewMetadataUpdated { title, .. } => {
             state.title.clone_from(title);
@@ -530,6 +539,11 @@ mod tests {
                 author: author(),
                 target: ReviewTarget::WorkingTree,
             },
+            ReviewEvent::ReviewDiffBaseCaptured {
+                review_id: "rev_test".to_string(),
+                captured_at: "2026-05-28T12:00:01Z".to_string(),
+                base_oid: Some("abc123".to_string()),
+            },
             ReviewEvent::ThreadCreated {
                 thread_id: "thr_test".to_string(),
                 comment_id: "cmt_test".to_string(),
@@ -555,6 +569,7 @@ mod tests {
         let state = replay_events(&decoded).unwrap();
 
         assert_eq!(state.review_id.as_deref(), Some("rev_test"));
+        assert_eq!(state.diff_base_oid, Some(Some("abc123".to_string())));
         assert!(state.threads["thr_test"].resolved);
     }
 }

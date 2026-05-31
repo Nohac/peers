@@ -13,7 +13,7 @@ use crate::diff::{
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
     append_review_event, load_review_state, new_comment_id, new_thread_id, now_rfc3339,
-    regenerate_outputs,
+    regenerate_outputs, review_needs_fresh_successor,
 };
 
 const LINE_SCOPE: &str = "line";
@@ -87,8 +87,13 @@ impl ReviewProvider {
             .ok_or_else(|| ReviewProviderError::MissingTarget {
                 review_id: self.review_id.clone(),
             })?;
-        let diff = load_review_diff(&self.repo_root, &target).await?;
-        Ok(review_payload(&state, diff, &self.author))
+        let is_stale = review_needs_fresh_successor(&self.repo_root, &state).await?;
+        let diff = if is_stale {
+            empty_diff_payload()
+        } else {
+            load_review_diff(&self.repo_root, &target).await?
+        };
+        Ok(review_payload(&state, diff, &self.author, is_stale))
     }
 
     pub async fn refresh_diff(&self) -> Result<ApiReviewPayload> {
@@ -382,12 +387,17 @@ fn review_payload(
     state: &ReviewState,
     mut diff: ReviewDiffPayload,
     current_author: &Author,
+    is_stale: bool,
 ) -> ApiReviewPayload {
-    let threads: Vec<_> = state
-        .threads
-        .values()
-        .map(|thread| api_thread(thread, current_author))
-        .collect();
+    let threads: Vec<_> = if is_stale {
+        Vec::new()
+    } else {
+        state
+            .threads
+            .values()
+            .map(|thread| api_thread(thread, current_author))
+            .collect()
+    };
     let mut comment_counts = BTreeMap::<String, u32>::new();
     for thread in &threads {
         if !thread.resolved
@@ -418,6 +428,14 @@ fn review_payload(
         threads,
         review_threads,
         commits: Vec::new(),
+    }
+}
+
+fn empty_diff_payload() -> ReviewDiffPayload {
+    ReviewDiffPayload {
+        files: Vec::new(),
+        file_contents_by_path: BTreeMap::new(),
+        file_diffs_by_path: BTreeMap::new(),
     }
 }
 
