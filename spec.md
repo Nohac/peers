@@ -159,6 +159,10 @@ peers comment add \
 
 peers comment reply thr_123 --body "I fixed this."
 peers comment reply thr_123 --body-file -
+peers comment list
+peers comment list --status open
+peers comment list --status complete
+peers comment list current rev_123
 peers comment edit cmt_123 --body "Updated comment."
 peers comment delete cmt_123
 peers comment resolve thr_123
@@ -168,6 +172,7 @@ peers comment reopen thr_123
 Agent support:
 
 ```bash
+peers skill
 peers --agent comment add ...
 peers --author-kind agent --author-name Codex comment reply ...
 peers agent-context
@@ -1004,10 +1009,10 @@ Current status:
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Project rename to Peers | Complete | CLI/package/docs use `peers`, `.peers`, and `PEERS_*`. |
-| CLI skeleton | Partial | Commands exist and review UI launch starts the local Vox server; browser auto-open and packaging polish remain. |
+| CLI skeleton | Partial | Commands exist, `peers skill` prints an agent workflow overview, and review UI launch starts the local Vox server; browser auto-open and packaging polish remain. |
 | Review storage/event log | Partial | Append-only JSONL storage exists for review/comment/file-viewed/submit flows. |
 | Author detection and overrides | Complete | Git config, CLI flags, `PEERS_*` env vars, and agent fallback identity are implemented. |
-| CLI comment operations | Partial | Add/reply/edit/delete/resolve/reopen plumbing exists for line comments; file/review-level CLI creation is not implemented. |
+| CLI comment operations | Partial | List/add/reply/edit/delete/resolve/reopen plumbing exists for comments; creation from the CLI is still line-scope only. |
 | Generated review and agent context files | Partial | Basic generated files exist and replay hides invalidated dependent activity; richer file/review-level coverage still needs polish. |
 | Git diff loading | Partial | Working tree, cached, all-changes, and branch targets load real Git diffs into the compact payload through gitoxide snapshots and `gix-diff` hunk generation. Rename detection is currently exact-content only, and richer normalization fixtures remain. |
 | Arborium highlighting | Planned | Not implemented. |

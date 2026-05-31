@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::io::AsyncReadExt;
 
-use crate::comments::{AuthorKind, ReviewEvent, hash_text};
+use crate::comments::{AuthorKind, CommentThread, ReviewEvent, ReviewState, hash_text};
 use crate::diff::{FileSide, LineAnchor, ReviewTarget};
 use crate::review::{
     AuthorOverride, append_review_event, create_review, current_or_create_fresh_review_id,
@@ -18,6 +18,64 @@ const REVIEW_UI_LABEL: &str = "Review UI";
 const FRONTEND_DEV_HINT: &str =
     "Run `cd frontend && bun run dev` in another terminal, then open the Review UI URL.";
 const SESSION_STOP_HINT: &str = "Press Ctrl-C to stop the local Peers session.";
+const CURRENT_REVIEW_ALIAS: &str = "current";
+const REVIEW_LABEL: &str = "Review";
+const TARGET_LABEL: &str = "Target";
+const THREADS_LABEL: &str = "Threads";
+const THREAD_LABEL: &str = "Thread";
+const UPDATED_LABEL: &str = "Updated";
+const EDITED_LABEL: &str = "edited";
+const NO_COMMENTS_MESSAGE: &str = "No comments.";
+const HUMAN_AUTHOR_KIND_LABEL: &str = "human";
+const AGENT_AUTHOR_KIND_LABEL: &str = "agent";
+const RESOLVED_THREAD_STATUS: &str = "resolved";
+const UNRESOLVED_THREAD_STATUS: &str = "unresolved";
+const PEERS_SKILL_TEXT: &str = r#"Peers is a local Git review tool. It stores review comments in `.peers/`
+inside the reviewed repository so humans and agents can share the same review state.
+
+Agent workflow:
+1. Run `peers comment list --status open` to see unresolved review comments.
+2. Use each thread anchor to inspect the referenced file and line/range.
+3. Make the requested code changes in the working tree.
+4. Run the relevant project checks.
+5. Reply to each addressed thread with `peers --agent comment reply <thread-id> --body "..."`
+6. Resolve completed threads with `peers --agent comment resolve <thread-id>`.
+7. If a comment cannot be addressed, reply with the blocker instead of resolving it.
+
+Core commands:
+- `peers skill`
+  Print this overview.
+- `peers review current`
+  Print the current review id.
+- `peers review list`
+  List stored reviews.
+- `peers comment list`
+  List all visible comments for the current review.
+- `peers comment list --status open`
+  List unresolved threads only. Use this first when asked to address comments.
+- `peers comment list --status complete`
+  List resolved threads only.
+- `peers comment list current rev_123`
+  List comments for multiple reviews. `current` means the current review.
+- `peers --agent comment reply <thread-id> --body "Done: ..."`
+  Add an agent reply to a thread.
+- `peers --agent comment resolve <thread-id>`
+  Mark a thread complete.
+- `peers --agent comment reopen <thread-id>`
+  Reopen a thread if follow-up work is needed.
+- `peers --agent comment edit <comment-id> --body "..."`
+  Edit one of your comments. Editing can invalidate later dependent activity.
+- `peers --agent comment delete <comment-id>`
+  Delete one of your comments. Deleting can invalidate later dependent activity.
+- `peers agent-context`
+  Print the path to the generated agent context file for the current review.
+
+Notes:
+- Prefer the CLI over editing `.peers/reviews/<review-id>/events.jsonl` manually.
+- Comment ids start with `cmt_`; thread ids start with `thr_`.
+- Open means unresolved. Complete means resolved.
+- Use `--body-file -` to read a multiline reply body from stdin.
+"#;
 
 #[derive(Parser)]
 #[command(name = "peers")]
@@ -37,6 +95,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print an agent workflow overview for using Peers.
+    Skill,
     Diff(DiffArgs),
     Review(ReviewArgs),
     Comment {
@@ -91,12 +151,29 @@ enum CreateReviewKind {
 
 #[derive(Subcommand)]
 enum CommentCommand {
+    /// List visible comment threads.
+    List(ListCommentsArgs),
     Add(AddCommentArgs),
     Reply(ReplyCommentArgs),
     Edit(EditCommentArgs),
     Delete(DeleteCommentArgs),
     Resolve(ThreadCommandArgs),
     Reopen(ThreadCommandArgs),
+}
+
+#[derive(Args)]
+struct ListCommentsArgs {
+    #[arg(long, value_enum, default_value = "all")]
+    status: CommentListStatus,
+    #[arg(value_name = "REVIEW")]
+    reviews: Vec<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CommentListStatus {
+    All,
+    Open,
+    Complete,
 }
 
 #[derive(Args)]
@@ -209,6 +286,11 @@ struct LineRange {
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Skill = &cli.command {
+        print!("{PEERS_SKILL_TEXT}");
+        return Ok(());
+    }
+
     let repo = discover_repo(AuthorOverride {
         kind: cli.author_kind.map(Into::into),
         name: cli.author_name,
@@ -217,6 +299,7 @@ pub async fn run() -> Result<()> {
     })?;
 
     match cli.command {
+        Command::Skill => unreachable!("skill exits before repository discovery"),
         Command::Diff(args) => {
             let target = if args.all {
                 ReviewTarget::All
@@ -348,8 +431,20 @@ async fn handle_comment(
     repo_root: &std::path::Path,
     author: crate::comments::Author,
 ) -> Result<()> {
+    match command {
+        CommentCommand::List(args) => handle_comment_list(args, repo_root).await,
+        command => handle_comment_mutation(command, repo_root, author).await,
+    }
+}
+
+async fn handle_comment_mutation(
+    command: CommentCommand,
+    repo_root: &std::path::Path,
+    author: crate::comments::Author,
+) -> Result<()> {
     let review_id = current_review_id(repo_root).await?;
     match command {
+        CommentCommand::List(_) => unreachable!("list commands are handled before mutations"),
         CommentCommand::Add(args) => {
             let body = read_body(args.body, args.body_file).await?;
             let now = now_rfc3339()?;
@@ -462,6 +557,118 @@ async fn handle_comment(
     );
 
     Ok(())
+}
+
+async fn handle_comment_list(args: ListCommentsArgs, repo_root: &std::path::Path) -> Result<()> {
+    let status = args.status;
+    let review_ids = resolve_comment_list_reviews(repo_root, args.reviews).await?;
+
+    for (index, review_id) in review_ids.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+
+        let state = load_review_state(repo_root, review_id).await?;
+        print_comment_list(review_id, &state, status);
+    }
+
+    Ok(())
+}
+
+async fn resolve_comment_list_reviews(
+    repo_root: &std::path::Path,
+    reviews: Vec<String>,
+) -> Result<Vec<String>> {
+    if reviews.is_empty() {
+        return Ok(vec![current_review_id(repo_root).await?]);
+    }
+
+    let mut review_ids = Vec::with_capacity(reviews.len());
+    for review in reviews {
+        if review == CURRENT_REVIEW_ALIAS {
+            review_ids.push(current_review_id(repo_root).await?);
+        } else {
+            review_ids.push(review);
+        }
+    }
+
+    Ok(review_ids)
+}
+
+fn print_comment_list(review_id: &str, state: &ReviewState, status_filter: CommentListStatus) {
+    println!("{REVIEW_LABEL}: {review_id}");
+    if let Some(target) = &state.target {
+        println!("{TARGET_LABEL}: {}", target.label());
+    }
+    println!(
+        "{THREADS_LABEL}: {}, {} unresolved",
+        state.threads.len(),
+        state.unresolved_threads().count()
+    );
+
+    let visible_threads: Vec<_> = state
+        .threads
+        .values()
+        .filter(|thread| comment_list_status_matches(thread, &status_filter))
+        .collect();
+
+    if visible_threads.is_empty() {
+        println!("{NO_COMMENTS_MESSAGE}");
+        return;
+    }
+
+    for thread in visible_threads {
+        print_comment_thread(thread);
+    }
+}
+
+fn comment_list_status_matches(thread: &CommentThread, status_filter: &CommentListStatus) -> bool {
+    match status_filter {
+        CommentListStatus::All => true,
+        CommentListStatus::Open => !thread.resolved,
+        CommentListStatus::Complete => thread.resolved,
+    }
+}
+
+fn print_comment_thread(thread: &CommentThread) {
+    let status = if thread.resolved {
+        RESOLVED_THREAD_STATUS
+    } else {
+        UNRESOLVED_THREAD_STATUS
+    };
+
+    println!();
+    println!("[{status}] {}", thread.anchor.label());
+    println!("{THREAD_LABEL}: {}", thread.id);
+    println!("{UPDATED_LABEL}: {}", thread.updated_at);
+
+    for comment in &thread.comments {
+        let kind = match &comment.author.kind {
+            AuthorKind::Human => HUMAN_AUTHOR_KIND_LABEL,
+            AuthorKind::Agent => AGENT_AUTHOR_KIND_LABEL,
+        };
+        let edited = comment
+            .edited_at
+            .as_ref()
+            .map(|edited_at| format!(" ({EDITED_LABEL} {edited_at})"))
+            .unwrap_or_default();
+        println!(
+            "- {} by {} ({kind}) at {}{edited}:",
+            comment.id, comment.author.display_name, comment.created_at
+        );
+        print_indented_body(&comment.body);
+    }
+}
+
+fn print_indented_body(body: &str) {
+    if body.is_empty() {
+        println!("  ");
+        return;
+    }
+
+    for line in body.lines() {
+        println!("  {line}");
+    }
 }
 
 async fn read_body(body: Option<String>, body_file: Option<PathBuf>) -> Result<String> {

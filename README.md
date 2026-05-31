@@ -29,6 +29,12 @@ This project is in early development. See [spec.md](./spec.md) for the full impl
 
 ## Planned CLI
 
+Learn the agent workflow:
+
+```bash
+peers skill
+```
+
 Review current changes:
 
 ```bash
@@ -48,6 +54,10 @@ peers review --base origin/main
 Create and manage comments:
 
 ```bash
+peers comment list
+peers comment list --status open
+peers comment list --status complete
+peers comment list current rev_123
 peers comment add --path src/foo.rs --side new --lines 42:47 --body "This needs validation."
 peers comment reply thr_123 --body "Fixed in the latest change."
 peers comment resolve thr_123
