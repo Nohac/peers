@@ -2,13 +2,13 @@ use std::collections::BTreeSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use facet::Facet;
+use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{broadcast, mpsc};
@@ -33,11 +33,7 @@ const DOT_GIT_DIR: &str = ".git";
 const DOT_PEERS_DIR: &str = ".peers";
 const GITIGNORE_FILE: &str = ".gitignore";
 const GIT_INDEX_FILE: &str = "index";
-const GIT_BINARY: &str = "git";
-const GIT_LS_FILES_ARG: &str = "ls-files";
-const GIT_CACHED_OTHERS_ARG: &str = "-co";
-const GIT_EXCLUDE_STANDARD_ARG: &str = "--exclude-standard";
-const GIT_NULL_ARG: &str = "-z";
+const PATH_UTF8_ERROR: &str = "repository path is not valid UTF-8";
 
 #[derive(Clone, Debug, Facet)]
 pub struct ReviewUpdate {
@@ -271,25 +267,61 @@ impl RepoFingerprint {
 }
 
 fn git_visible_paths(repo_root: &Path) -> Vec<PathBuf> {
-    let Ok(output) = Command::new(GIT_BINARY)
-        .arg(GIT_LS_FILES_ARG)
-        .arg(GIT_CACHED_OTHERS_ARG)
-        .arg(GIT_EXCLUDE_STANDARD_ARG)
-        .arg(GIT_NULL_ARG)
-        .current_dir(repo_root)
-        .output()
-    else {
-        return Vec::new();
-    };
+    let mut paths = BTreeSet::new();
+    collect_index_paths(repo_root, &mut paths);
+    collect_worktree_paths(repo_root, &mut paths);
+    paths.into_iter().collect()
+}
 
-    output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .filter_map(|path| std::str::from_utf8(path).ok())
-        .map(PathBuf::from)
-        .filter(|path| !path.starts_with(DOT_PEERS_DIR))
-        .collect()
+fn collect_index_paths(repo_root: &Path, paths: &mut BTreeSet<PathBuf>) {
+    let Ok(repo) = gix::discover(repo_root) else {
+        return;
+    };
+    let Ok(index) = repo.index_or_empty() else {
+        return;
+    };
+    for entry in index.entries() {
+        if entry.stage_raw() != 0 {
+            continue;
+        }
+        let path = entry.path(&index);
+        let Ok(path) = String::from_utf8(path.to_vec()).context(PATH_UTF8_ERROR) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        if !path.starts_with(DOT_PEERS_DIR) {
+            paths.insert(path);
+        }
+    }
+}
+
+fn collect_worktree_paths(repo_root: &Path, paths: &mut BTreeSet<PathBuf>) {
+    for entry in WalkBuilder::new(repo_root)
+        .hidden(false)
+        .filter_entry(|entry| !is_internal_entry(entry.path()))
+        .build()
+    {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.path().strip_prefix(repo_root).unwrap_or(entry.path());
+        if path.starts_with(DOT_PEERS_DIR) {
+            continue;
+        }
+        paths.insert(path.to_path_buf());
+    }
+}
+
+fn is_internal_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == DOT_GIT_DIR || name == DOT_PEERS_DIR)
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
@@ -407,7 +439,6 @@ fn same_path(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::Stdio;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -416,20 +447,13 @@ mod tests {
     const TEST_FILE: &str = "src/rpc.rs";
     const TEST_EVENTS: &str = ".peers/reviews/rev_test/events.jsonl";
     const TEST_WATCHER_STARTUP_MS: u64 = 1000;
-    const TEST_GIT_INIT_ARG: &str = "init";
 
     #[tokio::test]
     async fn realtime_watcher_broadcasts_diff_change_after_snapshot() {
         let root = test_root("diff_change");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join(".peers/reviews").join(TEST_REVIEW_ID)).unwrap();
-        Command::new(GIT_BINARY)
-            .arg(TEST_GIT_INIT_ARG)
-            .current_dir(&root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
+        gix::init(&root).unwrap();
         fs::write(root.join(TEST_FILE), "before\n").unwrap();
         fs::write(root.join(TEST_EVENTS), "").unwrap();
 

@@ -4,7 +4,6 @@ use anyhow::{Context, Result, anyhow};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::Command;
 
 use crate::comments::{
     Author, AuthorKind, ReviewEvent, ReviewState, encode_event, parse_events_from_reader,
@@ -12,12 +11,9 @@ use crate::comments::{
 };
 use crate::diff::ReviewTarget;
 
-const GIT_BINARY: &str = "git";
-const GIT_REV_PARSE_ARG: &str = "rev-parse";
-const GIT_VERIFY_ARG: &str = "--verify";
-const GIT_HEAD_REF: &str = "HEAD";
 const CURRENT_REVIEW_STALE_CONTEXT: &str = "failed to inspect current review freshness";
 const CURRENT_HEAD_ERROR: &str = "failed to inspect current HEAD";
+const HEAD_REF: &str = "HEAD";
 
 pub struct RepoContext {
     pub root: PathBuf,
@@ -228,23 +224,16 @@ pub async fn review_needs_fresh_successor(repo_root: &Path, state: &ReviewState)
 }
 
 pub async fn current_head_oid(repo_root: &Path) -> Result<Option<String>> {
-    let output = Command::new(GIT_BINARY)
-        .arg(GIT_REV_PARSE_ARG)
-        .arg(GIT_VERIFY_ARG)
-        .arg(GIT_HEAD_REF)
-        .current_dir(repo_root)
-        .output()
-        .await
-        .context(CURRENT_HEAD_ERROR)?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if oid.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(oid))
-    }
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let repo = gix::discover(repo_root).context(CURRENT_HEAD_ERROR)?;
+        match repo.rev_parse_single(HEAD_REF) {
+            Ok(id) => Ok(Some(id.detach().to_string())),
+            Err(_) => Ok(None),
+        }
+    })
+    .await
+    .context(CURRENT_HEAD_ERROR)?
 }
 
 pub async fn list_reviews(repo_root: &Path) -> Result<Vec<String>> {
@@ -352,7 +341,6 @@ fn id_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::{Command as StdCommand, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -364,30 +352,16 @@ mod tests {
     const TEST_NEXT_BODY: &str = "next\n";
     const TEST_INITIAL_COMMIT: &str = "initial";
     const TEST_NEXT_COMMIT: &str = "next";
-    const GIT_INIT_ARG: &str = "init";
-    const GIT_CONFIG_ARG: &str = "config";
-    const GIT_ADD_ARG: &str = "add";
-    const GIT_COMMIT_ARG: &str = "commit";
-    const GIT_MESSAGE_ARG: &str = "-m";
-    const GIT_USER_NAME_KEY: &str = "user.name";
-    const GIT_USER_EMAIL_KEY: &str = "user.email";
+    const GIT_USER_NAME_FIELD: &str = "name";
+    const GIT_USER_EMAIL_FIELD: &str = "email";
 
     #[tokio::test]
     async fn local_diff_current_review_rotates_when_head_changes() {
         let root = test_root("head_change");
         fs::create_dir_all(&root).unwrap();
-        git(&root, [GIT_INIT_ARG]);
-        git(&root, [GIT_CONFIG_ARG, GIT_USER_NAME_KEY, TEST_AUTHOR_NAME]);
-        git(
-            &root,
-            [GIT_CONFIG_ARG, GIT_USER_EMAIL_KEY, TEST_AUTHOR_EMAIL],
-        );
+        init_repo(&root);
         fs::write(root.join(TEST_FILE), TEST_INITIAL_BODY).unwrap();
-        git(&root, [GIT_ADD_ARG, TEST_FILE]);
-        git(
-            &root,
-            [GIT_COMMIT_ARG, GIT_MESSAGE_ARG, TEST_INITIAL_COMMIT],
-        );
+        commit_file(&root, TEST_INITIAL_COMMIT, TEST_INITIAL_BODY);
 
         let review_id = create_review(&root, author(), ReviewTarget::WorkingTree)
             .await
@@ -396,8 +370,7 @@ mod tests {
         assert!(!review_needs_fresh_successor(&root, &state).await.unwrap());
 
         fs::write(root.join(TEST_FILE), TEST_NEXT_BODY).unwrap();
-        git(&root, [GIT_ADD_ARG, TEST_FILE]);
-        git(&root, [GIT_COMMIT_ARG, GIT_MESSAGE_ARG, TEST_NEXT_COMMIT]);
+        commit_file(&root, TEST_NEXT_COMMIT, TEST_NEXT_BODY);
 
         let state = load_review_state(&root, &review_id).await.unwrap();
         assert!(review_needs_fresh_successor(&root, &state).await.unwrap());
@@ -432,14 +405,35 @@ mod tests {
         std::env::temp_dir().join(format!("peers_review_{name}_{nonce}"))
     }
 
-    fn git<const N: usize>(root: &Path, args: [&str; N]) {
-        let status = StdCommand::new(GIT_BINARY)
-            .args(args)
-            .current_dir(root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success());
+    fn init_repo(root: &Path) {
+        gix::init(root).expect("failed to init gix");
+        let config_path = root.join(".git").join("config");
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!(
+            "\n[user]\n\t{} = {}\n\t{} = {}\n",
+            GIT_USER_NAME_FIELD, TEST_AUTHOR_NAME, GIT_USER_EMAIL_FIELD, TEST_AUTHOR_EMAIL
+        ));
+        fs::write(config_path, config).unwrap();
+    }
+
+    fn commit_file(root: &Path, message: &str, body: &str) {
+        let repo = gix::open(root).unwrap();
+        let blob_id = repo.write_blob(body.as_bytes()).unwrap().detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: TEST_FILE.into(),
+                oid: blob_id,
+            }],
+        };
+        let tree_id = repo.write_object(tree).unwrap().detach();
+        let parents = current_head_oid_blocking(&repo)
+            .into_iter()
+            .collect::<Vec<_>>();
+        repo.commit(HEAD_REF, message, tree_id, parents).unwrap();
+    }
+
+    fn current_head_oid_blocking(repo: &gix::Repository) -> Option<gix::ObjectId> {
+        repo.rev_parse_single(HEAD_REF).ok().map(|id| id.detach())
     }
 }

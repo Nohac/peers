@@ -14,6 +14,7 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 facet = "0.46.5"
 facet-json = "0.46.1"
 gix = "0.84.0"
+gix-diff = "0.64.0"
 ignore = "0.4.25"
 notify = "8.2.0"
 time = { version = "0.3.47", features = ["formatting", "macros"] }

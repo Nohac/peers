@@ -1,9 +1,24 @@
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use facet::Facet;
-use tokio::process::Command;
+use gix_diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
+use ignore::WalkBuilder;
+
+const DIFF_CONTEXT_LINES: u32 = 3;
+const HEAD_REF: &str = "HEAD";
+const DOT_GIT_DIR: &str = ".git";
+const DOT_PEERS_DIR: &str = ".peers";
+const PATH_SEPARATOR: char = '/';
+const BINARY_NUL: u8 = 0;
+const EMPTY_PATH_ERROR: &str = "repository path is not valid UTF-8";
+const GIT_DISCOVER_ERROR: &str = "failed to open Git repository for diff";
+const MERGE_BASE_ERROR: &str = "failed to resolve branch merge base";
+const DIFF_TASK_ERROR: &str = "failed to join Git diff loader";
+const BRANCH_BASE_RESOLVE_ERROR: &str = "failed to resolve branch base";
+const BRANCH_HEAD_RESOLVE_ERROR: &str = "failed to resolve branch head";
+const REV_RESOLVE_ERROR: &str = "failed to resolve revision";
 
 #[derive(Clone, Debug, Facet, PartialEq)]
 #[repr(C)]
@@ -185,44 +200,50 @@ pub struct OldRange {
 enum ContentSource {
     Worktree,
     Index,
-    Commit(String),
+    Commit { rev: String, allow_missing: bool },
 }
 
 pub async fn load_review_diff(
     repo_root: &Path,
     target: &ReviewTarget,
 ) -> Result<ReviewDiffPayload> {
-    // Keep Git repository access thin here. gix remains the repo discovery layer; Git's
-    // porcelain diff format is then normalized into the compact UI model.
-    let _repo = gix::discover(repo_root).context("failed to open Git repository for diff")?;
-    let resolved = ResolvedTarget::resolve(repo_root, target).await?;
-    let raw_diff = run_git(repo_root, resolved.diff_args("--unified=3")).await?;
-    let mut file_diffs = parse_unified_diff(&raw_diff)?;
-    let name_status = run_git(repo_root, resolved.diff_args("--name-status")).await?;
-    let status_by_path = parse_name_status(&name_status);
+    let repo_root = repo_root.to_path_buf();
+    let target = target.clone();
+    tokio::task::spawn_blocking(move || load_review_diff_sync(&repo_root, &target))
+        .await
+        .context(DIFF_TASK_ERROR)?
+}
 
+fn load_review_diff_sync(repo_root: &Path, target: &ReviewTarget) -> Result<ReviewDiffPayload> {
+    let repo = gix::discover(repo_root).context(GIT_DISCOVER_ERROR)?;
+    let resolved = ResolvedTarget::resolve(&repo, target)?;
+    let old_snapshot =
+        snapshot_for_source(repo_root, &repo, &resolved.old_source, &BTreeSet::new())?;
+    let old_paths = old_snapshot.keys().cloned().collect();
+    let new_snapshot = snapshot_for_source(repo_root, &repo, &resolved.new_source, &old_paths)?;
+    let entries = diff_entries(old_snapshot, new_snapshot)?;
     let mut files = Vec::new();
     let mut file_contents_by_path = BTreeMap::new();
     let mut file_diffs_by_path = BTreeMap::new();
 
-    for file_diff in &mut file_diffs {
-        let path = file_diff.path.clone();
-        let parsed_status = status_by_path.get(&path);
-        let old_path = parsed_status
-            .and_then(|entry| entry.old_path.clone())
-            .or_else(|| file_diff_old_path(file_diff));
-        let status = parsed_status
-            .map(|entry| entry.status)
-            .unwrap_or(FileStatus::Modified);
-        let added_lines = added_lines(file_diff);
-        let removed_lines = removed_lines(file_diff);
-        let old_content = read_content(
-            repo_root,
-            &resolved.old_source,
-            old_path.as_deref().unwrap_or(&path),
-        )
-        .await?;
-        let new_content = read_content(repo_root, &resolved.new_source, &path).await?;
+    for entry in entries {
+        let path = entry.path;
+        let old_path = entry.old_path;
+        let mut status = entry.status;
+        let binary = is_binary(entry.old.as_deref()) || is_binary(entry.new.as_deref());
+        if binary {
+            status = FileStatus::Binary;
+        }
+        let file_diff = if binary {
+            FileDiff {
+                path: path.clone(),
+                hunks: Vec::new(),
+            }
+        } else {
+            build_file_diff(&path, entry.old.as_deref(), entry.new.as_deref())?
+        };
+        let added_lines = added_lines(&file_diff);
+        let removed_lines = removed_lines(&file_diff);
 
         file_contents_by_path.insert(
             path.clone(),
@@ -230,12 +251,12 @@ pub async fn load_review_diff(
                 old: if matches!(status, FileStatus::Added) {
                     None
                 } else {
-                    old_content
+                    entry.old.as_deref().and_then(bytes_to_lines)
                 },
                 new: if matches!(status, FileStatus::Deleted) {
                     None
                 } else {
-                    new_content
+                    entry.new.as_deref().and_then(bytes_to_lines)
                 },
             },
         );
@@ -262,128 +283,178 @@ pub async fn load_review_diff(
 }
 
 struct ResolvedTarget {
-    diff_base: Option<String>,
-    diff_head: Option<String>,
-    cached: bool,
     old_source: ContentSource,
     new_source: ContentSource,
 }
 
 impl ResolvedTarget {
-    async fn resolve(repo_root: &Path, target: &ReviewTarget) -> Result<Self> {
+    fn resolve(repo: &gix::Repository, target: &ReviewTarget) -> Result<Self> {
         match target {
             ReviewTarget::WorkingTree => Ok(Self {
-                diff_base: None,
-                diff_head: None,
-                cached: false,
                 old_source: ContentSource::Index,
                 new_source: ContentSource::Worktree,
             }),
             ReviewTarget::Cached => Ok(Self {
-                diff_base: None,
-                diff_head: None,
-                cached: true,
-                old_source: ContentSource::Commit("HEAD".to_string()),
+                old_source: ContentSource::Commit {
+                    rev: HEAD_REF.to_string(),
+                    allow_missing: true,
+                },
                 new_source: ContentSource::Index,
             }),
             ReviewTarget::All => Ok(Self {
-                diff_base: Some("HEAD".to_string()),
-                diff_head: None,
-                cached: false,
-                old_source: ContentSource::Commit("HEAD".to_string()),
+                old_source: ContentSource::Commit {
+                    rev: HEAD_REF.to_string(),
+                    allow_missing: true,
+                },
                 new_source: ContentSource::Worktree,
             }),
             ReviewTarget::Branch { base, head } => {
-                let merge_base =
-                    run_git(repo_root, ["merge-base", base.as_str(), head.as_str()]).await?;
-                let merge_base = merge_base.trim().to_string();
+                let base_id = repo
+                    .rev_parse_single(base.as_str())
+                    .with_context(|| format!("{BRANCH_BASE_RESOLVE_ERROR} `{base}`"))?;
+                let head_id = repo
+                    .rev_parse_single(head.as_str())
+                    .with_context(|| format!("{BRANCH_HEAD_RESOLVE_ERROR} `{head}`"))?;
+                let merge_base = repo
+                    .merge_base(base_id.detach(), head_id.detach())
+                    .context(MERGE_BASE_ERROR)?
+                    .to_string();
                 Ok(Self {
-                    diff_base: Some(merge_base.clone()),
-                    diff_head: Some(head.clone()),
-                    cached: false,
-                    old_source: ContentSource::Commit(merge_base),
-                    new_source: ContentSource::Commit(head.clone()),
+                    old_source: ContentSource::Commit {
+                        rev: merge_base,
+                        allow_missing: false,
+                    },
+                    new_source: ContentSource::Commit {
+                        rev: head.clone(),
+                        allow_missing: false,
+                    },
                 })
             }
         }
     }
-
-    fn diff_args<'a>(&'a self, format_arg: &'a str) -> Vec<&'a str> {
-        let mut args = vec![
-            "diff",
-            "--find-renames",
-            "--no-color",
-            "--no-ext-diff",
-            format_arg,
-        ];
-        if self.cached {
-            args.push("--cached");
-        }
-        if let Some(base) = &self.diff_base {
-            args.push(base);
-        }
-        if let Some(head) = &self.diff_head {
-            args.push(head);
-        }
-        args
-    }
 }
 
-async fn run_git<I, S>(repo_root: &Path, args: I) -> Result<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_root)
-        .output()
-        .await
-        .context("failed to run git")?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git command failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-async fn read_content(
+fn snapshot_for_source(
     repo_root: &Path,
+    repo: &gix::Repository,
     source: &ContentSource,
-    path: &str,
-) -> Result<Option<Vec<String>>> {
-    let bytes = match source {
-        ContentSource::Worktree => {
-            let full_path = repo_root.join(path);
-            match tokio::fs::read(full_path).await {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            }
-        }
-        ContentSource::Index => {
-            match run_git(repo_root, ["show".to_string(), format!(":{path}")]).await {
-                Ok(output) => output.into_bytes(),
-                Err(_) => return Ok(None),
-            }
-        }
-        ContentSource::Commit(commit) => {
-            match run_git(repo_root, ["show".to_string(), format!("{commit}:{path}")]).await {
-                Ok(output) => output.into_bytes(),
-                Err(_) => return Ok(None),
-            }
-        }
-    };
+    extra_worktree_paths: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    match source {
+        ContentSource::Worktree => worktree_snapshot(repo_root, extra_worktree_paths),
+        ContentSource::Index => index_snapshot(repo),
+        ContentSource::Commit { rev, allow_missing } => commit_snapshot(repo, rev, *allow_missing),
+    }
+}
 
-    if bytes.contains(&0) {
-        return Ok(None);
+fn index_snapshot(repo: &gix::Repository) -> Result<BTreeMap<String, Vec<u8>>> {
+    let index = repo.index_or_empty()?;
+    let mut snapshot = BTreeMap::new();
+    for entry in index.entries() {
+        if entry.stage_raw() != 0 {
+            continue;
+        }
+        let path = bstr_path_to_string(entry.path(&index))?;
+        let blob = repo.find_blob(entry.id)?;
+        snapshot.insert(path, blob.data.to_vec());
+    }
+    Ok(snapshot)
+}
+
+fn commit_snapshot(
+    repo: &gix::Repository,
+    rev: &str,
+    allow_missing: bool,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let id = match repo.rev_parse_single(rev) {
+        Ok(id) => id,
+        Err(error) if allow_missing => {
+            let _ = error;
+            return Ok(BTreeMap::new());
+        }
+        Err(error) => return Err(error).with_context(|| format!("{REV_RESOLVE_ERROR} `{rev}`")),
+    };
+    let tree_id = id.object()?.peel_to_commit()?.tree_id()?;
+    let index = repo.index_from_tree(&tree_id)?;
+    let mut snapshot = BTreeMap::new();
+    for entry in index.entries() {
+        if entry.stage_raw() != 0 {
+            continue;
+        }
+        let path = bstr_path_to_string(entry.path(&index))?;
+        let blob = repo.find_blob(entry.id)?;
+        snapshot.insert(path, blob.data.to_vec());
+    }
+    Ok(snapshot)
+}
+
+fn worktree_snapshot(
+    repo_root: &Path,
+    extra_paths: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut paths = extra_paths.clone();
+    for entry in WalkBuilder::new(repo_root)
+        .hidden(false)
+        .filter_entry(|entry| !is_internal_entry(entry.path()))
+        .build()
+    {
+        let entry = entry?;
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = relative_worktree_path(repo_root, entry.path())?;
+        if !path.is_empty() {
+            paths.insert(path);
+        }
     }
 
-    Ok(Some(split_lines(&String::from_utf8_lossy(&bytes))))
+    let mut snapshot = BTreeMap::new();
+    for path in paths {
+        let full_path = repo_root.join(path_to_platform(&path));
+        match std::fs::read(full_path) {
+            Ok(bytes) => {
+                snapshot.insert(path, bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(snapshot)
+}
+
+fn is_internal_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == DOT_GIT_DIR || name == DOT_PEERS_DIR)
+}
+
+fn relative_worktree_path(repo_root: &Path, path: &Path) -> Result<String> {
+    let relative = path.strip_prefix(repo_root).unwrap_or(path);
+    path_to_string(relative)
+}
+
+fn path_to_platform(path: &str) -> PathBuf {
+    path.split(PATH_SEPARATOR).collect()
+}
+
+fn path_to_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
+        .ok_or_else(|| anyhow!(EMPTY_PATH_ERROR))
+}
+
+fn bstr_path_to_string(path: &gix::bstr::BStr) -> Result<String> {
+    String::from_utf8(path.to_vec()).context(EMPTY_PATH_ERROR)
+}
+
+fn bytes_to_lines(bytes: &[u8]) -> Option<Vec<String>> {
+    if is_binary(Some(bytes)) {
+        return None;
+    }
+    Some(split_lines(&String::from_utf8_lossy(bytes)))
 }
 
 fn split_lines(input: &str) -> Vec<String> {
@@ -393,6 +464,235 @@ fn split_lines(input: &str) -> Vec<String> {
         .split('\n')
         .map(str::to_string)
         .collect()
+}
+
+struct DiffEntry {
+    path: String,
+    old_path: Option<String>,
+    status: FileStatus,
+    old: Option<Vec<u8>>,
+    new: Option<Vec<u8>>,
+}
+
+fn diff_entries(
+    old_snapshot: BTreeMap<String, Vec<u8>>,
+    new_snapshot: BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<DiffEntry>> {
+    let paths = old_snapshot
+        .keys()
+        .chain(new_snapshot.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+
+    for path in paths {
+        let old = old_snapshot.get(&path).cloned();
+        let new = new_snapshot.get(&path).cloned();
+        if old == new {
+            continue;
+        }
+        let status = match (&old, &new) {
+            (None, Some(_)) => FileStatus::Added,
+            (Some(_), None) => FileStatus::Deleted,
+            (Some(_), Some(_)) => FileStatus::Modified,
+            (None, None) => continue,
+        };
+        entries.push(DiffEntry {
+            path,
+            old_path: None,
+            status,
+            old,
+            new,
+        });
+    }
+
+    Ok(coalesce_exact_renames(entries))
+}
+
+fn coalesce_exact_renames(entries: Vec<DiffEntry>) -> Vec<DiffEntry> {
+    let mut additions = Vec::new();
+    let mut deletions = Vec::new();
+    let mut others = Vec::new();
+
+    for entry in entries {
+        match entry.status {
+            FileStatus::Added => additions.push(entry),
+            FileStatus::Deleted => deletions.push(entry),
+            _ => others.push(entry),
+        }
+    }
+
+    let mut used_additions = BTreeSet::new();
+    let mut coalesced = Vec::new();
+    for deletion in deletions {
+        let Some(old_bytes) = deletion.old.as_ref() else {
+            coalesced.push(deletion);
+            continue;
+        };
+        let addition = additions
+            .iter()
+            .enumerate()
+            .find(|(index, addition)| {
+                !used_additions.contains(index) && addition.new.as_ref() == Some(old_bytes)
+            })
+            .map(|(index, addition)| (index, addition));
+        if let Some((index, addition)) = addition {
+            used_additions.insert(index);
+            coalesced.push(DiffEntry {
+                path: addition.path.clone(),
+                old_path: Some(deletion.path),
+                status: FileStatus::Renamed,
+                old: deletion.old,
+                new: addition.new.clone(),
+            });
+        } else {
+            coalesced.push(deletion);
+        }
+    }
+
+    for (index, addition) in additions.into_iter().enumerate() {
+        if !used_additions.contains(&index) {
+            coalesced.push(addition);
+        }
+    }
+
+    coalesced.extend(others);
+    coalesced.sort_by(|left, right| left.path.cmp(&right.path));
+    coalesced
+}
+
+fn build_file_diff(path: &str, old: Option<&[u8]>, new: Option<&[u8]>) -> Result<FileDiff> {
+    let old = old.unwrap_or_default();
+    let new = new.unwrap_or_default();
+    let input = gix_diff::blob::InternedInput::new(
+        gix_diff::blob::sources::byte_lines(old),
+        gix_diff::blob::sources::byte_lines(new),
+    );
+    let diff =
+        gix_diff::blob::diff_with_slider_heuristics(gix_diff::blob::Algorithm::Histogram, &input);
+    let collector = HunkCollector::default();
+    let hunks = gix_diff::blob::UnifiedDiff::new(
+        &diff,
+        &input,
+        collector,
+        ContextSize::symmetrical(DIFF_CONTEXT_LINES),
+    )
+    .consume()?;
+
+    Ok(FileDiff {
+        path: path.to_string(),
+        hunks,
+    })
+}
+
+#[derive(Default)]
+struct HunkCollector {
+    hunks: Vec<DiffHunk>,
+}
+
+impl ConsumeHunk for HunkCollector {
+    type Out = Vec<DiffHunk>;
+
+    fn consume_hunk(
+        &mut self,
+        header: HunkHeader,
+        lines: &[(DiffLineKind, &[u8])],
+    ) -> std::io::Result<()> {
+        let mut hunk = DiffHunk {
+            old: Some(hunk_range(header.before_hunk_start, header.before_hunk_len)),
+            new: Some(hunk_range(header.after_hunk_start, header.after_hunk_len)),
+            sections: Vec::new(),
+        };
+        let mut section = None;
+        let mut old_line = header.before_hunk_start;
+        let mut new_line = header.after_hunk_start;
+
+        for (kind, _) in lines {
+            match kind {
+                DiffLineKind::Context => {
+                    append_section_to_hunk(
+                        &mut hunk,
+                        &mut section,
+                        SectionKind::Context,
+                        Some(old_line),
+                        Some(new_line),
+                    );
+                    old_line += 1;
+                    new_line += 1;
+                }
+                DiffLineKind::Add => {
+                    append_section_to_hunk(
+                        &mut hunk,
+                        &mut section,
+                        SectionKind::Added,
+                        None,
+                        Some(new_line),
+                    );
+                    new_line += 1;
+                }
+                DiffLineKind::Remove => {
+                    append_section_to_hunk(
+                        &mut hunk,
+                        &mut section,
+                        SectionKind::Removed,
+                        Some(old_line),
+                        None,
+                    );
+                    old_line += 1;
+                }
+            }
+        }
+
+        if let Some(section) = section.take() {
+            hunk.sections.push(section.finish());
+        }
+        self.hunks.push(hunk);
+        Ok(())
+    }
+
+    fn finish(self) -> Self::Out {
+        self.hunks
+    }
+}
+
+fn append_section_to_hunk(
+    hunk: &mut DiffHunk,
+    current_section: &mut Option<SectionBuilder>,
+    kind: SectionKind,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+) {
+    let same_kind = current_section.as_ref().is_some_and(|section| {
+        std::mem::discriminant(&section.kind) == std::mem::discriminant(&kind)
+    });
+    if same_kind {
+        if let Some(section) = current_section {
+            section.extend(old_line, new_line);
+        }
+        return;
+    }
+
+    if let Some(section) = current_section.take() {
+        hunk.sections.push(section.finish());
+    }
+    *current_section = Some(match kind {
+        SectionKind::Context => {
+            SectionBuilder::context(old_line.unwrap_or(1), new_line.unwrap_or(1))
+        }
+        SectionKind::Added => SectionBuilder::added(new_line.unwrap_or(1)),
+        SectionKind::Removed => SectionBuilder::removed(old_line.unwrap_or(1)),
+    });
+}
+
+fn hunk_range(start: u32, len: u32) -> LineRange {
+    LineRange {
+        start,
+        end: start.saturating_add(len).saturating_sub(1),
+    }
+}
+
+fn is_binary(bytes: Option<&[u8]>) -> bool {
+    bytes.is_some_and(|bytes| bytes.contains(&BINARY_NUL))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -484,219 +784,6 @@ impl SectionBuilder {
     }
 }
 
-fn parse_unified_diff(input: &str) -> Result<Vec<FileDiff>> {
-    let mut files = Vec::new();
-    let mut current_file: Option<FileDiff> = None;
-    let mut current_hunk: Option<DiffHunk> = None;
-    let mut current_section: Option<SectionBuilder> = None;
-    let mut old_line = 0u32;
-    let mut new_line = 0u32;
-
-    for line in input.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            flush_section(&mut current_hunk, &mut current_section);
-            flush_hunk(&mut current_file, &mut current_hunk);
-            if let Some(file) = current_file.take() {
-                files.push(file);
-            }
-            let path = rest
-                .split_once(" b/")
-                .map(|(_, path)| path.to_string())
-                .unwrap_or_default();
-            current_file = Some(FileDiff {
-                path,
-                hunks: Vec::new(),
-            });
-            continue;
-        }
-
-        if let Some(path) = line.strip_prefix("+++ b/") {
-            if let Some(file) = &mut current_file {
-                file.path = path.to_string();
-            }
-            continue;
-        }
-
-        if let Some(header) = line.strip_prefix("@@ ") {
-            flush_section(&mut current_hunk, &mut current_section);
-            flush_hunk(&mut current_file, &mut current_hunk);
-            let (old_range, new_range) = parse_hunk_header(header)?;
-            old_line = old_range.start;
-            new_line = new_range.start;
-            current_hunk = Some(DiffHunk {
-                old: Some(old_range),
-                new: Some(new_range),
-                sections: Vec::new(),
-            });
-            continue;
-        }
-
-        let Some(first) = line.as_bytes().first().copied() else {
-            continue;
-        };
-        if current_hunk.is_none() {
-            continue;
-        }
-
-        match first {
-            b' ' => {
-                append_section(
-                    &mut current_hunk,
-                    &mut current_section,
-                    SectionKind::Context,
-                    Some(old_line),
-                    Some(new_line),
-                );
-                old_line += 1;
-                new_line += 1;
-            }
-            b'+' => {
-                append_section(
-                    &mut current_hunk,
-                    &mut current_section,
-                    SectionKind::Added,
-                    None,
-                    Some(new_line),
-                );
-                new_line += 1;
-            }
-            b'-' => {
-                append_section(
-                    &mut current_hunk,
-                    &mut current_section,
-                    SectionKind::Removed,
-                    Some(old_line),
-                    None,
-                );
-                old_line += 1;
-            }
-            b'\\' => {}
-            _ => {}
-        }
-    }
-
-    flush_section(&mut current_hunk, &mut current_section);
-    flush_hunk(&mut current_file, &mut current_hunk);
-    if let Some(file) = current_file {
-        files.push(file);
-    }
-
-    Ok(files)
-}
-
-fn append_section(
-    current_hunk: &mut Option<DiffHunk>,
-    current_section: &mut Option<SectionBuilder>,
-    kind: SectionKind,
-    old_line: Option<u32>,
-    new_line: Option<u32>,
-) {
-    let same_kind = current_section.as_ref().is_some_and(|section| {
-        std::mem::discriminant(&section.kind) == std::mem::discriminant(&kind)
-    });
-    if same_kind {
-        if let Some(section) = current_section {
-            section.extend(old_line, new_line);
-        }
-        return;
-    }
-
-    flush_section(current_hunk, current_section);
-    *current_section = Some(match kind {
-        SectionKind::Context => {
-            SectionBuilder::context(old_line.unwrap_or(1), new_line.unwrap_or(1))
-        }
-        SectionKind::Added => SectionBuilder::added(new_line.unwrap_or(1)),
-        SectionKind::Removed => SectionBuilder::removed(old_line.unwrap_or(1)),
-    });
-}
-
-fn flush_section(
-    current_hunk: &mut Option<DiffHunk>,
-    current_section: &mut Option<SectionBuilder>,
-) {
-    if let (Some(hunk), Some(section)) = (current_hunk.as_mut(), current_section.take()) {
-        hunk.sections.push(section.finish());
-    }
-}
-
-fn flush_hunk(current_file: &mut Option<FileDiff>, current_hunk: &mut Option<DiffHunk>) {
-    if let (Some(file), Some(hunk)) = (current_file.as_mut(), current_hunk.take()) {
-        file.hunks.push(hunk);
-    }
-}
-
-fn parse_hunk_header(header: &str) -> Result<(LineRange, LineRange)> {
-    let mut parts = header.split_whitespace();
-    let old = parts
-        .next()
-        .ok_or_else(|| anyhow!("hunk header missing old range"))?;
-    let new = parts
-        .next()
-        .ok_or_else(|| anyhow!("hunk header missing new range"))?;
-    Ok((parse_hunk_range(old, '-')?, parse_hunk_range(new, '+')?))
-}
-
-fn parse_hunk_range(input: &str, prefix: char) -> Result<LineRange> {
-    let input = input
-        .strip_prefix(prefix)
-        .ok_or_else(|| anyhow!("invalid hunk range `{input}`"))?;
-    let (start, count) = match input.split_once(',') {
-        Some((start, count)) => (start.parse::<u32>()?, count.parse::<u32>()?),
-        None => (input.parse::<u32>()?, 1),
-    };
-    Ok(LineRange {
-        start,
-        end: start.saturating_add(count).saturating_sub(1),
-    })
-}
-
-struct NameStatusEntry {
-    status: FileStatus,
-    old_path: Option<String>,
-}
-
-fn parse_name_status(input: &str) -> BTreeMap<String, NameStatusEntry> {
-    let mut entries = BTreeMap::new();
-    for line in input.lines() {
-        let fields: Vec<_> = line.split('\t').collect();
-        if fields.len() < 2 {
-            continue;
-        }
-        let code = fields[0];
-        let status = match code.as_bytes().first().copied() {
-            Some(b'A') => FileStatus::Added,
-            Some(b'D') => FileStatus::Deleted,
-            Some(b'R') => FileStatus::Renamed,
-            Some(b'M') => FileStatus::Modified,
-            Some(b'T') => FileStatus::Modified,
-            _ => FileStatus::Modified,
-        };
-        if code.starts_with('R') && fields.len() >= 3 {
-            entries.insert(
-                fields[2].to_string(),
-                NameStatusEntry {
-                    status,
-                    old_path: Some(fields[1].to_string()),
-                },
-            );
-        } else {
-            entries.insert(
-                fields[1].to_string(),
-                NameStatusEntry {
-                    status,
-                    old_path: None,
-                },
-            );
-        }
-    }
-    entries
-}
-
-fn file_diff_old_path(_file_diff: &FileDiff) -> Option<String> {
-    None
-}
-
 fn added_lines(file_diff: &FileDiff) -> u32 {
     file_diff
         .hunks
@@ -730,24 +817,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_unified_diff_sections() {
-        let input = "\
-diff --git a/src/lib.rs b/src/lib.rs
-index 1111111..2222222 100644
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -1,3 +1,4 @@
- use anyhow::Result;
--fn old() {}
-+fn new() {}
-+fn added() {}
- fn keep() {}
-";
-        let files = parse_unified_diff(input).unwrap();
+    fn builds_diff_sections() {
+        let old = b"use anyhow::Result;\nfn old() {}\nfn keep() {}\n";
+        let new = b"use anyhow::Result;\nfn new() {}\nfn added() {}\nfn keep() {}\n";
+        let file = build_file_diff("src/lib.rs", Some(old), Some(new)).unwrap();
 
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "src/lib.rs");
-        assert_eq!(removed_lines(&files[0]), 1);
-        assert_eq!(added_lines(&files[0]), 2);
+        assert_eq!(file.path, "src/lib.rs");
+        assert_eq!(removed_lines(&file), 1);
+        assert_eq!(added_lines(&file), 2);
     }
 }

@@ -2751,6 +2751,7 @@ dependencies = [
  "facet",
  "facet-json",
  "gix",
+ "gix-diff",
  "ignore",
  "notify",
  "thiserror 2.0.18",
