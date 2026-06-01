@@ -10,8 +10,8 @@ use crate::comments::{
     ThreadId, ThreadPayload, ThreadStatus,
 };
 use crate::diff::{
-    CommentAnchor, FileContent, FileDiff, FileSide, LineAnchor, ReviewDiffPayload, ReviewFile,
-    ReviewTarget, load_review_diff,
+    CommentAnchor, FileContent, FileContextRequest, FileDiff, FileSide, LineAnchor,
+    ReviewDiffPayload, ReviewFile, ReviewTarget, load_review_diff_with_contexts,
 };
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
@@ -85,7 +85,8 @@ impl ReviewProvider {
 
     pub async fn get_review(&self) -> Result<ReviewProjection> {
         let state = load_peers_state(&self.repo_root).await?;
-        let diff = load_review_diff(&self.repo_root, &self.target).await?;
+        let contexts = open_comment_contexts(&state);
+        let diff = load_review_diff_with_contexts(&self.repo_root, &self.target, &contexts).await?;
         Ok(review_payload(&state, diff, &self.target, &self.author))
     }
 
@@ -437,6 +438,33 @@ fn review_payload(
         review_threads,
         commits: Vec::new(),
     }
+}
+
+fn open_comment_contexts(state: &PeersState) -> Vec<FileContextRequest> {
+    state
+        .threads
+        .values()
+        .filter(|thread| {
+            !thread.resolved && thread.archived_at.is_none() && thread.pruned_at.is_none()
+        })
+        .filter_map(|thread| match &thread.anchor {
+            CommentAnchor::Line { line } => Some(FileContextRequest {
+                path: line.path.clone(),
+                old_path: line.old_path.clone(),
+                side: Some(line.side.clone()),
+                start_line: Some(line.start_line),
+                end_line: Some(line.end_line),
+            }),
+            CommentAnchor::File { path } => Some(FileContextRequest {
+                path: path.clone(),
+                old_path: None,
+                side: None,
+                start_line: None,
+                end_line: None,
+            }),
+            CommentAnchor::Review => None,
+        })
+        .collect()
 }
 
 fn review_thread(thread: &CommentThread, current_author: &Author) -> ReviewThread {

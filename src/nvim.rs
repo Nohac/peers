@@ -660,13 +660,13 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         symbols: Vec::new(),
     };
 
-    if !review.files.iter().any(|file| file.is_changed) {
+    if !review.files.iter().any(review_file_is_visible) {
         render_empty_review(&mut rendered);
         return rendered;
     }
 
     for file in &review.files {
-        if !file.is_changed {
+        if !review_file_is_visible(file) {
             continue;
         }
 
@@ -849,6 +849,10 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
     }
 
     rendered
+}
+
+fn review_file_is_visible(file: &crate::diff::ReviewFile) -> bool {
+    file.is_changed || file.comment_count > 0
 }
 
 fn render_empty_review(rendered: &mut RenderedReview) {
@@ -1693,4 +1697,50 @@ fn review_update_param(kind: String, sequence: u64) -> LSPAny {
     object.insert("kind".to_string(), LSPAny::String(kind));
     object.insert("sequence".to_string(), LSPAny::Number(sequence.into()));
     LSPAny::Object(object)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::diff::{FileDiff, FileStatus, ReviewFile};
+
+    use super::*;
+
+    #[test]
+    fn renders_unchanged_files_with_open_comments() {
+        let rendered = render_review_payload(ReviewProjection {
+            review_id: "repo".to_string(),
+            target_label: "working tree".to_string(),
+            is_branch_review: false,
+            files: vec![ReviewFile {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Unchanged,
+                is_changed: false,
+                comment_count: 1,
+                added_lines: 0,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::new(),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                FileDiff {
+                    path: "src/main.rs".to_string(),
+                    hunks: Vec::new(),
+                },
+            )]),
+            threads: Vec::new(),
+            review_threads: Vec::new(),
+            commits: Vec::new(),
+        });
+
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.contains("src/main.rs"))
+        );
+        assert!(!rendered.lines.iter().any(|line| line.contains(EMPTY_TITLE)));
+    }
 }

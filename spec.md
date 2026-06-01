@@ -289,17 +289,18 @@ Event kinds:
 - `comment_deleted`
 - `agent_comment_accepted`
 - `agent_comment_declined`
+- `thread_title_updated`
 - `thread_resolved`
 - `thread_reopened`
 - `thread_anchored`
 - `thread_archived`
 - `thread_pruned`
-- `file_marked_viewed`
-- `review_submitted`
 
 Derived state is rebuilt by loading thread/comment payloads and replaying events.
 
 Agent comment disposition is distinct from thread resolution. An agent-authored comment may be pending, accepted, or declined. Accepting an agent comment means a human has acknowledged the feedback as valid or useful; it does not automatically apply code and does not automatically resolve the thread. Declining an agent comment means a human has explicitly rejected that feedback; if the declined comment is the only remaining actionable item in the thread, the UI may offer `Decline and resolve`, but the storage model should still record the decline and the resolve as separate events. The latest disposition event for a comment wins.
+
+Threads may have an optional short title stored in the thread payload and updated through an append-only `thread_title_updated` event. The title is display metadata for collapsed/resolved thread rows and summaries; it should be concise enough to remind the reader what the thread was about without reopening it. When an agent resolves a thread, it must set or update this title as part of the resolution flow. Human resolution may allow an optional title, but should not require one.
 
 `thread_archived` and `thread_pruned` are intended for `peers clean`. Prefer append-only cleanup events first. A later explicit compaction command may rewrite the event log into a smaller canonical form, but ordinary cleanup should not silently rewrite history.
 
@@ -892,6 +893,7 @@ Inline thread behavior:
 - Existing threads render directly below their anchored line or range in both diff and full-file views.
 - Multiple threads on the same line or range render in a stable order by creation time.
 - Resolved threads may be collapsed by default, but unresolved threads should be visible without opening a side panel.
+- Collapsed resolved threads should show the thread title when present, plus compact status/metadata, so the row remains useful as a context reminder.
 - Reply, edit, delete, resolve, and reopen actions are available from the inline thread.
 - Creating a new thread opens the composer inline at the selected range after the comment affordance is clicked.
 - If an anchor becomes outdated or detached, show the thread inline at the best relocated position when possible; otherwise show it in a clear detached/outdated section for that file.
@@ -1063,11 +1065,12 @@ Current status:
 | CLI comment operations | Partial | List/add/reply/edit/delete/resolve/reopen operate on repo-scoped state; richer projection filtering remains. |
 | `peers clean` | Partial | Cleanup previews and archives resolved candidates with confirmation unless explicitly non-interactive; detached/hidden/age policies remain coarse. |
 | Agent comment accept/decline | Planned | Agent-authored comments should expose accept/decline code actions and append explicit disposition events without conflating disposition with thread resolution. |
+| Thread titles | Planned | Agent resolution should set a short thread title so collapsed resolved threads can show a useful reminder without expanding the full conversation. |
 | Anchor relocation and visibility policy | Planned | Rich content/context anchors and aggressive unresolved vs conservative resolved visibility are specified but not implemented. |
 | Generated review and agent context files | Partial | Basic generated files read repo-scoped state and replay hides invalidated dependent activity; richer projection context remains. |
 | Git diff loading | Partial | Working tree, cached, all-changes, and branch targets load real Git diffs into the compact payload through gitoxide snapshots and `gix-diff` hunk generation. Rename detection is currently exact-content only, and richer normalization fixtures remain. |
 | Arborium highlighting | Planned | Not implemented. |
-| Vox RPC service | Partial | Local WebSocket service exposes review load, refresh, comment mutations, viewed files, submit review, and a coarse update subscription channel; contract should be revised around repo-scoped projections and is lower priority than Neovim. |
+| Vox RPC service | Partial | Local WebSocket service exposes review load, refresh, comment mutations, and a coarse update subscription channel; contract should be revised around repo-scoped projections and is lower priority than Neovim. |
 | Realtime UI updates | Partial | The session broadcasts coarse `review_changed` and `diff_changed` updates through Vox channels, watches `.peers/events.jsonl`, `.peers/threads/`, and the repository tree with debounce plus polling fallback, and refreshes Neovim review buffers through a direct Neovim RPC callback. |
 | Neovim review mode | Partial | The local Peers session starts a `peersdiff` LSP endpoint using `tower-lsp-server`; `peers diff` and `peers review` launch repo-scoped sessions, Vox/LSP share a cloneable review provider, and Lua `:Peers`/`:PeersReview` open a full-focus synthetic review buffer from `.peers/session.json`. Rust serves `peers/renderReview` with rendered diff rows, row metadata, structural highlights, document symbols, and an empty state when there are no changed files; Lua applies rows, mirrors viewport-scoped Tree-sitter highlights from hidden current-side source buffers, opens floating writable composers for add/reply/edit comment code actions, executes delete/resolve/reopen mutations, shows edit/delete invalidation confirmation through native Neovim prompts, masks file diffs when Neovim has unsaved changes in the corresponding source buffer, publishes diagnostics for those masked files, refreshes via direct Neovim RPC while a review session is active, and proxies hover/definition/declaration/type-definition/implementation/references from mapped current-side rows into hidden source buffer LSP clients. Line comments render inline at their anchor row with range rails and context-aware code actions for line/range/file/comment rows. Broader relocation diagnostics remain. |
 | Neovim cursor stability | Planned | Live review-buffer refreshes should restore cursor and viewport by semantic row anchors such as comment id, thread id, or source path/line rather than raw Neovim line number. |

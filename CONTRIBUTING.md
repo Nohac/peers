@@ -90,6 +90,8 @@ Agents should normally use CLI commands to add/reply/resolve comments. Payload f
 
 Keep tests minimal, but keep logic testable.
 
+Unit tests must not touch filesystem, process, network, editor, or Git repository IO. If a test needs IO, move it to an integration or end-to-end test layer and keep the unit-level behavior behind a pure abstraction that can be exercised with in-memory data.
+
 Test logic that can become subtle:
 
 - JSONL event parse/encode roundtrip.

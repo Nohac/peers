@@ -153,6 +153,15 @@ pub struct ReviewFile {
     pub removed_lines: u32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileContextRequest {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub side: Option<FileSide>,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+}
+
 #[derive(Clone, Copy, Debug, Facet, PartialEq)]
 #[repr(u8)]
 #[facet(rename_all = "snake_case")]
@@ -226,21 +235,38 @@ pub async fn load_review_diff(
     repo_root: &Path,
     target: &ReviewTarget,
 ) -> Result<ReviewDiffPayload> {
+    load_review_diff_with_contexts(repo_root, target, &[]).await
+}
+
+pub async fn load_review_diff_with_contexts(
+    repo_root: &Path,
+    target: &ReviewTarget,
+    contexts: &[FileContextRequest],
+) -> Result<ReviewDiffPayload> {
     let repo_root = repo_root.to_path_buf();
     let target = target.clone();
-    tokio::task::spawn_blocking(move || load_review_diff_sync(&repo_root, &target))
+    let contexts = contexts.to_vec();
+    tokio::task::spawn_blocking(move || load_review_diff_sync(&repo_root, &target, &contexts))
         .await
         .context(DIFF_TASK_ERROR)?
 }
 
-fn load_review_diff_sync(repo_root: &Path, target: &ReviewTarget) -> Result<ReviewDiffPayload> {
+fn load_review_diff_sync(
+    repo_root: &Path,
+    target: &ReviewTarget,
+    contexts: &[FileContextRequest],
+) -> Result<ReviewDiffPayload> {
     let repo = gix::discover(repo_root).context(GIT_DISCOVER_ERROR)?;
     let resolved = ResolvedTarget::resolve(&repo, target)?;
-    let old_snapshot =
-        snapshot_for_source(repo_root, &repo, &resolved.old_source, &BTreeSet::new())?;
-    let old_paths = old_snapshot.keys().cloned().collect();
+    let context_paths = context_paths(contexts);
+    let old_snapshot = snapshot_for_source(repo_root, &repo, &resolved.old_source, &context_paths)?;
+    let old_paths = old_snapshot
+        .keys()
+        .chain(context_paths.iter())
+        .cloned()
+        .collect();
     let new_snapshot = snapshot_for_source(repo_root, &repo, &resolved.new_source, &old_paths)?;
-    let entries = diff_entries(old_snapshot, new_snapshot)?;
+    let entries = diff_entries(&old_snapshot, &new_snapshot)?;
     let mut files = Vec::new();
     let mut file_contents_by_path = BTreeMap::new();
     let mut file_diffs_by_path = BTreeMap::new();
@@ -293,11 +319,20 @@ fn load_review_diff_sync(repo_root: &Path, target: &ReviewTarget) -> Result<Revi
 
     files.sort_by(|left, right| left.path.cmp(&right.path));
 
-    Ok(ReviewDiffPayload {
+    let mut payload = ReviewDiffPayload {
         files,
         file_contents_by_path,
         file_diffs_by_path,
-    })
+    };
+    apply_file_contexts(&mut payload, &old_snapshot, &new_snapshot, contexts);
+    Ok(payload)
+}
+
+fn context_paths(contexts: &[FileContextRequest]) -> BTreeSet<String> {
+    contexts
+        .iter()
+        .flat_map(|context| std::iter::once(context.path.clone()).chain(context.old_path.clone()))
+        .collect()
 }
 
 struct ResolvedTarget {
@@ -493,8 +528,8 @@ struct DiffEntry {
 }
 
 fn diff_entries(
-    old_snapshot: BTreeMap<String, Vec<u8>>,
-    new_snapshot: BTreeMap<String, Vec<u8>>,
+    old_snapshot: &BTreeMap<String, Vec<u8>>,
+    new_snapshot: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<DiffEntry>> {
     let paths = old_snapshot
         .keys()
@@ -525,6 +560,150 @@ fn diff_entries(
     }
 
     Ok(coalesce_exact_renames(entries))
+}
+
+fn apply_file_contexts(
+    payload: &mut ReviewDiffPayload,
+    old_snapshot: &BTreeMap<String, Vec<u8>>,
+    new_snapshot: &BTreeMap<String, Vec<u8>>,
+    contexts: &[FileContextRequest],
+) {
+    for context in contexts {
+        ensure_context_file(payload, old_snapshot, new_snapshot, context);
+
+        let (Some(side), Some(start_line)) = (&context.side, context.start_line) else {
+            continue;
+        };
+        let end_line = context.end_line.unwrap_or(start_line).max(start_line);
+        let Some(diff) = payload.file_diffs_by_path.get_mut(&context.path) else {
+            continue;
+        };
+        if diff_covers_range(diff, side, start_line, end_line) {
+            continue;
+        }
+
+        let line_count = match side {
+            FileSide::Old => old_snapshot
+                .get(context.old_path.as_ref().unwrap_or(&context.path))
+                .and_then(|bytes| bytes_to_lines(bytes))
+                .map_or(0, |lines| lines.len() as u32),
+            FileSide::New => new_snapshot
+                .get(&context.path)
+                .and_then(|bytes| bytes_to_lines(bytes))
+                .map_or(0, |lines| lines.len() as u32),
+        };
+        let window = context_window(start_line, end_line, line_count);
+        diff.hunks.push(context_hunk(side.clone(), window));
+    }
+
+    payload
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+}
+
+fn ensure_context_file(
+    payload: &mut ReviewDiffPayload,
+    old_snapshot: &BTreeMap<String, Vec<u8>>,
+    new_snapshot: &BTreeMap<String, Vec<u8>>,
+    context: &FileContextRequest,
+) {
+    if payload.file_diffs_by_path.contains_key(&context.path) {
+        return;
+    }
+
+    let old_bytes = context
+        .old_path
+        .as_ref()
+        .and_then(|path| old_snapshot.get(path))
+        .or_else(|| old_snapshot.get(&context.path));
+    let new_bytes = new_snapshot.get(&context.path);
+    let content = FileContent {
+        old: old_bytes.and_then(|bytes| bytes_to_lines(bytes)),
+        new: new_bytes.and_then(|bytes| bytes_to_lines(bytes)),
+    };
+    let status = match (old_bytes, new_bytes) {
+        (Some(_), None) => FileStatus::Deleted,
+        (None, Some(_)) => FileStatus::Added,
+        _ => FileStatus::Unchanged,
+    };
+
+    payload
+        .file_contents_by_path
+        .insert(context.path.clone(), content);
+    payload.file_diffs_by_path.insert(
+        context.path.clone(),
+        FileDiff {
+            path: context.path.clone(),
+            hunks: Vec::new(),
+        },
+    );
+    payload.files.push(ReviewFile {
+        path: context.path.clone(),
+        old_path: context.old_path.clone(),
+        status,
+        is_changed: false,
+        comment_count: 0,
+        added_lines: 0,
+        removed_lines: 0,
+    });
+}
+
+fn diff_covers_range(diff: &FileDiff, side: &FileSide, start_line: u32, end_line: u32) -> bool {
+    (start_line..=end_line).all(|line| diff_covers_line(diff, side, line))
+}
+
+fn diff_covers_line(diff: &FileDiff, side: &FileSide, line: u32) -> bool {
+    diff.hunks.iter().any(|hunk| {
+        hunk.sections.iter().any(|section| match (side, section) {
+            (FileSide::New, DiffSection::Context { context }) => range_contains(context.new, line),
+            (FileSide::New, DiffSection::Added { added }) => range_contains(added.new, line),
+            (FileSide::Old, DiffSection::Context { context }) => range_contains(context.old, line),
+            (FileSide::Old, DiffSection::Removed { removed }) => range_contains(removed.old, line),
+            _ => false,
+        })
+    })
+}
+
+fn range_contains(range: LineRange, line: u32) -> bool {
+    line >= range.start && line <= range.end
+}
+
+fn context_window(start_line: u32, end_line: u32, line_count: u32) -> LineRange {
+    let start_line = start_line.max(1);
+    let end_line = end_line.max(start_line);
+    let window_start = start_line.saturating_sub(DIFF_CONTEXT_LINES).max(1);
+    let window_end = end_line.saturating_add(DIFF_CONTEXT_LINES).max(end_line);
+    let window_end = if line_count == 0 {
+        window_end
+    } else {
+        window_end.min(line_count.max(end_line))
+    };
+    LineRange {
+        start: window_start,
+        end: window_end,
+    }
+}
+
+fn context_hunk(side: FileSide, window: LineRange) -> DiffHunk {
+    match side {
+        FileSide::New => DiffHunk {
+            old: Some(window),
+            new: Some(window),
+            sections: vec![DiffSection::Context {
+                context: PairedRange {
+                    old: window,
+                    new: window,
+                },
+            }],
+        },
+        FileSide::Old => DiffHunk {
+            old: Some(window),
+            new: None,
+            sections: vec![DiffSection::Removed {
+                removed: OldRange { old: window },
+            }],
+        },
+    }
 }
 
 fn coalesce_exact_renames(entries: Vec<DiffEntry>) -> Vec<DiffEntry> {
@@ -835,9 +1014,6 @@ fn range_len(range: LineRange) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
 
     #[test]
@@ -851,29 +1027,57 @@ mod tests {
         assert_eq!(added_lines(&file), 2);
     }
 
-    #[tokio::test]
-    async fn loads_empty_repo_worktree_diff() {
-        let root = test_root("empty_repo_worktree");
-        fs::create_dir_all(root.join("src")).unwrap();
-        gix::init(&root).unwrap();
-        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    #[test]
+    fn diff_entries_reports_added_file() {
+        let old_snapshot = BTreeMap::new();
+        let new_snapshot =
+            BTreeMap::from([("src/main.rs".to_string(), b"fn main() {}\n".to_vec())]);
 
-        let diff = load_review_diff(&root, &ReviewTarget::WorkingTree)
-            .await
-            .unwrap();
+        let entries = diff_entries(&old_snapshot, &new_snapshot).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "src/main.rs");
+        assert_eq!(entries[0].status, FileStatus::Added);
+    }
+
+    #[test]
+    fn applies_unchanged_file_context_for_comment() {
+        let old_snapshot =
+            BTreeMap::from([("src/main.rs".to_string(), b"one\ntwo\nthree\n".to_vec())]);
+        let new_snapshot = old_snapshot.clone();
+        let mut diff = ReviewDiffPayload {
+            files: Vec::new(),
+            file_contents_by_path: BTreeMap::new(),
+            file_diffs_by_path: BTreeMap::new(),
+        };
+
+        apply_file_contexts(
+            &mut diff,
+            &old_snapshot,
+            &new_snapshot,
+            &[FileContextRequest {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                side: Some(FileSide::New),
+                start_line: Some(2),
+                end_line: Some(2),
+            }],
+        );
 
         assert_eq!(diff.files.len(), 1);
         assert_eq!(diff.files[0].path, "src/main.rs");
-        assert_eq!(diff.files[0].status, FileStatus::Added);
+        assert_eq!(diff.files[0].status, FileStatus::Unchanged);
+        assert!(!diff.files[0].is_changed);
+        assert_eq!(diff.file_diffs_by_path["src/main.rs"].hunks.len(), 1);
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    fn test_root(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("peers_diff_{name}_{nonce}"))
+        let hunk = &diff.file_diffs_by_path["src/main.rs"].hunks[0];
+        assert_eq!(hunk.new, Some(LineRange { start: 1, end: 3 }));
+        assert_eq!(
+            diff.file_contents_by_path["src/main.rs"]
+                .new
+                .as_ref()
+                .unwrap()[1],
+            "two"
+        );
     }
 }
