@@ -1,8 +1,7 @@
 use std::net::SocketAddr;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use chrono::DateTime;
-use chrono_humanize::HumanTime;
 use tokio::net::{TcpListener, TcpStream};
 use tower_lsp_server::jsonrpc::{Error as LspError, Result as LspResult};
 use tower_lsp_server::ls_types::*;
@@ -1169,10 +1168,34 @@ fn truncate_display_line(line: String) -> String {
 }
 
 fn comment_timestamp(input: &str) -> String {
-    let Ok(created_at) = DateTime::parse_from_rfc3339(input) else {
+    let Ok(created_at) = humantime::parse_rfc3339(input) else {
         return input.to_string();
     };
-    HumanTime::from(created_at).to_string()
+    relative_timestamp(created_at)
+}
+
+fn relative_timestamp(timestamp: SystemTime) -> String {
+    match SystemTime::now().duration_since(timestamp) {
+        Ok(elapsed) if elapsed < Duration::from_secs(1) => "now".to_string(),
+        Ok(elapsed) => format!(
+            "{} ago",
+            humantime::format_duration(coarse_duration(elapsed))
+        ),
+        Err(_) => match timestamp.duration_since(SystemTime::now()) {
+            Ok(until) if until < Duration::from_secs(1) => "now".to_string(),
+            Ok(until) => format!("in {}", humantime::format_duration(coarse_duration(until))),
+            Err(_) => "now".to_string(),
+        },
+    }
+}
+
+fn coarse_duration(duration: Duration) -> Duration {
+    const MINUTE: u64 = 60;
+    let seconds = duration.as_secs();
+    if seconds < MINUTE {
+        return Duration::from_secs(seconds);
+    }
+    Duration::from_secs((seconds / MINUTE) * MINUTE)
 }
 
 fn code_actions_for_range(rendered: &RenderedReview, range: Range) -> CodeActionResponse {

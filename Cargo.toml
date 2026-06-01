@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
-chrono-humanize = "0.2.3"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 facet = "0.46.5"
 facet-json = "0.46.1"
@@ -19,3 +18,4 @@ thiserror = "2.0"
 tokio = { version = "1.52.3", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tower-lsp-server = "0.23.0"
 vox = { version = "0.8.2", features = ["transport-websocket"] }
+humantime = "2.3.0"

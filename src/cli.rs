@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
@@ -29,6 +30,7 @@ const HUMAN_AUTHOR_KIND_LABEL: &str = "human";
 const AGENT_AUTHOR_KIND_LABEL: &str = "agent";
 const RESOLVED_THREAD_STATUS: &str = "resolved";
 const UNRESOLVED_THREAD_STATUS: &str = "unresolved";
+const DEFAULT_CLEAN_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const PEERS_SKILL_TEXT: &str = r#"Peers is a local Git review tool. It stores repo-scoped comments in `.peers/`
 inside the reviewed repository so humans and agents can share the same review state.
 
@@ -487,8 +489,9 @@ async fn handle_clean(
     author: crate::comments::Author,
 ) -> Result<()> {
     validate_clean_args(&args)?;
+    let clean_cutoff = clean_cutoff(args.older_than.as_deref())?;
     let state = load_peers_state(repo_root).await?;
-    let candidates = clean_candidates(&state);
+    let candidates = clean_candidates(&state, clean_cutoff)?;
 
     if candidates.is_empty() {
         println!("No clean candidates.");
@@ -538,11 +541,6 @@ fn validate_clean_args(args: &CleanArgs) -> Result<()> {
     match args.status {
         CleanStatus::Complete => {}
     }
-    if let Some(older_than) = &args.older_than {
-        return Err(anyhow!(
-            "`peers clean --older-than {older_than}` is specified but age-based cleanup is not implemented yet"
-        ));
-    }
     if args.detached {
         return Err(anyhow!(
             "`peers clean --detached` is specified but detached cleanup candidates are not implemented yet"
@@ -556,13 +554,42 @@ fn validate_clean_args(args: &CleanArgs) -> Result<()> {
     Ok(())
 }
 
-fn clean_candidates(state: &PeersState) -> Vec<&CommentThread> {
+fn clean_cutoff(older_than: Option<&str>) -> Result<SystemTime> {
+    let age = older_than
+        .map(parse_clean_age)
+        .transpose()?
+        .unwrap_or(DEFAULT_CLEAN_GRACE);
+    SystemTime::now()
+        .checked_sub(age)
+        .ok_or_else(|| anyhow!("clean age is too large"))
+}
+
+fn parse_clean_age(input: &str) -> Result<Duration> {
+    let age =
+        humantime::parse_duration(input).with_context(|| format!("invalid clean age `{input}`"))?;
+    if age.is_zero() {
+        return Err(anyhow!("clean age must be greater than zero"));
+    }
+    Ok(age)
+}
+
+fn clean_candidates(state: &PeersState, older_than: SystemTime) -> Result<Vec<&CommentThread>> {
     state
         .threads
         .values()
         .filter(|thread| thread.resolved)
         .filter(|thread| thread.archived_at.is_none() && thread.pruned_at.is_none())
+        .filter_map(|thread| match thread_updated_at(thread) {
+            Ok(updated_at) if updated_at < older_than => Some(Ok(thread)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect()
+}
+
+fn thread_updated_at(thread: &CommentThread) -> Result<SystemTime> {
+    Ok(humantime::parse_rfc3339(thread.updated_at.as_str())
+        .with_context(|| format!("invalid thread updated timestamp `{}`", thread.updated_at))?)
 }
 
 async fn confirm_clean(candidate_count: usize) -> Result<bool> {
