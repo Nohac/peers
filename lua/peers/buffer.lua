@@ -940,10 +940,6 @@ end
 
 local apply_render
 
-local function review_buffer_is_active(buf)
-  return vim.api.nvim_get_current_buf() == buf
-end
-
 local function review_buffer_is_visible(buf)
   return #vim.fn.win_findbuf(buf) > 0
 end
@@ -1002,7 +998,7 @@ local function schedule_pending_refresh_check(buf, state)
       return
     end
     local paused = review_refresh_is_paused(current)
-    if review_buffer_is_active(buf) and not paused then
+    if not paused then
       render_review_now(buf, current)
     elseif paused then
       schedule_pending_refresh_check(buf, current)
@@ -1015,7 +1011,7 @@ local function request_review_refresh(buf, state)
     return
   end
 
-  if review_buffer_is_active(buf) and not review_refresh_is_paused(state) then
+  if review_buffer_is_visible(buf) and not review_refresh_is_paused(state) then
     render_review_now(buf, state)
     return
   end
@@ -1074,13 +1070,38 @@ local function setup_mirror_autocmds(buf)
       save_current_view(buf)
     end,
   })
-  vim.api.nvim_create_autocmd("BufEnter", {
+  vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
     group = state.augroup,
     buffer = buf,
     callback = function()
       sidebar.mark_review_active(buf, RENDER_STATES)
       restore_current_view(buf)
       flush_pending_refresh(buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd("QuitPre", {
+    group = state.augroup,
+    buffer = buf,
+    callback = function()
+      local current = RENDER_STATES[buf]
+      if current then
+        sidebar.close(current)
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWinLeave", {
+    group = state.augroup,
+    buffer = buf,
+    callback = function()
+      vim.schedule(function()
+        if #vim.fn.win_findbuf(buf) > 0 then
+          return
+        end
+        local current = RENDER_STATES[buf]
+        if current then
+          sidebar.detach(current)
+        end
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("BufWipeout", {
@@ -1119,6 +1140,8 @@ local function setup_source_change_autocmds()
 end
 
 local function close_composer(state)
+  local review_win = state and state.composer_review_win or nil
+  pcall(vim.cmd, "stopinsert")
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.api.nvim_win_close(state.composer_win, true)
   end
@@ -1127,6 +1150,9 @@ local function close_composer(state)
   end
   state.composer_win = nil
   state.composer_buf = nil
+  state.composer_review_win = nil
+  state.composer_review_view = nil
+  return review_win
 end
 
 local function composer_width(review_win)
@@ -1163,8 +1189,20 @@ end
 
 local function apply_mutation_render(state, review_buf, render)
   state.pending_refresh = false
-  close_composer(state)
+  local review_view = state.composer_review_view
+  local review_win = close_composer(state)
+  if
+    review_win
+    and vim.api.nvim_win_is_valid(review_win)
+    and vim.api.nvim_win_get_buf(review_win) == review_buf
+  then
+    vim.api.nvim_set_current_win(review_win)
+  end
   apply_render(state.root, review_buf, render, state.client_id)
+  if review_win and vim.api.nvim_win_is_valid(review_win) and review_view then
+    restore_win_view(review_win, review_view)
+    save_current_view(review_buf)
+  end
 end
 
 local function confirm_invalidating(input)
@@ -1216,6 +1254,8 @@ local function open_composer(review_buf, opts)
   local draft_win = vim.api.nvim_open_win(draft_buf, true, composer_config(review_win, opts.title))
   state.composer_buf = draft_buf
   state.composer_win = draft_win
+  state.composer_review_win = review_win
+  state.composer_review_view = save_win_view(review_win)
 
   vim.keymap.set({ "n", "i" }, COMPOSER_SUBMIT_MAP, function()
     submit_composer(review_buf, draft_buf, opts.on_submit)
@@ -1272,7 +1312,7 @@ function apply_render(root, buf, render, client_id)
     RENDER_STATES[buf].sidebar_requested = true
   end
   restore_buffer_cursor_anchors(buf, cursor_anchors, render.rows or {})
-  sidebar.update(buf, RENDER_STATES, false)
+  sidebar.update_preserving_focus(buf, RENDER_STATES)
   setup_mirror_autocmds(buf)
   mirror_visible_treesitter(buf)
 end

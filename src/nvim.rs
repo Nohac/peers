@@ -492,6 +492,9 @@ impl RenderedReview {
 struct RenderedRow {
     kind: &'static str,
     path: Option<String>,
+    file_status: Option<String>,
+    added_lines: Option<u32>,
+    removed_lines: Option<u32>,
     side: Option<&'static str>,
     source_line: Option<u32>,
     code_start_col: Option<u32>,
@@ -509,6 +512,9 @@ impl RenderedRow {
         Self {
             kind,
             path: None,
+            file_status: None,
+            added_lines: None,
+            removed_lines: None,
             side: None,
             source_line: None,
             code_start_col: None,
@@ -526,6 +532,29 @@ impl RenderedRow {
         Self {
             kind,
             path: Some(path.to_string()),
+            file_status: None,
+            added_lines: None,
+            removed_lines: None,
+            side: None,
+            source_line: None,
+            code_start_col: None,
+            thread_id: None,
+            comment_id: None,
+            comment_body: None,
+            can_edit: None,
+            invalidates_later_activity: None,
+            resolved: None,
+            placement_state: Some("file"),
+        }
+    }
+
+    fn file_header(file: &crate::diff::ReviewFile) -> Self {
+        Self {
+            kind: ROW_KIND_FILE_HEADER,
+            path: Some(file.path.clone()),
+            file_status: Some(format!("{:?}", file.status)),
+            added_lines: Some(file.added_lines),
+            removed_lines: Some(file.removed_lines),
             side: None,
             source_line: None,
             code_start_col: None,
@@ -543,6 +572,9 @@ impl RenderedRow {
         Self {
             kind,
             path: Some(path.to_string()),
+            file_status: None,
+            added_lines: None,
+            removed_lines: None,
             side: Some(side),
             source_line: Some(source_line),
             code_start_col: Some(LINE_PREFIX_WIDTH),
@@ -564,6 +596,9 @@ impl RenderedRow {
         Self {
             kind: ROW_KIND_COMMENT,
             path: thread.path.clone(),
+            file_status: None,
+            added_lines: None,
+            removed_lines: None,
             side: thread.anchor.side.as_deref().and_then(rendered_side_name),
             source_line: thread.anchor.end_line,
             code_start_col: None,
@@ -582,6 +617,15 @@ impl RenderedRow {
         object.insert("kind".to_string(), LSPAny::String(self.kind.to_string()));
         if let Some(path) = self.path {
             object.insert("path".to_string(), LSPAny::String(path));
+        }
+        if let Some(file_status) = self.file_status {
+            object.insert("file_status".to_string(), LSPAny::String(file_status));
+        }
+        if let Some(added_lines) = self.added_lines {
+            object.insert("added_lines".to_string(), lsp_number(added_lines));
+        }
+        if let Some(removed_lines) = self.removed_lines {
+            object.insert("removed_lines".to_string(), lsp_number(removed_lines));
         }
         if let Some(side) = self.side {
             object.insert("side".to_string(), LSPAny::String(side.to_string()));
@@ -675,7 +719,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
                 "{FILE_HEADER_PREFIX}{}  {:?}  +{} -{}",
                 file.path, file.status, file.added_lines, file.removed_lines
             ),
-            RenderedRow::file_meta(ROW_KIND_FILE_HEADER, &file.path),
+            RenderedRow::file_header(file),
         );
         rendered.push_highlight(
             file_line,
@@ -700,6 +744,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         let file_threads: Vec<_> = review
             .threads
             .iter()
+            .filter(|thread| !thread.resolved)
             .filter(|thread| thread.path.as_deref() == Some(file.path.as_str()))
             .collect();
 
@@ -1704,6 +1749,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::diff::{FileDiff, FileStatus, ReviewFile};
+    use crate::review_provider::ReviewThreadAnchor;
 
     use super::*;
 
@@ -1742,5 +1788,67 @@ mod tests {
                 .any(|line| line.contains("src/main.rs"))
         );
         assert!(!rendered.lines.iter().any(|line| line.contains(EMPTY_TITLE)));
+    }
+
+    #[test]
+    fn hides_resolved_threads_from_default_render() {
+        let rendered = render_review_payload(ReviewProjection {
+            review_id: "repo".to_string(),
+            target_label: "working tree".to_string(),
+            is_branch_review: false,
+            files: vec![ReviewFile {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                is_changed: true,
+                comment_count: 0,
+                added_lines: 1,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                crate::diff::FileContent {
+                    old: None,
+                    new: Some(vec!["fn main() {}".to_string()]),
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                FileDiff {
+                    path: "src/main.rs".to_string(),
+                    hunks: vec![crate::diff::DiffHunk {
+                        old: None,
+                        new: Some(crate::diff::LineRange { start: 1, end: 1 }),
+                        sections: vec![crate::diff::DiffSection::Added {
+                            added: crate::diff::NewRange {
+                                new: crate::diff::LineRange { start: 1, end: 1 },
+                            },
+                        }],
+                    }],
+                },
+            )]),
+            threads: vec![ReviewThread {
+                id: "thread-1".to_string(),
+                scope: THREAD_SCOPE_LINE.to_string(),
+                path: Some("src/main.rs".to_string()),
+                line_label: "src/main.rs:1".to_string(),
+                anchor: ReviewThreadAnchor {
+                    side: Some(SIDE_NEW.to_string()),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                },
+                resolved: true,
+                comments: Vec::new(),
+            }],
+            review_threads: Vec::new(),
+            commits: Vec::new(),
+        });
+
+        assert!(
+            !rendered
+                .lines
+                .iter()
+                .any(|line| line.contains(COMMENT_STATUS_RESOLVED))
+        );
     }
 }

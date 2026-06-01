@@ -651,8 +651,10 @@ Neovim sidebar:
 
 - The Neovim integration should provide an optional narrow right sidebar for review navigation.
 - The sidebar must use a dedicated read-only `nofile` buffer in a fixed window with `winfixbuf` and `winfixwidth` enabled, so moving into the sidebar cannot replace the sidebar buffer. Buffer-switching commands inside the sidebar are intentionally blocked by Neovim; use `d` or `q` before normal buffer/window operations.
-- Sidebar visibility is driven by the active window: while the sidebar is focused, live updates and resizes must keep it open and preserve focus unless the user presses `q` or `d`; while the main review/diff window is focused, hide the sidebar when that window is 120 columns or narrower, and keep or restore it above 120 columns unless the user explicitly closed it with `q`.
+- Sidebar visibility is driven by the active window: while the sidebar is focused, live updates and resizes must keep it open and preserve focus unless the user presses `q` or `d`; while the main review/diff window is focused, hide the sidebar when that window is 90 columns or narrower, and keep or restore it above 90 columns unless the user explicitly closed it with `q`.
 - The sidebar has at least two modes: changed/visible files and comment/thread overview. It should preserve its mode and cursor independently from the main review cursor across refreshes.
+- File sidebar content should group files by parent path, render the directory row before file rows, use box-drawing border/tree glyphs rather than ASCII separators, and include compact colored Git status letters (`A`, `M`, `D`, `R`, `U`, `B`) plus added, removed, and net-delta line counts.
+- Comment sidebar content should use the same box-drawing visual language as inline comments, including compact open/resolved status glyphs.
 - From either the review buffer or the sidebar, normal-mode `d`/`D` focuses the main diff/review view, `o`/`O` opens or focuses the files sidebar mode, and `i`/`I` opens or focuses the comments sidebar mode.
 - In the sidebar, `<CR>` jumps the main review window to the selected file/thread/comment row. `q` hides the sidebar.
 - Sidebar buffers are read-only review UI surfaces, so normal-mode insert keys such as `i`, `o`, and related uppercase variants may be remapped there.

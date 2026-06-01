@@ -9,7 +9,8 @@ local TITLE_COMMENTS = "Comments"
 local EMPTY_FILES = "No files"
 local EMPTY_COMMENTS = "No comments"
 local WIDTH = 36
-local MIN_REVIEW_WIDTH = 120
+local CONTENT_WIDTH = WIDTH - 2
+local MIN_REVIEW_WIDTH = 90
 local ROW_KIND_FILE_HEADER = "file_header"
 local ROW_KIND_COMMENT = "comment"
 local KEY_FOCUS_REVIEW = "d"
@@ -17,11 +18,70 @@ local KEY_FILES = "o"
 local KEY_COMMENTS = "i"
 local KEY_HIDE = "q"
 local KEY_OPEN = "<CR>"
+local NAMESPACE = vim.api.nvim_create_namespace("peers-sidebar")
+local TOP_LEFT = "╭"
+local BOTTOM_LEFT = "╰"
+local BRANCH = "├"
+local VERTICAL = "│"
+local HORIZONTAL = "─"
+local OPEN_STATUS = "●"
+local RESOLVED_STATUS = "✓"
+local STATUS_SIGNS = {
+  Added = "A",
+  Deleted = "D",
+  Modified = "M",
+  Renamed = "R",
+  Unchanged = "U",
+  Binary = "B",
+}
+local STATUS_HIGHLIGHTS = {
+  Added = "PeersSidebarStatusAdded",
+  Deleted = "PeersSidebarStatusDeleted",
+  Modified = "PeersSidebarStatusModified",
+  Renamed = "PeersSidebarStatusRenamed",
+  Unchanged = "PeersSidebarStatusUnchanged",
+  Binary = "PeersSidebarStatusBinary",
+}
+local HIGHLIGHT_DELTA_ADDED = "PeersSidebarDeltaAdded"
+local HIGHLIGHT_DELTA_REMOVED = "PeersSidebarDeltaRemoved"
+local HIGHLIGHT_DELTA_POSITIVE = "PeersSidebarDeltaPositive"
+local HIGHLIGHT_DELTA_NEGATIVE = "PeersSidebarDeltaNegative"
+local HIGHLIGHT_DELTA_NEUTRAL = "PeersSidebarDeltaNeutral"
 
 M.MODE_FILES = MODE_FILES
 M.MODE_COMMENTS = MODE_COMMENTS
 
 local sidebar_review_by_buf = {}
+
+local function highlight_fg(groups, fallback)
+  for _, group in ipairs(groups) do
+    local ok, highlight = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+    if ok and highlight and highlight.fg then
+      return highlight.fg
+    end
+  end
+  return fallback
+end
+
+local function define_highlights()
+  local add_fg = highlight_fg({ "GitSignsAdd", "Added", "DiagnosticOk" }, 0x3fb950)
+  local delete_fg = highlight_fg({ "GitSignsDelete", "Removed", "DiagnosticError" }, 0xf85149)
+  local change_fg = highlight_fg({ "GitSignsChange", "Changed", "DiagnosticWarn" }, 0xd29922)
+  local info_fg = highlight_fg({ "DiagnosticInfo", "Identifier" }, 0x58a6ff)
+  local muted_fg = highlight_fg({ "Comment", "LineNr" }, 0x8b949e)
+  local warning_fg = highlight_fg({ "WarningMsg", "DiagnosticWarn" }, 0xd29922)
+  pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusAdded", { default = true, fg = add_fg, bold = true })
+  pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusDeleted", { default = true, fg = delete_fg, bold = true })
+  pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusModified", { default = true, fg = change_fg, bold = true })
+  pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusRenamed", { default = true, fg = info_fg, bold = true })
+  pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusUnchanged", { default = true, fg = muted_fg })
+  pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusBinary", { default = true, fg = warning_fg, bold = true })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_DELTA_ADDED, { default = true, fg = add_fg })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_DELTA_REMOVED, { default = true, fg = delete_fg })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_DELTA_POSITIVE, { default = true, fg = add_fg })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_DELTA_NEGATIVE, { default = true, fg = delete_fg })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_DELTA_NEUTRAL, { default = true, fg = muted_fg })
+end
 
 local function existing_buffer(name)
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
@@ -99,7 +159,13 @@ end
 local function close_sidebar_windows(state, keep)
   for _, win in ipairs(sidebar_windows(state)) do
     if win ~= keep and vim.api.nvim_win_is_valid(win) then
-      pcall(vim.api.nvim_win_close, win, true)
+      if #vim.api.nvim_list_wins() <= 1 then
+        local replacement = vim.api.nvim_create_buf(true, false)
+        vim.wo[win].winfixbuf = false
+        pcall(vim.api.nvim_win_set_buf, win, replacement)
+      else
+        pcall(vim.api.nvim_win_close, win, true)
+      end
     end
   end
 end
@@ -121,6 +187,7 @@ local function name_for_review(review_buf)
 end
 
 local function ensure_buffer(review_buf, state)
+  define_highlights()
   if state.sidebar_buf and vim.api.nvim_buf_is_valid(state.sidebar_buf) then
     return state.sidebar_buf
   end
@@ -144,11 +211,8 @@ local function ensure_buffer(review_buf, state)
       group = state.sidebar_augroup,
       buffer = buf,
       callback = function()
-        state.sidebar_has_focus = false
-        state.sidebar_recent_focus = true
         state.sidebar_window_closing = true
         vim.schedule(function()
-          state.sidebar_recent_focus = false
           state.sidebar_window_closing = false
         end)
       end,
@@ -259,24 +323,118 @@ local function ensure_window(review_buf, state, focus)
   close_sidebar_windows(state, sidebar_win)
   if not focus and current and vim.api.nvim_win_is_valid(current) then
     vim.api.nvim_set_current_win(current)
+    state.sidebar_has_focus = false
+    state.sidebar_window_closing = false
   end
   return sidebar_win
 end
 
+local function display_width(text)
+  return vim.fn.strdisplaywidth(text or "")
+end
+
 local function shorten(text, width)
   text = text or ""
-  if #text <= width then
+  if display_width(text) <= width then
     return text
   end
   if width <= 3 then
-    return text:sub(-width)
+    return vim.fn.strcharpart(text, 0, width)
   end
-  return "..." .. text:sub(-(width - 3))
+
+  local marker = "…"
+  local remaining = width - display_width(marker)
+  local result = ""
+  for index = vim.fn.strchars(text) - 1, 0, -1 do
+    local char = vim.fn.strcharpart(text, index, 1)
+    if display_width(char .. result) > remaining then
+      break
+    end
+    result = char .. result
+  end
+  return marker .. result
+end
+
+local function pad_right(text, width)
+  local padding = math.max(0, width - display_width(text))
+  return text .. string.rep(" ", padding)
+end
+
+local function frame_line(left, label)
+  label = label or ""
+  local prefix = left .. HORIZONTAL
+  if label ~= "" then
+    prefix = prefix .. " " .. label .. " "
+  end
+  return pad_right(shorten(prefix, WIDTH), WIDTH)
 end
 
 local function push_line(lines, rows, text, target)
   table.insert(lines, text)
   table.insert(rows, target or {})
+end
+
+local function dirname(path)
+  local dir = path:match("^(.*)/[^/]+$")
+  if not dir or dir == "" then
+    return "./"
+  end
+  return dir .. "/"
+end
+
+local function basename(path)
+  return path:match("[^/]+$") or path
+end
+
+local function file_status_sign(status)
+  return STATUS_SIGNS[status or ""] or "●"
+end
+
+local function file_status_highlight(status)
+  return STATUS_HIGHLIGHTS[status or ""]
+end
+
+local function push_delta_part(parts, text, highlight)
+  table.insert(parts, {
+    highlight = highlight,
+    text = text,
+  })
+end
+
+local function file_delta_parts(file)
+  local parts = {}
+  if (file.added_lines or 0) > 0 then
+    push_delta_part(parts, "+" .. file.added_lines, HIGHLIGHT_DELTA_ADDED)
+  end
+  if (file.removed_lines or 0) > 0 then
+    push_delta_part(parts, "−" .. file.removed_lines, HIGHLIGHT_DELTA_REMOVED)
+  end
+  if (file.added_lines or 0) > 0 or (file.removed_lines or 0) > 0 then
+    local delta = (file.added_lines or 0) - (file.removed_lines or 0)
+    local sign = delta > 0 and "+" or ""
+    local highlight = HIGHLIGHT_DELTA_NEUTRAL
+    if delta > 0 then
+      highlight = HIGHLIGHT_DELTA_POSITIVE
+    elseif delta < 0 then
+      highlight = HIGHLIGHT_DELTA_NEGATIVE
+    end
+    push_delta_part(parts, "Δ" .. sign .. delta, highlight)
+  end
+  if file.count and file.count > 0 then
+    push_delta_part(parts, "●" .. file.count, nil)
+  end
+  return parts
+end
+
+local function format_delta_parts(parts)
+  if #parts == 0 then
+    return ""
+  end
+  local labels = {}
+  for _, part in ipairs(parts) do
+    table.insert(labels, part.text)
+  end
+  return " " .. table.concat(labels, " ")
 end
 
 local function comment_counts(rows)
@@ -294,25 +452,73 @@ end
 local function build_files(state)
   local lines = {}
   local rows = {}
+  local groups = {}
+  local group_order = {}
   local seen = {}
   local counts = comment_counts(state.rows)
-  push_line(lines, rows, TITLE_FILES, { title = true })
-  push_line(lines, rows, string.rep("-", WIDTH - 1), { title = true })
+  push_line(lines, rows, frame_line(TOP_LEFT, TITLE_FILES), { title = true })
 
   for index, row in ipairs(state.rows or {}) do
     if row.kind == ROW_KIND_FILE_HEADER and row.path and not seen[row.path] then
       seen[row.path] = true
-      local count = counts[row.path] or 0
-      local prefix = count > 0 and string.format("%2d ", count) or "   "
-      push_line(lines, rows, prefix .. shorten(row.path, WIDTH - #prefix - 1), {
-        target_line = index,
+      local dir = dirname(row.path)
+      if not groups[dir] then
+        groups[dir] = {}
+        table.insert(group_order, dir)
+      end
+      table.insert(groups[dir], {
+        added_lines = row.added_lines or 0,
+        count = counts[row.path] or 0,
+        file_status = row.file_status,
+        name = basename(row.path),
         path = row.path,
+        removed_lines = row.removed_lines or 0,
+        target_line = index,
       })
     end
   end
 
-  if #lines == 2 then
-    push_line(lines, rows, EMPTY_FILES, {})
+  for group_index, dir in ipairs(group_order) do
+    local files = groups[dir]
+    local is_last_group = group_index == #group_order
+    local group_prefix = is_last_group and BOTTOM_LEFT or BRANCH
+    local file_prefix = is_last_group and "   " or (VERTICAL .. "  ")
+    push_line(lines, rows, group_prefix .. HORIZONTAL .. " " .. shorten(dir, CONTENT_WIDTH), {
+      target_line = files[1] and files[1].target_line,
+      path = files[1] and files[1].path,
+    })
+    for _, file in ipairs(files) do
+      local prefix = file_prefix .. file_status_sign(file.file_status) .. " "
+      local delta_parts = file_delta_parts(file)
+      local suffix = format_delta_parts(delta_parts)
+      local width = WIDTH - display_width(prefix) - display_width(suffix)
+      local name = shorten(file.name, width)
+      local line = prefix .. name .. suffix
+      local delta_col = #prefix + #name
+      local delta_highlights = {}
+      if suffix ~= "" then
+        delta_col = delta_col + 1
+        for _, part in ipairs(delta_parts) do
+          table.insert(delta_highlights, {
+            col = delta_col,
+            highlight = part.highlight,
+            width = #part.text,
+          })
+          delta_col = delta_col + #part.text + 1
+        end
+      end
+      push_line(lines, rows, line, {
+        delta_highlights = delta_highlights,
+        target_line = file.target_line,
+        path = file.path,
+        status_col = #file_prefix,
+        status_highlight = file_status_highlight(file.file_status),
+      })
+    end
+  end
+
+  if #group_order == 0 then
+    push_line(lines, rows, VERTICAL .. " " .. EMPTY_FILES, {})
   end
   return lines, rows
 end
@@ -348,23 +554,25 @@ local function build_comments(state)
 
   local lines = {}
   local rows = {}
-  push_line(lines, rows, TITLE_COMMENTS, { title = true })
-  push_line(lines, rows, string.rep("-", WIDTH - 1), { title = true })
+  push_line(lines, rows, frame_line(TOP_LEFT, TITLE_COMMENTS), { title = true })
 
-  for _, thread in ipairs(threads) do
-    local status = thread.resolved and "x " or "* "
-    push_line(lines, rows, status .. shorten(thread.label, WIDTH - 3), {
+  for index, thread in ipairs(threads) do
+    local is_last_thread = index == #threads
+    local branch = is_last_thread and BOTTOM_LEFT or BRANCH
+    local body_prefix = is_last_thread and "   " or (VERTICAL .. "  ")
+    local status = thread.resolved and RESOLVED_STATUS or OPEN_STATUS
+    push_line(lines, rows, branch .. HORIZONTAL .. " " .. status .. " " .. shorten(thread.label, WIDTH - 6), {
       target_line = thread.target_line,
     })
     if thread.body then
-      push_line(lines, rows, "  " .. shorten(thread.body, WIDTH - 3), {
+      push_line(lines, rows, body_prefix .. shorten(thread.body, WIDTH - display_width(body_prefix)), {
         target_line = thread.target_line,
       })
     end
   end
 
-  if #lines == 2 then
-    push_line(lines, rows, EMPTY_COMMENTS, {})
+  if #threads == 0 then
+    push_line(lines, rows, VERTICAL .. " " .. EMPTY_COMMENTS, {})
   end
   return lines, rows
 end
@@ -405,6 +613,23 @@ local function render(review_buf, state)
   end
   set_lines(sidebar_buf, lines)
   state.sidebar_rows = rows
+  vim.api.nvim_buf_clear_namespace(sidebar_buf, NAMESPACE, 0, -1)
+  for index, row in ipairs(rows) do
+    if row.status_col and row.status_highlight then
+      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, row.status_col, {
+        end_col = row.status_col + 1,
+        hl_group = row.status_highlight,
+      })
+    end
+    for _, delta in ipairs(row.delta_highlights or {}) do
+      if delta.highlight then
+        vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, delta.col, {
+          end_col = delta.col + delta.width,
+          hl_group = delta.highlight,
+        })
+      end
+    end
+  end
   restore_cursor(state)
 end
 
@@ -422,12 +647,21 @@ end
 
 function M.detach(state)
   M.close(state)
-  if state and state.sidebar_buf then
+  local sidebar_buf = state and state.sidebar_buf or nil
+  if sidebar_buf then
     sidebar_review_by_buf[state.sidebar_buf] = nil
   end
   if state and state.sidebar_augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.sidebar_augroup)
     state.sidebar_augroup = nil
+  end
+  if sidebar_buf and vim.api.nvim_buf_is_valid(sidebar_buf) then
+    pcall(vim.api.nvim_buf_delete, sidebar_buf, { force = true })
+  end
+  if state then
+    state.sidebar_buf = nil
+    state.sidebar_win = nil
+    state.sidebar_rows = nil
   end
 end
 
@@ -445,7 +679,7 @@ function M.update(review_buf, states, focus, event)
   local current = vim.api.nvim_get_current_win()
   local state = states[review_buf]
   local window_kind = current_window_kind(review_buf, state)
-  if state and state.sidebar_window_closing and event ~= "WinResized" then
+  if state and state.sidebar_window_closing and event ~= "WinResized" and focus ~= true then
     return
   end
   if not state or not state.sidebar_requested then
@@ -461,13 +695,13 @@ function M.update(review_buf, states, focus, event)
     return
   end
 
-  local preserve_sidebar_focus = event == "WinResized" and (state.sidebar_has_focus == true or state.sidebar_recent_focus == true)
-  if preserve_sidebar_focus then
+  local restore_sidebar_focus = event == "WinResized" and state.sidebar_has_focus
+  if restore_sidebar_focus then
     window_kind = "sidebar"
-  elseif window_kind == "sidebar" then
+  end
+
+  if window_kind == "sidebar" then
     state.sidebar_has_focus = true
-  elseif window_kind == "review" and not state.sidebar_has_focus then
-    state.sidebar_has_focus = false
   end
 
   if not should_show(review_buf, state, focus, window_kind) then
@@ -481,16 +715,23 @@ function M.update(review_buf, states, focus, event)
   end
   set_sidebar_keymaps(state.sidebar_buf, states)
   render(review_buf, state)
-  if (focus or preserve_sidebar_focus) and vim.api.nvim_win_is_valid(win) then
+  if (focus or restore_sidebar_focus) and vim.api.nvim_win_is_valid(win) then
     vim.api.nvim_set_current_win(win)
-    if preserve_sidebar_focus then
-      vim.schedule(function()
-        if vim.api.nvim_win_is_valid(win) then
-          pcall(vim.api.nvim_set_current_win, win)
-        end
-      end)
-    end
   elseif vim.api.nvim_win_is_valid(current) then
+    vim.api.nvim_set_current_win(current)
+  end
+end
+
+function M.update_preserving_focus(review_buf, states, event)
+  local current = vim.api.nvim_get_current_win()
+  local state = states[review_buf]
+  local restore_sidebar_focus = event == "WinResized" and state and state.sidebar_has_focus
+  M.update(review_buf, states, false, event)
+  if restore_sidebar_focus and state and window_valid(state) then
+    vim.api.nvim_set_current_win(state.sidebar_win)
+    return
+  end
+  if current and vim.api.nvim_win_is_valid(current) then
     vim.api.nvim_set_current_win(current)
   end
 end
