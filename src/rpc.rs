@@ -5,9 +5,8 @@ use crate::review_provider::ReviewProvider;
 
 pub use crate::realtime::ReviewUpdate;
 pub use crate::review_provider::{
-    CommentRequest, CreateThreadRequest, EditCommentRequest, MarkFileViewedRequest, ReviewComment,
-    ReviewCommit, ReviewProjection, ReviewThread, ReviewThreadAnchor, SubmitReviewRequest,
-    ThreadBodyRequest, ThreadRequest,
+    CommentRequest, CreateThreadRequest, EditCommentRequest, ReviewComment, ReviewCommit,
+    ReviewProjection, ReviewThread, ReviewThreadAnchor, ThreadBodyRequest, ThreadRequest,
 };
 
 #[derive(Debug, Error)]
@@ -59,16 +58,6 @@ pub trait PeersReview {
         &self,
         token: String,
         request: ThreadRequest,
-    ) -> std::result::Result<ReviewProjection, String>;
-    async fn mark_file_viewed(
-        &self,
-        token: String,
-        request: MarkFileViewedRequest,
-    ) -> std::result::Result<ReviewProjection, String>;
-    async fn submit_review(
-        &self,
-        token: String,
-        request: SubmitReviewRequest,
     ) -> std::result::Result<ReviewProjection, String>;
 }
 
@@ -199,30 +188,6 @@ impl PeersReview for ReviewApi {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .reopen_thread(request)
-            .await
-            .map_err(format_error)
-    }
-
-    async fn mark_file_viewed(
-        &self,
-        token: String,
-        request: MarkFileViewedRequest,
-    ) -> std::result::Result<ReviewProjection, String> {
-        self.check_token(&token).map_err(format_error)?;
-        self.provider
-            .mark_file_viewed(request)
-            .await
-            .map_err(format_error)
-    }
-
-    async fn submit_review(
-        &self,
-        token: String,
-        request: SubmitReviewRequest,
-    ) -> std::result::Result<ReviewProjection, String> {
-        self.check_token(&token).map_err(format_error)?;
-        self.provider
-            .submit_review(request)
             .await
             .map_err(format_error)
     }

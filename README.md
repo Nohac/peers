@@ -7,7 +7,7 @@ This project is in early development. See [spec.md](./spec.md) for the full impl
 ## Goals
 
 - Review unstaged, staged, full working tree, and branch-range diffs.
-- Open a local review UI from the CLI.
+- Open a local Neovim review session from the CLI.
 - Select lines or ranges and create comment threads.
 - Add, edit, delete, reply to, resolve, and reopen comments.
 - Store reviews in an append-friendly local format.
@@ -23,9 +23,6 @@ This project is in early development. See [spec.md](./spec.md) for the full impl
 - `tower-lsp-server` for the planned Neovim `peersdiff` LSP
 - `facet` and `facet-json` for serialization
 - Arborium for server-side syntax highlighting
-- TanStack Start frontend
-- React Query
-- shadcn/ui and Tailwind CSS
 
 ## Planned CLI
 
@@ -78,7 +75,7 @@ peers diff --all
 peers review --base main --head HEAD
 ```
 
-This starts the local Peers session for a repo-scoped projection and prints the Vox and `peersdiff` LSP endpoints that a Neovim integration can attach to.
+This starts the local Peers session for a repo-scoped projection and prints the Vox and `peersdiff` LSP endpoints that the Neovim integration can attach to.
 The same connection details are written to `.peers/session.json` while the session is running.
 
 Neovim plugin usage:
@@ -142,24 +139,7 @@ Reviews are planned to be stored in the reviewed repository:
 
 ## Development
 
-The repository currently contains a Rust crate scaffold and a TanStack Start frontend in `frontend/`.
-
-Frontend commands:
-
-```bash
-cd frontend
-bun install
-bun run dev
-bun run fmt:check
-bun run lint
-bun run ts:check
-```
-
-Frontend tooling:
-
-- `oxfmt` formats TypeScript, TSX, and related frontend files.
-- `oxlint` handles frontend linting.
-- `tsgo --noEmit` handles TypeScript checking.
+The repository currently contains the Rust CLI/backend and bundled Neovim integration.
 
 Rust commands:
 

@@ -16,7 +16,7 @@ Local Git peer review for humans and agents.
 - Keep comments independent of a specific review session. Comments should follow code across staged/unstaged views, branch creation, branch switches, commits, and branch reviews when anchor relocation still deems them relevant.
 - Make Neovim the primary product surface while the review model is stabilizing.
 - Store review data in a local project folder with an append-friendly format.
-- Use Rust for the backend, gitoxide for Git access, Vox for RPC, facet for serialization, and TanStack Start for the frontend.
+- Use Rust, gitoxide for Git access, Vox for local RPC, facet for serialization, and Neovim as the primary UI surface.
 - Keep the implementation simple: single Rust crate, minimal tests, behavior-oriented code organization.
 
 ## Non-Goals
@@ -43,17 +43,10 @@ Backend:
 - `thiserror` for custom domain errors
 - Arborium for server-side syntax highlighting
 
-Frontend:
+Web frontend:
 
-- TanStack Start
-- React Query
-- shadcn/ui components
-- Tailwind CSS
-- lucide-react icons
-
-The current frontend scaffold has TanStack Start SPA mode enabled. SSR mode and future Rust-binary bundling need to be handled explicitly.
-
-The web frontend is currently low priority. If backend/provider contract changes make the web frontend expensive to keep compiling or coherent, it is acceptable to remove it temporarily after prompting the project owner. If removed, delete it in one dedicated commit so the full frontend can be recovered easily from Git history later.
+- Removed while the repo-scoped provider and Neovim-first workflow stabilize.
+- Recover from Git history later if a web surface becomes useful again.
 
 ## Project Shape
 
@@ -71,8 +64,6 @@ peers/
     review_provider.rs
     server.rs
     rpc.rs
-    ui_assets.rs
-  frontend/
 ```
 
 Do not organize by generic category names like `types.rs`. Put data structures next to the behavior that owns them.
@@ -83,43 +74,9 @@ Suggested backend ownership:
 - `diff.rs`: review target resolution, gitoxide diff loading, diff normalization, highlighting integration.
 - `review.rs`: view/projection construction, generated review artifacts, and compatibility code while older review-scoped storage is being removed.
 - `comments.rs`: repo-scoped event model, JSONL parsing/encoding, replay, comment commands, anchor relocation inputs, and agent context rendering.
-- `review_provider.rs`: cloneable async review provider used by web RPC, Neovim LSP, and future local clients.
+- `review_provider.rs`: cloneable async review provider used by Vox RPC, Neovim LSP, and future local clients.
 - `rpc.rs`: Vox service trait and token-checking RPC wrapper around the shared review provider.
-- `server.rs`: local HTTP server, Vox endpoint, one-use token, static/frontend serving.
-- `ui_assets.rs`: embedded frontend assets when packaging is added.
-
-Frontend:
-
-```text
-frontend/src/features/
-  review/
-    ReviewWorkspace.tsx
-    FileSidebar.tsx
-    QuickAccess.tsx
-    quickAccessSearch.ts
-    reviewQueries.ts
-  diff/
-    DiffViewer.tsx
-    DiffFile.tsx
-    DiffLine.tsx
-    rangeSelection.ts
-  comments/
-    CommentThread.tsx
-    CommentComposer.tsx
-    commentAnchors.ts
-```
-
-Do not create broad `types.ts` files. Keep types close to the component or logic that uses them, unless they are genuinely shared across features.
-
-Frontend file structure rules:
-
-- Avoid large files.
-- Prefer one meaningful component per file.
-- Split large review surfaces into smaller components before they become hard to scan.
-- Route files and other compositional files should stay lean.
-- Compositional files should mostly arrange smaller components and pass data; they should contain minimal Tailwind.
-- Primitive component files may use as much inline Tailwind as needed.
-- Primitive components should follow the same structure and conventions as shadcn components.
+- `server.rs`: local session process, Vox endpoint, one-use token, realtime watcher, and Neovim LSP startup.
 
 ## CLI
 
@@ -196,7 +153,7 @@ An active session should publish ephemeral connection information at:
 .peers/session.json
 ```
 
-The file includes the process id, current repo/view metadata, Vox URL, `peersdiff` LSP URL, optional frontend URL, token, and start time. It is an attachment hint for local clients, not canonical comment state.
+The file includes the process id, current repo/view metadata, Vox URL, `peersdiff` LSP URL, optional frontend URL, token, and start time. The frontend URL is currently `null` because the web UI has been removed. The session file is an attachment hint for local clients, not canonical comment state.
 
 Environment overrides:
 
@@ -242,7 +199,7 @@ When opening the UI:
 - Start or attach to a repo session and compute the requested view projection.
 - Start a localhost server on `127.0.0.1:<random-port>`.
 - Generate a one-use token.
-- Open the review UI URL if the web UI is enabled.
+- Open or attach the Neovim review buffer when launched from the editor.
 - Keep the process running until browser/session exit or Ctrl-C.
 
 The server must not listen publicly by default.
@@ -381,6 +338,8 @@ Anchor relocation should try, in order:
 
 Unresolved comments should be surfaced aggressively. If an unresolved anchor can only be weakly relocated, show it with moved/stale/changed metadata rather than hiding it. If it cannot be relocated, keep it visible in an unresolved detached section and diagnostics/list output.
 
+Open comments are part of the projection, not decoration on top of changed hunks. If the current Git diff has no changed files or no hunk for a commented region, unresolved comments should still create enough review surface to read and act on them. For line/range comments, render a synthetic comment-context hunk around the relocated anchor with unchanged source lines and the inline thread. For file-level comments, render the file header and thread even if the file is currently unchanged. For detached unresolved comments, render a detached section instead of hiding them behind an empty state.
+
 Resolved comments should be hidden more aggressively as context changes. Exact matches may remain available behind a show-resolved option. Weak matches, file-only matches, and detached resolved comments should be hidden from normal diff/editor projections by default, while remaining available through explicit complete/resolved/global listing and cleanup previews.
 
 ## Cleanup
@@ -508,7 +467,7 @@ Full-file view:
 - Reuses the same line rendering, comment anchoring, inline thread, and line selection logic as the diff view.
 - Diff views may show only changed hunks; full-file views must show the complete file content while preserving the same comment behavior.
 
-Frontend review payload shape:
+Projection payload shape:
 
 - `files`: ordered list of `ReviewableFile` metadata for the sidebar and file headers.
 - `fileContentsByPath`: map keyed by repo path. Each value contains `old` and/or `new` line arrays for full-file rendering.
@@ -521,7 +480,7 @@ Diff hunks must point back into `fileContentsByPath`:
 - Context sections contain old and new ranges.
 - Added sections contain a new range.
 - Removed sections contain an old range.
-- The UI expands sections into render rows and reads text from `fileContentsByPath`.
+- Renderers expand sections into rows and read text from `fileContentsByPath`.
 - Added files should have only `new` content and added sections.
 - Deleted files should have only `old` content and removed sections.
 - Unchanged files may omit `FileDiff`; the UI should render full-file content when they are explicitly shown.
@@ -570,7 +529,7 @@ Do not bake diff colors into highlighted code. Syntax highlighting and diff stat
 
 - syntax spans come from Arborium
 - added/deleted/context state comes from diff metadata
-- selected/commented states come from frontend CSS
+- selected/commented states come from renderer styling
 
 ## RPC
 
@@ -621,7 +580,6 @@ Implementation expectations:
 - Watch the repo event log for append changes and notify connected clients.
 - Watch relevant Git working tree/index inputs for diff changes, respecting repository `.gitignore` rules, and notify connected clients that the diff payload should refresh.
 - The Neovim review buffer should refresh through the active session callback when it receives a comment or diff update notification.
-- If the web frontend remains present, it should invalidate/refetch the TanStack Query review payload when it receives a review or diff update notification.
 - Update notifications may be coarse-grained at first, such as `review_changed` and `diff_changed`; they do not need per-entity patches in the first pass.
 - UIs should keep local interaction state where practical, such as active file, active comment, cursor/scroll location, and composer draft, while replacing server-owned review data.
 - If an update invalidates the currently visible file, comment, or line anchor, the UI should fall back gracefully to the nearest valid review surface instead of crashing.
@@ -638,7 +596,7 @@ The integration should keep one Peers session process per repository/view attach
 - If no session exists, Neovim may start the same Peers process that the CLI would start, then attach to it.
 - Neovim and any future UI must see the same repo-scoped event log, realtime updates, and generated artifacts.
 
-The core operations should live behind one cloneable async provider that can render live projections from repo-scoped comments and Git state. Vox may expose that provider to the web frontend if the frontend remains present, and the `peersdiff` LSP should call the same provider directly inside the Peers session process. The provider should avoid external shared mutability by default; if live state becomes necessary, prefer an internal event loop, request/response channels, or purpose-built concurrent maps over `Arc<Mutex<_>>`.
+The core operations should live behind one cloneable async provider that can render live projections from repo-scoped comments and Git state. Vox may expose that provider to future local clients, and the `peersdiff` LSP should call the same provider directly inside the Peers session process. The provider should avoid external shared mutability by default; if live state becomes necessary, prefer an internal event loop, request/response channels, or purpose-built concurrent maps over `Arc<Mutex<_>>`.
 
 The Neovim surface should be one full-focus synthetic review buffer, not a split-based UI:
 
@@ -656,9 +614,10 @@ Expected behavior:
 
 - The review buffer should appear as a normal listed buffer so users can find it through familiar buffer pickers, including Telescope.
 - The review buffer should be easy to reopen with `:PeersReview` and should remain usable through the jumplist where practical.
-- The buffer should render files, hunks, added/removed/context lines, inline threads, multiline range markers, file-level comments, review-level conversation entries, and compact unchanged-context placeholders.
+- The buffer should render files, changed hunks, comment-context hunks, added/removed/context lines, inline threads, multiline range markers, file-level comments, review-level conversation entries, and compact unchanged-context placeholders.
 - File context labels, including file header rows and editor breadcrumb/document-symbol context, should include compact Git-style status markers such as `[A]`, `[D]`, `[R]`, `[M]`, `[U]`, or `[B]` for added, deleted, renamed, modified, unchanged, and binary files.
-- When there are no changed files, the Neovim review buffer should render the same empty state as the web review workspace: `No file changes`, the short explanation, and a refresh hint.
+- When there are no changed files but there are unresolved or otherwise visible comments, the Neovim review buffer should render the relevant commented files/regions as comment-context hunks rather than showing an empty state.
+- The `No file changes` empty state should only render when the current projection has no changed files and no visible unresolved/relevant comments. In normal default views, that usually means all comments are resolved or hidden by policy and the Git diff is empty.
 - Peers owns the render model. The `peersdiff` LSP exposes a custom `peers/renderReview` request that returns synthetic lines, row metadata, structural highlights, and symbol metadata derived from the shared review provider.
 - The Lua attachment layer applies rendered lines and extmarks to the synthetic buffer, while Rust remains the source of truth for row semantics and review data.
 - Structural highlights cover file headers, hunk headers, line numbers, add/delete gutter markers, and comment rows. Prefer gutter/prefix color over full-line color unless a stronger visual treatment is required.
@@ -675,7 +634,7 @@ The `peersdiff` LSP should let users keep their existing LSP mappings instead of
 - `textDocument/hover`: show Peers metadata for review rows and proxy source hover for mapped current-side code rows.
 - `textDocument/definition`: proxy from mapped current-side code rows to the hidden real source buffer's attached language servers and open the real target in the current window.
 - `textDocument/references`: proxy references from mapped current-side code rows where practical, using the user's normal quickfix/location-list behavior.
-- `textDocument/codeAction`: expose context-aware review actions only. Source LSP code actions from hidden buffers should not be proxied into the review buffer. Source rows should offer labels such as `Add line comment` or `Add comment on lines 3..9`; file-related contexts should also offer `Add comment on file`; comment rows should offer reply, edit own comment, delete own comment, resolve, and reopen actions as applicable. Agent-authored comment rows should also offer `Accept agent comment` and `Decline agent comment` when the current author is not that agent and the latest disposition is still pending. Deleting comments must show the same invalidation warning flow as the web frontend before appending the delete event.
+- `textDocument/codeAction`: expose context-aware review actions only. Source LSP code actions from hidden buffers should not be proxied into the review buffer. Source rows should offer labels such as `Add line comment` or `Add comment on lines 3..9`; file-related contexts should also offer `Add comment on file`; comment rows should offer reply, edit own comment, delete own comment, resolve, and reopen actions as applicable. Agent-authored comment rows should also offer `Accept agent comment` and `Decline agent comment` when the current author is not that agent and the latest disposition is still pending. Deleting comments must show the invalidation warning flow before appending the delete event.
 - `textDocument/diagnostic` or published diagnostics: show unresolved comments, stale anchors, failed mappings, and projected diagnostics from the real source buffer.
 - `textDocument/documentSymbol`: expose a root review target label, file path symbols, readable hunk range symbols such as `lines 10-21` or `old lines 10-17`, and later thread/unresolved comment symbols for picker/outline workflows.
 
@@ -727,7 +686,9 @@ Neovim commands should stay small:
 
 Most daily review actions should be available through normal LSP hover, definition, references, diagnostics, document symbols, and code actions.
 
-## Frontend Layout
+## Archived Web Layout
+
+The web frontend has been removed while the Neovim-first repo-scoped provider stabilizes. The notes below are archived design context only, not active implementation guidance.
 
 The review UI should feel close to GitHub's pull request review experience.
 
@@ -907,7 +868,7 @@ Editing and deletion:
 - Users can edit their own comments.
 - Users can delete their own comments.
 - Users can delete a whole thread when they are allowed to delete the thread's root comment.
-- Neovim must follow the same edit/delete rules as the web UI. Delete comment should be available from comment-row code actions for comments the current author can edit/delete, and must show the same warning before invalidating later dependent activity.
+- Delete comment should be available from comment-row code actions for comments the current author can edit/delete, and must show the same warning before invalidating later dependent activity.
 - Editing or deleting a user comment invalidates later dependent activity in that thread.
 - Dependent activity includes following agent comments, following agent-created replies, and later resolved/reopened status changes that happened after the edited/deleted comment.
 - Before applying an edit/delete that would invalidate later activity, show a confirmation warning that those later comments/status changes will be removed from the visible thread state.
@@ -1058,24 +1019,6 @@ The empty state belongs inside the scrollable results area so the panel geometry
 - Add new theme colors only when there is a concrete repeated semantic need.
 - Do not introduce one-off hardcoded colors in component Tailwind classes.
 
-## Frontend Tooling
-
-Use the configured frontend tools in `frontend/package.json`:
-
-```bash
-bun run fmt
-bun run fmt:check
-bun run lint
-bun run lint:fix
-bun run ts:check
-```
-
-- Use `oxfmt` as the frontend formatter.
-- Use `oxlint` as the frontend linter.
-- Use `tsgo --noEmit` for TypeScript checking.
-- Keep generated and hand-written frontend code passing all three checks before considering frontend work complete.
-- Prefer fixing lint and type errors in the source instead of suppressing them.
-
 ## Testing Policy
 
 Keep testing minimal, but keep code testable.
@@ -1125,11 +1068,12 @@ Current status:
 | Git diff loading | Partial | Working tree, cached, all-changes, and branch targets load real Git diffs into the compact payload through gitoxide snapshots and `gix-diff` hunk generation. Rename detection is currently exact-content only, and richer normalization fixtures remain. |
 | Arborium highlighting | Planned | Not implemented. |
 | Vox RPC service | Partial | Local WebSocket service exposes review load, refresh, comment mutations, viewed files, submit review, and a coarse update subscription channel; contract should be revised around repo-scoped projections and is lower priority than Neovim. |
-| Realtime UI updates | Partial | The session broadcasts coarse `review_changed` and `diff_changed` updates through Vox channels, watches `.peers/events.jsonl`, `.peers/threads/`, and the repository tree with debounce plus polling fallback, invalidates TanStack Query in the web UI, and refreshes Neovim review buffers through a direct Neovim RPC callback. |
+| Realtime UI updates | Partial | The session broadcasts coarse `review_changed` and `diff_changed` updates through Vox channels, watches `.peers/events.jsonl`, `.peers/threads/`, and the repository tree with debounce plus polling fallback, and refreshes Neovim review buffers through a direct Neovim RPC callback. |
 | Neovim review mode | Partial | The local Peers session starts a `peersdiff` LSP endpoint using `tower-lsp-server`; `peers diff` and `peers review` launch repo-scoped sessions, Vox/LSP share a cloneable review provider, and Lua `:Peers`/`:PeersReview` open a full-focus synthetic review buffer from `.peers/session.json`. Rust serves `peers/renderReview` with rendered diff rows, row metadata, structural highlights, document symbols, and an empty state when there are no changed files; Lua applies rows, mirrors viewport-scoped Tree-sitter highlights from hidden current-side source buffers, opens floating writable composers for add/reply/edit comment code actions, executes delete/resolve/reopen mutations, shows edit/delete invalidation confirmation through native Neovim prompts, masks file diffs when Neovim has unsaved changes in the corresponding source buffer, publishes diagnostics for those masked files, refreshes via direct Neovim RPC while a review session is active, and proxies hover/definition/declaration/type-definition/implementation/references from mapped current-side rows into hidden source buffer LSP clients. Line comments render inline at their anchor row with range rails and context-aware code actions for line/range/file/comment rows. Broader relocation diagnostics remain. |
 | Neovim cursor stability | Planned | Live review-buffer refreshes should restore cursor and viewport by semantic row anchors such as comment id, thread id, or source path/line rather than raw Neovim line number. |
-| Web review workspace | Low priority | Toolbar, sidebar, diff surface, full-file route, quick access, sticky diff headers, and empty-diff state exist. Web may be removed in one explicit commit after prompting if contract changes make it expensive to maintain during Neovim-first work. |
-| Frontend review payload shape | Complete | Frontend consumes server-provided files, per-path file content, per-path compact diffs, and thread data through TanStack Query. |
+| Comment-context hunks | Planned | Open comments should render relevant unchanged regions even when the current Git diff is otherwise empty; `No file changes` should require no visible relevant comments. |
+| Web review workspace | Removed | The frontend directory and TypeScript binding generator were removed during the Neovim-first provider refactor. Recover from Git history if a web surface becomes useful again. |
+| Frontend review payload shape | Removed | The active contract is the Rust provider/Neovim projection path. |
 | Inline comments in diff/full-file views | Partial | `git-diff-view` renders real diffs with inline composers, persisted threads, multi-line selection, and range rails. Full-file comments still rely on the current full-file route behavior rather than the same library surface. |
 | File-level comments | Partial | `Comment on this file` creates persisted file-level threads; broader Conversation/quick-access treatment still needs completion. |
 | Review-level comments | Planned | Specified for the `Conversation` tab; not implemented. |
@@ -1140,7 +1084,7 @@ Current status:
 | Unchanged-file toggle | Partial | Toggle and routing exist; behavior still needs verification against all routes. |
 | Quick access menu | Partial | File/comment search exists against live review data; review/file/review-level scope navigation is not complete. |
 | Comment card presentation | Partial | Inline cards, edit/delete warnings, resolve/reopen, and agent identity display exist; finer timestamp/icon polish remains. |
-| Packaging embedded frontend assets | Planned | Not implemented. |
+| Packaging embedded frontend assets | Removed | Not applicable while the web frontend is removed. |
 
 ## Implementation Order
 
@@ -1150,13 +1094,13 @@ Current priority order:
 2. Add rich content/context capture for new line and range comments.
 3. Implement anchor relocation and placement classification: inline, file-level, repo-level, detached, hidden.
 4. Apply visibility policy: unresolved comments surface aggressively; resolved comments hide aggressively as context drifts.
-5. Refine CLI comment projection filters for `--scope view|repo|detached`.
-6. Harden `peers clean` age, hidden, and detached candidate policies.
-7. Add agent comment accept/decline disposition events, provider operations, CLI commands, and Neovim code actions.
-8. Preserve Neovim cursor and viewport by semantic row anchors during live refreshes.
-9. Retarget Neovim rendering and realtime updates to repo-scoped projections.
-10. Improve Neovim diagnostics for detached/stale unresolved comments and cleanup candidates.
-11. Keep generated `review.md` and `agent-context.md` as views over repo-scoped projections.
-12. Decide whether to maintain, pause, or remove the web frontend after the provider contract stabilizes.
+5. Render comment-context hunks for visible unresolved comments even when the Git diff is empty.
+6. Refine CLI comment projection filters for `--scope view|repo|detached`.
+7. Harden `peers clean` age, hidden, and detached candidate policies.
+8. Add agent comment accept/decline disposition events, provider operations, CLI commands, and Neovim code actions.
+9. Preserve Neovim cursor and viewport by semantic row anchors during live refreshes.
+10. Retarget Neovim rendering and realtime updates to repo-scoped projections.
+11. Improve Neovim diagnostics for detached/stale unresolved comments and cleanup candidates.
+12. Keep generated `review.md` and `agent-context.md` as views over repo-scoped projections.
 13. Add Arborium highlighting only if it still matters after Neovim Tree-sitter mirroring covers the primary workflow.
-14. Revisit Vox/web RPC only after the Neovim-first provider model is stable.
+14. Revisit Vox RPC only after the Neovim-first provider model is stable.

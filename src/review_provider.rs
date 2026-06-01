@@ -292,19 +292,6 @@ impl ReviewProvider {
         self.updates.notify_review_changed();
         Ok(review)
     }
-
-    pub async fn mark_file_viewed(
-        &self,
-        _request: MarkFileViewedRequest,
-    ) -> Result<ReviewProjection> {
-        let review = self.get_review().await?;
-        Ok(review)
-    }
-
-    pub async fn submit_review(&self, _request: SubmitReviewRequest) -> Result<ReviewProjection> {
-        let review = self.get_review().await?;
-        Ok(review)
-    }
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
@@ -409,17 +396,6 @@ pub struct ThreadRequest {
     pub thread_id: String,
 }
 
-#[derive(Clone, Debug, Facet, PartialEq)]
-pub struct MarkFileViewedRequest {
-    pub path: String,
-    pub viewed: bool,
-}
-
-#[derive(Clone, Debug, Facet, PartialEq)]
-pub struct SubmitReviewRequest {
-    pub body: Option<String>,
-}
-
 fn review_payload(
     state: &PeersState,
     mut diff: ReviewDiffPayload,
@@ -441,7 +417,6 @@ fn review_payload(
         }
     }
     for file in &mut diff.files {
-        file.viewed = false;
         file.comment_count = comment_counts.get(&file.path).copied().unwrap_or(0);
     }
 

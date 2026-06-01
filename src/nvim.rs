@@ -55,8 +55,6 @@ const COMMAND_EDIT_COMMENT: &str = "peers.editComment";
 const COMMAND_DELETE_COMMENT: &str = "peers.deleteComment";
 const COMMAND_RESOLVE_THREAD: &str = "peers.resolveThread";
 const COMMAND_REOPEN_THREAD: &str = "peers.reopenThread";
-const COMMAND_MARK_VIEWED: &str = "peers.markViewed";
-const COMMAND_SUBMIT_REVIEW: &str = "peers.submitReview";
 const COMMAND_ASK_AGENT: &str = "peers.askAgent";
 
 const ACTION_ADD_LINE_COMMENT: &str = "Peers: Add line comment";
@@ -308,8 +306,6 @@ impl LanguageServer for PeersDiffLanguageServer {
                         COMMAND_DELETE_COMMENT.to_string(),
                         COMMAND_RESOLVE_THREAD.to_string(),
                         COMMAND_REOPEN_THREAD.to_string(),
-                        COMMAND_MARK_VIEWED.to_string(),
-                        COMMAND_SUBMIT_REVIEW.to_string(),
                         COMMAND_ASK_AGENT.to_string(),
                     ],
                     ..Default::default()

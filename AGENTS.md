@@ -1,21 +1,20 @@
 # Agent Entry Point
 
-Peers is a local Git review tool. It has a Rust CLI/backend and a TanStack Start frontend.
+Peers is a local Git review tool. It has a Rust CLI/backend and bundled Neovim integration.
 
 Start here:
 
 - [README.md](./README.md): project overview, planned stack, basic commands.
 - [spec.md](./spec.md): product and implementation plan.
-- [CONTRIBUTING.md](./CONTRIBUTING.md): coding standards, routing/state rules, testing policy, style rules.
+- [CONTRIBUTING.md](./CONTRIBUTING.md): coding standards, architecture rules, and testing policy.
 
 Current shape:
 
 - Rust source: `src/`
-- Frontend source: `frontend/src/`
-- Frontend features: `frontend/src/features/`
-- TanStack routes: `frontend/src/routes/`
+- Neovim plugin source: `lua/` and `plugin/`
 - Review storage target: `.peers/` inside reviewed repos
 
 Implementation note:
 
-- Check [CONTRIBUTING.md](./CONTRIBUTING.md) before making implementation decisions. It covers routing, state, testing, styling, and frontend component rules, including when to use shadcn/ui-style primitives instead of creating custom components from scratch.
+- Check [CONTRIBUTING.md](./CONTRIBUTING.md) before making implementation decisions.
+- Never commit changes unless the project owner has reviewed the work and explicitly told you to commit.
