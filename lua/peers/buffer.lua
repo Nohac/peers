@@ -57,6 +57,7 @@ local ROW_SIDE_NEW = "new"
 local ROW_SCOPE_LINE = "line"
 local ROW_SCOPE_FILE = "file"
 local ROW_KIND_FILE_HEADER = "file_header"
+local ROW_KIND_HUNK_HEADER = "hunk_header"
 local ROW_KIND_DIRTY = "dirty"
 local ROW_KIND_ADD = "add"
 local ROW_KIND_CONTEXT = "context"
@@ -78,6 +79,7 @@ local COMPOSER_HEIGHT = 7
 local COMPOSER_MIN_WIDTH = 40
 local COMPOSER_MAX_WIDTH = 88
 local COMPOSER_GUTTER_COL = 14
+local PAUSED_REFRESH_CHECK_MS = 80
 local COMMENT_EMPTY_MESSAGE = "Peers comment is empty"
 local COMMENT_UNAVAILABLE_MESSAGE = "Peers comment is only available on diff lines for now"
 local OPEN_SOURCE_UNAVAILABLE_MESSAGE = "Peers can only open source files from file, diff, or comment rows"
@@ -671,30 +673,12 @@ local function visible_row_ranges(buf)
   return ranges
 end
 
-local function buffer_windows(buf)
-  local windows = {}
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-      table.insert(windows, win)
-    end
-  end
-  return windows
-end
-
 local function save_win_view(win)
   local ok, view = pcall(vim.api.nvim_win_call, win, vim.fn.winsaveview)
   if ok then
     return view
   end
   return nil
-end
-
-local function save_buffer_views(buf)
-  local views = {}
-  for _, win in ipairs(buffer_windows(buf)) do
-    views[win] = save_win_view(win)
-  end
-  return views
 end
 
 local function restore_win_view(win, view)
@@ -707,9 +691,192 @@ local function restore_win_view(win, view)
   end)
 end
 
-local function restore_buffer_views(views)
-  for win, view in pairs(views or {}) do
-    restore_win_view(win, view)
+local function row_thread_offset(rows, index, thread_id)
+  local first = index
+  while first > 1 do
+    local previous = rows[first - 1]
+    if not previous or previous.thread_id ~= thread_id then
+      break
+    end
+    first = first - 1
+  end
+  return index - first
+end
+
+local function semantic_anchor_for_view(rows, view)
+  local line = math.max(1, view and view.lnum or 1)
+  local col = math.max(0, view and view.col or 0)
+  local row = rows and rows[line] or nil
+  local anchor = {
+    view = view,
+    fallback_line = line,
+    fallback_col = col,
+    top_delta = line - math.max(1, view and view.topline or line),
+  }
+
+  if not row then
+    return anchor
+  end
+
+  anchor.kind = row.kind
+  anchor.path = row.path
+  anchor.side = row.side
+  anchor.source_line = row.source_line
+  anchor.thread_id = row.thread_id
+  anchor.comment_id = row.comment_id
+
+  if row.thread_id then
+    anchor.thread_offset = row_thread_offset(rows, line, row.thread_id)
+  end
+
+  return anchor
+end
+
+local function save_buffer_cursor_anchors(buf)
+  local state = RENDER_STATES[buf]
+  local anchors = {}
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    local view = save_win_view(win)
+    anchors[win] = semantic_anchor_for_view(state and state.rows or nil, view)
+  end
+  return anchors
+end
+
+local function find_row(rows, predicate)
+  for index, row in ipairs(rows or {}) do
+    if predicate(row) then
+      return index, row
+    end
+  end
+  return nil, nil
+end
+
+local function find_thread_row(rows, thread_id, offset)
+  local first = find_row(rows, function(row)
+    return row.thread_id == thread_id
+  end)
+  if not first then
+    return nil, nil
+  end
+
+  local target = first + (offset or 0)
+  local row = rows[target]
+  if row and row.thread_id == thread_id then
+    return target, row
+  end
+  return first, rows[first]
+end
+
+local function find_semantic_row(rows, anchor)
+  if not anchor then
+    return nil, nil
+  end
+
+  if anchor.comment_id then
+    local index, row = find_row(rows, function(candidate)
+      return candidate.comment_id == anchor.comment_id
+    end)
+    if index then
+      return index, row
+    end
+  end
+
+  if anchor.thread_id then
+    local index, row = find_thread_row(rows, anchor.thread_id, anchor.thread_offset)
+    if index then
+      return index, row
+    end
+  end
+
+  if anchor.path and anchor.side and anchor.source_line then
+    local index, row = find_row(rows, function(candidate)
+      return candidate.path == anchor.path and candidate.side == anchor.side and candidate.source_line == anchor.source_line
+    end)
+    if index then
+      return index, row
+    end
+  end
+
+  if anchor.path and (anchor.kind == ROW_KIND_FILE_HEADER or anchor.kind == ROW_KIND_HUNK_HEADER) then
+    local index, row = find_row(rows, function(candidate)
+      return candidate.path == anchor.path and candidate.kind == anchor.kind
+    end)
+    if index then
+      return index, row
+    end
+  end
+
+  if anchor.path then
+    return find_row(rows, function(candidate)
+      return candidate.path == anchor.path
+    end)
+  end
+
+  return nil, nil
+end
+
+local function cursor_col_for_anchor(anchor)
+  return anchor and anchor.fallback_col or 0
+end
+
+local function clamp_cursor(buf, line, col)
+  local line_count = math.max(1, vim.api.nvim_buf_line_count(buf))
+  line = math.max(1, math.min(line or 1, line_count))
+  local text = vim.api.nvim_buf_get_lines(buf, line - 1, line, false)[1] or ""
+  col = math.max(0, math.min(col or 0, #text))
+  return line, col
+end
+
+local function restore_relative_win_view(win, buf, anchor)
+  if not anchor or not anchor.view or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+
+  local top_delta = math.max(0, anchor.top_delta or 0)
+  local line = (anchor.view.topline or 1) + top_delta
+  local col = cursor_col_for_anchor(anchor)
+  line, col = clamp_cursor(buf, line, col)
+
+  local view = vim.deepcopy(anchor.view)
+  view.lnum = line
+  view.col = col
+  view.curswant = col
+  view.topline = math.max(1, line - top_delta)
+
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.fn.winrestview(view)
+    pcall(vim.api.nvim_win_set_cursor, win, { line, col })
+  end)
+end
+
+local function restore_semantic_win_view(win, buf, anchor, rows)
+  if not anchor or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+
+  local line = find_semantic_row(rows, anchor)
+  if not line then
+    restore_relative_win_view(win, buf, anchor)
+    return
+  end
+
+  local col = cursor_col_for_anchor(anchor)
+  line, col = clamp_cursor(buf, line, col)
+  local view = vim.deepcopy(anchor.view or {})
+  view.lnum = line
+  view.col = col
+  view.curswant = col
+  view.topline = math.max(1, line - math.max(0, anchor.top_delta or 0))
+
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.fn.winrestview(view)
+    pcall(vim.api.nvim_win_set_cursor, win, { line, col })
+  end)
+end
+
+local function restore_buffer_cursor_anchors(buf, anchors, rows)
+  for win, anchor in pairs(anchors or {}) do
+    restore_semantic_win_view(win, buf, anchor, rows)
   end
 end
 
@@ -776,6 +943,34 @@ local function review_buffer_is_active(buf)
   return vim.api.nvim_get_current_buf() == buf
 end
 
+local function review_buffer_is_visible(buf)
+  return #vim.fn.win_findbuf(buf) > 0
+end
+
+local function composer_is_open(state)
+  return state
+    and (
+      (state.composer_win and vim.api.nvim_win_is_valid(state.composer_win))
+      or (state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf))
+    )
+end
+
+local function floating_window_is_open()
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(win) then
+      local config = vim.api.nvim_win_get_config(win)
+      if config and config.relative and config.relative ~= "" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function review_refresh_is_paused(state)
+  return composer_is_open(state) or floating_window_is_open()
+end
+
 local function render_review_now(buf, state)
   if not vim.api.nvim_buf_is_valid(buf) then
     return
@@ -787,15 +982,46 @@ local function render_review_now(buf, state)
   end)
 end
 
+local function schedule_pending_refresh_check(buf, state)
+  if not state or state.refresh_retry_scheduled then
+    return
+  end
+
+  state.refresh_retry_scheduled = true
+  vim.defer_fn(function()
+    local current = RENDER_STATES[buf]
+    if not current then
+      return
+    end
+    current.refresh_retry_scheduled = false
+    if not current.pending_refresh then
+      return
+    end
+    if not review_buffer_is_visible(buf) then
+      return
+    end
+    local paused = review_refresh_is_paused(current)
+    if review_buffer_is_active(buf) and not paused then
+      render_review_now(buf, current)
+    elseif paused then
+      schedule_pending_refresh_check(buf, current)
+    end
+  end, PAUSED_REFRESH_CHECK_MS)
+end
+
 local function request_review_refresh(buf, state)
   if not state or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
 
-  if review_buffer_is_active(buf) then
+  if review_buffer_is_active(buf) and not review_refresh_is_paused(state) then
     render_review_now(buf, state)
-  else
-    state.pending_refresh = true
+    return
+  end
+
+  state.pending_refresh = true
+  if review_buffer_is_visible(buf) then
+    schedule_pending_refresh_check(buf, state)
   end
 end
 
@@ -814,7 +1040,11 @@ end
 local function flush_pending_refresh(buf)
   local state = RENDER_STATES[buf]
   if state and state.pending_refresh then
-    render_review_now(buf, state)
+    if review_refresh_is_paused(state) then
+      schedule_pending_refresh_check(buf, state)
+    else
+      render_review_now(buf, state)
+    end
   end
 end
 
@@ -925,6 +1155,7 @@ local function composer_body(buf)
 end
 
 local function apply_mutation_render(state, review_buf, render)
+  state.pending_refresh = false
   close_composer(state)
   apply_render(state.root, review_buf, render, state.client_id)
 end
@@ -984,9 +1215,11 @@ local function open_composer(review_buf, opts)
   end, { buffer = draft_buf, nowait = true })
   vim.keymap.set("n", COMPOSER_CANCEL_MAP, function()
     close_composer(state)
+    flush_pending_refresh(review_buf)
   end, { buffer = draft_buf, nowait = true })
   vim.keymap.set("n", "<Esc>", function()
     close_composer(state)
+    flush_pending_refresh(review_buf)
   end, { buffer = draft_buf, nowait = true })
 
   vim.cmd("startinsert")
@@ -998,7 +1231,7 @@ function apply_render(root, buf, render, client_id)
   end
 
   local existing = RENDER_STATES[buf]
-  local visible_views = save_buffer_views(buf)
+  local cursor_anchors = save_buffer_cursor_anchors(buf)
   local remembered_view = existing and existing.view or nil
   if existing then
     close_composer(existing)
@@ -1017,9 +1250,10 @@ function apply_render(root, buf, render, client_id)
     source_segments = {},
     scheduled = false,
     pending_refresh = existing and existing.pending_refresh or false,
+    refresh_retry_scheduled = existing and existing.refresh_retry_scheduled or false,
     view = remembered_view,
   }
-  restore_buffer_views(visible_views)
+  restore_buffer_cursor_anchors(buf, cursor_anchors, render.rows or {})
   setup_mirror_autocmds(buf)
   mirror_visible_treesitter(buf)
 end
