@@ -91,7 +91,7 @@ impl LocalServer {
             token: token.clone(),
             realtime: true,
             nvim_listen: nvim_listen.clone(),
-            started_at: now_rfc3339()?,
+            started_at: now_rfc3339()?.to_string(),
         };
         write_session_info(&session_path, &session_info).await?;
 

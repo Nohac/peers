@@ -6,10 +6,10 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::comments::{
-    Author, AuthorKind, CommentPayload, PayloadStore, PeersEvent, PeersState, ThreadPayload,
-    decode_comment_payload, decode_thread_payload, encode_comment_payload, encode_event,
-    encode_thread_payload, parse_events_from_reader, render_agent_context, render_review_markdown,
-    replay_events,
+    Author, AuthorKind, Comment, CommentId, PayloadStore, PeersEvent, PeersState, PeersTimestamp,
+    ThreadId, ThreadPayload, decode_comment_payload, decode_thread_payload, encode_comment_payload,
+    encode_event, encode_thread_payload, parse_events_from_reader, render_agent_context,
+    render_review_markdown, replay_events,
 };
 use crate::diff::ReviewTarget;
 
@@ -201,7 +201,7 @@ pub async fn write_thread_payload(repo_root: &Path, payload: &ThreadPayload) -> 
     write_thread_payload_file(&thread_payload_path(repo_root, &payload.id), payload).await
 }
 
-pub async fn write_comment_payload(repo_root: &Path, payload: &CommentPayload) -> Result<()> {
+pub async fn write_comment_payload(repo_root: &Path, payload: &Comment) -> Result<()> {
     write_comment_payload_file(
         &comment_payload_path(repo_root, &payload.thread_id, &payload.id),
         payload,
@@ -209,15 +209,15 @@ pub async fn write_comment_payload(repo_root: &Path, payload: &CommentPayload) -
     .await
 }
 
-pub async fn load_thread_payload(repo_root: &Path, thread_id: &str) -> Result<ThreadPayload> {
+pub async fn load_thread_payload(repo_root: &Path, thread_id: &ThreadId) -> Result<ThreadPayload> {
     read_thread_payload_file(&thread_payload_path(repo_root, thread_id)).await
 }
 
 pub async fn load_comment_payload(
     repo_root: &Path,
-    thread_id: &str,
-    comment_id: &str,
-) -> Result<CommentPayload> {
+    thread_id: &ThreadId,
+    comment_id: &CommentId,
+) -> Result<Comment> {
     read_comment_payload_file(&comment_payload_path(repo_root, thread_id, comment_id)).await
 }
 
@@ -226,7 +226,7 @@ async fn read_thread_payload_file(path: &Path) -> Result<ThreadPayload> {
     decode_thread_payload(&input)
 }
 
-async fn read_comment_payload_file(path: &Path) -> Result<CommentPayload> {
+async fn read_comment_payload_file(path: &Path) -> Result<Comment> {
     let input = fs::read_to_string(path).await?;
     decode_comment_payload(&input)
 }
@@ -240,7 +240,7 @@ async fn write_thread_payload_file(path: &Path, payload: &ThreadPayload) -> Resu
     Ok(())
 }
 
-async fn write_comment_payload_file(path: &Path, payload: &CommentPayload) -> Result<()> {
+async fn write_comment_payload_file(path: &Path, payload: &Comment) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -249,17 +249,17 @@ async fn write_comment_payload_file(path: &Path, payload: &CommentPayload) -> Re
     Ok(())
 }
 
-fn thread_payload_path(repo_root: &Path, thread_id: &str) -> PathBuf {
+fn thread_payload_path(repo_root: &Path, thread_id: &ThreadId) -> PathBuf {
     peers_paths(repo_root)
         .threads
-        .join(thread_id)
+        .join(thread_id.as_str())
         .join(THREAD_JSON)
 }
 
-fn comment_payload_path(repo_root: &Path, thread_id: &str, comment_id: &str) -> PathBuf {
+fn comment_payload_path(repo_root: &Path, thread_id: &ThreadId, comment_id: &CommentId) -> PathBuf {
     peers_paths(repo_root)
         .threads
-        .join(thread_id)
+        .join(thread_id.as_str())
         .join(COMMENTS_DIR)
         .join(format!("{comment_id}.json"))
 }
@@ -323,18 +323,19 @@ pub async fn current_head_oid(repo_root: &Path) -> Result<Option<String>> {
     .context(CURRENT_HEAD_ERROR)?
 }
 
-pub fn now_rfc3339() -> Result<String> {
-    OffsetDateTime::now_utc()
+pub fn now_rfc3339() -> Result<PeersTimestamp> {
+    let value = OffsetDateTime::now_utc()
         .format(&Rfc3339)
-        .context("failed to format timestamp")
+        .context("failed to format timestamp")?;
+    PeersTimestamp::new(value)
 }
 
-pub fn new_thread_id() -> String {
-    format!("thr_{}", id_suffix())
+pub fn new_thread_id() -> ThreadId {
+    ThreadId::from_raw(format!("thr_{}", id_suffix()))
 }
 
-pub fn new_comment_id() -> String {
-    format!("cmt_{}", id_suffix())
+pub fn new_comment_id() -> CommentId {
+    CommentId::from_raw(format!("cmt_{}", id_suffix()))
 }
 
 fn id_suffix() -> String {
@@ -351,7 +352,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::comments::{CreationProvenance, ThreadStatus};
+    use crate::comments::{CommentId, CreationProvenance, PeersTimestamp, ThreadStatus};
     use crate::diff::{CommentAnchor, FileSide, LineAnchor};
 
     const TEST_AUTHOR_NAME: &str = "Jonas";
@@ -363,19 +364,19 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let thread = ThreadPayload {
-            id: "thr_test".to_string(),
+            id: thread_id(),
             status: ThreadStatus::Open,
             anchor: CommentAnchor::Line {
                 line: LineAnchor::new("src/main.rs".to_string(), FileSide::New, 1, 1),
             },
-            created_at: "2026-05-28T12:01:00Z".to_string(),
-            updated_at: "2026-05-28T12:01:00Z".to_string(),
+            created_at: timestamp("2026-05-28T12:01:00Z"),
+            updated_at: timestamp("2026-05-28T12:01:00Z"),
             provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
             archived_at: None,
             pruned_at: None,
         };
-        let comment = CommentPayload {
-            id: "cmt_test".to_string(),
+        let comment = Comment {
+            id: comment_id(),
             thread_id: thread.id.clone(),
             author: author(),
             body: "body".to_string(),
@@ -398,7 +399,7 @@ mod tests {
         .unwrap();
 
         let state = load_peers_state(&root).await.unwrap();
-        assert_eq!(state.threads["thr_test"].comments[0].body, "body");
+        assert_eq!(state.threads[&thread_id()].comments[0].body, "body");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -409,6 +410,18 @@ mod tests {
             display_name: TEST_AUTHOR_NAME.to_string(),
             email: Some(TEST_AUTHOR_EMAIL.to_string()),
         }
+    }
+
+    fn thread_id() -> ThreadId {
+        ThreadId::new("thr_test").unwrap()
+    }
+
+    fn comment_id() -> CommentId {
+        CommentId::new("cmt_test").unwrap()
+    }
+
+    fn timestamp(input: &str) -> PeersTimestamp {
+        PeersTimestamp::new(input).unwrap()
     }
 
     fn test_root(name: &str) -> PathBuf {

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
 use facet::Facet;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -20,6 +21,93 @@ pub struct Author {
     pub kind: AuthorKind,
     pub display_name: String,
     pub email: Option<String>,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+#[facet(transparent)]
+pub struct ThreadId(String);
+
+impl ThreadId {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if !value.starts_with("thr_") {
+            return Err(anyhow!("thread id must start with `thr_`"));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn from_raw(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Facet, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+#[facet(transparent)]
+pub struct CommentId(String);
+
+impl CommentId {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if !value.starts_with("cmt_") {
+            return Err(anyhow!("comment id must start with `cmt_`"));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn from_raw(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CommentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Facet, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+#[facet(transparent)]
+pub struct PeersTimestamp(String);
+
+impl PeersTimestamp {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let _ = DateTime::parse_from_rfc3339(&value)
+            .with_context(|| format!("invalid RFC3339 timestamp `{value}`"))?
+            .with_timezone(&Utc);
+        Ok(Self(value))
+    }
+
+    pub fn from_rfc3339_unchecked(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeersTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 impl Author {
@@ -45,48 +133,48 @@ impl Author {
 #[facet(tag = "kind", rename_all = "snake_case")]
 pub enum PeersEvent {
     ThreadCreated {
-        thread_id: String,
-        comment_id: String,
-        created_at: String,
+        thread_id: ThreadId,
+        comment_id: CommentId,
+        created_at: PeersTimestamp,
         author: Author,
     },
     CommentAdded {
-        thread_id: String,
-        comment_id: String,
-        created_at: String,
+        thread_id: ThreadId,
+        comment_id: CommentId,
+        created_at: PeersTimestamp,
         author: Author,
     },
     CommentEdited {
-        thread_id: String,
-        comment_id: String,
-        edited_at: String,
+        thread_id: ThreadId,
+        comment_id: CommentId,
+        edited_at: PeersTimestamp,
         author: Author,
     },
     CommentDeleted {
-        thread_id: String,
-        comment_id: String,
-        deleted_at: String,
+        thread_id: ThreadId,
+        comment_id: CommentId,
+        deleted_at: PeersTimestamp,
         author: Author,
     },
     ThreadResolved {
-        thread_id: String,
-        resolved_at: String,
+        thread_id: ThreadId,
+        resolved_at: PeersTimestamp,
         author: Author,
     },
     ThreadReopened {
-        thread_id: String,
-        reopened_at: String,
+        thread_id: ThreadId,
+        reopened_at: PeersTimestamp,
         author: Author,
     },
     ThreadArchived {
-        thread_id: String,
-        archived_at: String,
+        thread_id: ThreadId,
+        archived_at: PeersTimestamp,
         author: Author,
         reason: Option<String>,
     },
     ThreadPruned {
-        thread_id: String,
-        pruned_at: String,
+        thread_id: ThreadId,
+        pruned_at: PeersTimestamp,
         author: Author,
         reason: Option<String>,
     },
@@ -126,42 +214,25 @@ impl CreationProvenance {
 
 #[derive(Clone, Debug, Facet, PartialEq)]
 pub struct ThreadPayload {
-    pub id: String,
+    pub id: ThreadId,
     pub status: ThreadStatus,
     pub anchor: CommentAnchor,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: PeersTimestamp,
+    pub updated_at: PeersTimestamp,
     pub provenance: CreationProvenance,
-    pub archived_at: Option<String>,
-    pub pruned_at: Option<String>,
-}
-
-#[derive(Clone, Debug, Facet, PartialEq)]
-pub struct CommentPayload {
-    pub id: String,
-    pub thread_id: String,
-    pub author: Author,
-    pub body: String,
-    pub created_at: String,
-    pub edited_at: Option<String>,
-    pub deleted_at: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct PayloadStore {
-    pub threads: BTreeMap<String, ThreadPayload>,
-    pub comments: BTreeMap<String, CommentPayload>,
+    pub archived_at: Option<PeersTimestamp>,
+    pub pruned_at: Option<PeersTimestamp>,
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
 pub struct Comment {
-    pub id: String,
-    pub thread_id: String,
+    pub id: CommentId,
+    pub thread_id: ThreadId,
     pub author: Author,
     pub body: String,
-    pub created_at: String,
-    pub edited_at: Option<String>,
-    pub deleted_at: Option<String>,
+    pub created_at: PeersTimestamp,
+    pub edited_at: Option<PeersTimestamp>,
+    pub deleted_at: Option<PeersTimestamp>,
 }
 
 impl Comment {
@@ -174,35 +245,27 @@ impl Comment {
     }
 }
 
-impl From<CommentPayload> for Comment {
-    fn from(payload: CommentPayload) -> Self {
-        Self {
-            id: payload.id,
-            thread_id: payload.thread_id,
-            author: payload.author,
-            body: payload.body,
-            created_at: payload.created_at,
-            edited_at: payload.edited_at,
-            deleted_at: payload.deleted_at,
-        }
-    }
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PayloadStore {
+    pub threads: BTreeMap<ThreadId, ThreadPayload>,
+    pub comments: BTreeMap<CommentId, Comment>,
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
 pub struct CommentThread {
-    pub id: String,
+    pub id: ThreadId,
     pub anchor: CommentAnchor,
     pub comments: Vec<Comment>,
     pub resolved: bool,
-    pub created_at: String,
-    pub updated_at: String,
-    pub archived_at: Option<String>,
-    pub pruned_at: Option<String>,
+    pub created_at: PeersTimestamp,
+    pub updated_at: PeersTimestamp,
+    pub archived_at: Option<PeersTimestamp>,
+    pub pruned_at: Option<PeersTimestamp>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PeersState {
-    pub threads: BTreeMap<String, CommentThread>,
+    pub threads: BTreeMap<ThreadId, CommentThread>,
 }
 
 impl PeersState {
@@ -261,11 +324,11 @@ pub fn decode_thread_payload(input: &str) -> Result<ThreadPayload> {
     facet_json::from_str(input).context("failed to decode thread payload")
 }
 
-pub fn encode_comment_payload(payload: &CommentPayload) -> Result<String> {
+pub fn encode_comment_payload(payload: &Comment) -> Result<String> {
     facet_json::to_string(payload).context("failed to encode comment payload")
 }
 
-pub fn decode_comment_payload(input: &str) -> Result<CommentPayload> {
+pub fn decode_comment_payload(input: &str) -> Result<Comment> {
     facet_json::from_str(input).context("failed to decode comment payload")
 }
 
@@ -298,7 +361,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                 CommentThread {
                     id: payload.id.clone(),
                     anchor: payload.anchor.clone(),
-                    comments: visible_comments(vec![comment.clone().into()]),
+                    comments: visible_comments(vec![comment.clone()]),
                     resolved: payload.status == ThreadStatus::Resolved,
                     created_at: payload.created_at.clone(),
                     updated_at: payload.updated_at.clone(),
@@ -320,7 +383,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                 .threads
                 .get_mut(thread_id)
                 .ok_or_else(|| anyhow!("comment references unknown thread `{thread_id}`"))?;
-            thread.comments.push(comment.clone().into());
+            thread.comments.push(comment.clone());
             thread.comments = visible_comments(std::mem::take(&mut thread.comments));
             thread.updated_at = created_at.clone();
         }
@@ -344,7 +407,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                 .position(|comment| comment.id == *comment_id)
                 .ok_or_else(|| anyhow!("unknown comment `{comment_id}`"))?;
             thread.comments.truncate(comment_index + 1);
-            thread.comments[comment_index] = payload.clone().into();
+            thread.comments[comment_index] = payload.clone();
             thread.resolved = false;
             thread.updated_at = edited_at.clone();
         }
@@ -368,7 +431,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                     .position(|comment| comment.id == *comment_id)
                     .ok_or_else(|| anyhow!("unknown comment `{comment_id}`"))?;
                 thread.comments.truncate(comment_index + 1);
-                thread.comments[comment_index] = payload.clone().into();
+                thread.comments[comment_index] = payload.clone();
                 thread.comments = visible_comments(std::mem::take(&mut thread.comments));
                 thread.resolved = false;
                 thread.updated_at = deleted_at.clone();
@@ -551,27 +614,39 @@ mod tests {
         }
     }
 
+    fn thread_id() -> ThreadId {
+        ThreadId::new("thr_test").unwrap()
+    }
+
+    fn comment_id() -> CommentId {
+        CommentId::new("cmt_test").unwrap()
+    }
+
+    fn timestamp(input: &str) -> PeersTimestamp {
+        PeersTimestamp::new(input).unwrap()
+    }
+
     #[tokio::test]
     async fn event_roundtrip_replays_payload_state() {
         let anchor = CommentAnchor::Line {
             line: LineAnchor::new("src/main.rs".to_string(), FileSide::New, 4, 6),
         };
         let thread = ThreadPayload {
-            id: "thr_test".to_string(),
+            id: thread_id(),
             status: ThreadStatus::Open,
             anchor,
-            created_at: "2026-05-28T12:01:00Z".to_string(),
-            updated_at: "2026-05-28T12:01:00Z".to_string(),
+            created_at: timestamp("2026-05-28T12:01:00Z"),
+            updated_at: timestamp("2026-05-28T12:01:00Z"),
             provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
             archived_at: None,
             pruned_at: None,
         };
-        let comment = CommentPayload {
-            id: "cmt_test".to_string(),
-            thread_id: "thr_test".to_string(),
+        let comment = Comment {
+            id: comment_id(),
+            thread_id: thread_id(),
             author: author(),
             body: "Needs a testable event log.".to_string(),
-            created_at: "2026-05-28T12:01:00Z".to_string(),
+            created_at: timestamp("2026-05-28T12:01:00Z"),
             edited_at: None,
             deleted_at: None,
         };
@@ -581,14 +656,14 @@ mod tests {
         };
         let events = vec![
             PeersEvent::ThreadCreated {
-                thread_id: "thr_test".to_string(),
-                comment_id: "cmt_test".to_string(),
-                created_at: "2026-05-28T12:01:00Z".to_string(),
+                thread_id: thread_id(),
+                comment_id: comment_id(),
+                created_at: timestamp("2026-05-28T12:01:00Z"),
                 author: author(),
             },
             PeersEvent::ThreadResolved {
-                thread_id: "thr_test".to_string(),
-                resolved_at: "2026-05-28T12:02:00Z".to_string(),
+                thread_id: thread_id(),
+                resolved_at: timestamp("2026-05-28T12:02:00Z"),
                 author: author(),
             },
         ];
@@ -602,21 +677,21 @@ mod tests {
         let decoded = parse_events(&input).await.unwrap();
         let state = replay_events(&decoded, &payloads).unwrap();
 
-        assert!(state.threads["thr_test"].resolved);
+        assert!(state.threads[&thread_id()].resolved);
         assert_eq!(
-            state.threads["thr_test"].comments[0].body,
+            state.threads[&thread_id()].comments[0].body,
             "Needs a testable event log."
         );
     }
 
     #[test]
     fn payload_roundtrip() {
-        let payload = CommentPayload {
-            id: "cmt_test".to_string(),
-            thread_id: "thr_test".to_string(),
+        let payload = Comment {
+            id: comment_id(),
+            thread_id: thread_id(),
             author: author(),
             body: "hello".to_string(),
-            created_at: "2026-05-28T12:01:00Z".to_string(),
+            created_at: timestamp("2026-05-28T12:01:00Z"),
             edited_at: None,
             deleted_at: None,
         };

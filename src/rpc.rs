@@ -5,9 +5,9 @@ use crate::review_provider::ReviewProvider;
 
 pub use crate::realtime::ReviewUpdate;
 pub use crate::review_provider::{
-    ApiCommentThread, ApiCommit, ApiReviewComment, ApiReviewPayload, ApiThreadAnchor,
-    CommentRequest, CreateThreadRequest, EditCommentRequest, MarkFileViewedRequest,
-    SubmitReviewRequest, ThreadBodyRequest, ThreadRequest,
+    CommentRequest, CreateThreadRequest, EditCommentRequest, MarkFileViewedRequest, ReviewComment,
+    ReviewCommit, ReviewProjection, ReviewThread, ReviewThreadAnchor, SubmitReviewRequest,
+    ThreadBodyRequest, ThreadRequest,
 };
 
 #[derive(Debug, Error)]
@@ -18,58 +18,58 @@ enum ReviewApiError {
 
 #[vox::service]
 pub trait PeersReview {
-    async fn get_review(&self, token: String) -> std::result::Result<ApiReviewPayload, String>;
+    async fn get_review(&self, token: String) -> std::result::Result<ReviewProjection, String>;
     async fn subscribe_updates(
         &self,
         token: String,
         updates: vox::Tx<ReviewUpdate>,
     ) -> std::result::Result<(), String>;
-    async fn refresh_diff(&self, token: String) -> std::result::Result<ApiReviewPayload, String>;
+    async fn refresh_diff(&self, token: String) -> std::result::Result<ReviewProjection, String>;
     async fn create_thread(
         &self,
         token: String,
         request: CreateThreadRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
     async fn reply_to_thread(
         &self,
         token: String,
         request: ThreadBodyRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
     async fn edit_comment(
         &self,
         token: String,
         request: EditCommentRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
     async fn delete_comment(
         &self,
         token: String,
         request: CommentRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
     async fn delete_thread(
         &self,
         token: String,
         request: ThreadRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
     async fn resolve_thread(
         &self,
         token: String,
         request: ThreadRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
     async fn reopen_thread(
         &self,
         token: String,
         request: ThreadRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
     async fn mark_file_viewed(
         &self,
         token: String,
         request: MarkFileViewedRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
     async fn submit_review(
         &self,
         token: String,
         request: SubmitReviewRequest,
-    ) -> std::result::Result<ApiReviewPayload, String>;
+    ) -> std::result::Result<ReviewProjection, String>;
 }
 
 #[derive(Clone)]
@@ -92,7 +92,7 @@ impl ReviewApi {
 }
 
 impl PeersReview for ReviewApi {
-    async fn get_review(&self, token: String) -> std::result::Result<ApiReviewPayload, String> {
+    async fn get_review(&self, token: String) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider.get_review().await.map_err(format_error)
     }
@@ -114,7 +114,7 @@ impl PeersReview for ReviewApi {
         Ok(())
     }
 
-    async fn refresh_diff(&self, token: String) -> std::result::Result<ApiReviewPayload, String> {
+    async fn refresh_diff(&self, token: String) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider.refresh_diff().await.map_err(format_error)
     }
@@ -123,7 +123,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: CreateThreadRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .create_thread(request)
@@ -135,7 +135,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: ThreadBodyRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .reply_to_thread(request)
@@ -147,7 +147,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: EditCommentRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .edit_comment(request)
@@ -159,7 +159,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: CommentRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .delete_comment(request)
@@ -171,7 +171,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: ThreadRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .delete_thread(request)
@@ -183,7 +183,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: ThreadRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .resolve_thread(request)
@@ -195,7 +195,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: ThreadRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .reopen_thread(request)
@@ -207,7 +207,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: MarkFileViewedRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .mark_file_viewed(request)
@@ -219,7 +219,7 @@ impl PeersReview for ReviewApi {
         &self,
         token: String,
         request: SubmitReviewRequest,
-    ) -> std::result::Result<ApiReviewPayload, String> {
+    ) -> std::result::Result<ReviewProjection, String> {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .submit_review(request)

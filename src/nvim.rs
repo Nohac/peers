@@ -8,11 +8,12 @@ use tower_lsp_server::jsonrpc::{Error as LspError, Result as LspResult};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 
+use crate::comments::AuthorKind;
 use crate::diff::{DiffSection, FileSide, LineRange};
 use crate::review_provider::ReviewProvider;
 use crate::review_provider::{
-    ApiCommentThread, ApiReviewComment, ApiReviewPayload, CommentRequest, CreateThreadRequest,
-    EditCommentRequest, ThreadBodyRequest, ThreadRequest,
+    CommentRequest, CreateThreadRequest, EditCommentRequest, ReviewComment, ReviewProjection,
+    ReviewThread, ThreadBodyRequest, ThreadRequest,
 };
 
 const LOOPBACK_BIND_HOST: &str = "127.0.0.1";
@@ -561,8 +562,8 @@ impl RenderedRow {
     }
 
     fn comment(
-        thread: &ApiCommentThread,
-        comment: Option<&ApiReviewComment>,
+        thread: &ReviewThread,
+        comment: Option<&ReviewComment>,
         invalidates_later_activity: bool,
     ) -> Self {
         Self {
@@ -572,8 +573,8 @@ impl RenderedRow {
             source_line: thread.anchor.end_line,
             code_start_col: None,
             thread_id: Some(thread.id.clone()),
-            comment_id: comment.map(|comment| comment.id.clone()),
-            comment_body: comment.map(|comment| comment.body.clone()),
+            comment_id: comment.map(|comment| comment.comment.id.to_string()),
+            comment_body: comment.map(|comment| comment.comment.body.clone()),
             can_edit: comment.map(|comment| comment.can_edit),
             invalidates_later_activity: comment.map(|_| invalidates_later_activity),
             resolved: Some(thread.resolved),
@@ -656,7 +657,7 @@ struct RenderedSymbol {
     parent: Option<usize>,
 }
 
-fn render_review_payload(review: ApiReviewPayload) -> RenderedReview {
+fn render_review_payload(review: ReviewProjection) -> RenderedReview {
     let mut rendered = RenderedReview {
         lines: Vec::new(),
         rows: Vec::new(),
@@ -959,7 +960,7 @@ fn push_source_line(
 
 fn push_attachment_highlights(
     rendered: &mut RenderedReview,
-    threads: &[&ApiCommentThread],
+    threads: &[&ReviewThread],
     path: &str,
     side: &str,
     line: u32,
@@ -990,7 +991,7 @@ fn push_attachment_highlights(
 
 fn push_inline_threads(
     rendered: &mut RenderedReview,
-    threads: &[&ApiCommentThread],
+    threads: &[&ReviewThread],
     path: &str,
     side: &str,
     line: u32,
@@ -1004,14 +1005,14 @@ fn push_inline_threads(
     }
 }
 
-fn thread_matches_line(thread: &ApiCommentThread, path: &str, side: &str, line: u32) -> bool {
+fn thread_matches_line(thread: &ReviewThread, path: &str, side: &str, line: u32) -> bool {
     thread.scope == THREAD_SCOPE_LINE
         && thread.path.as_deref() == Some(path)
         && thread.anchor.side.as_deref() == Some(side)
         && thread.anchor.end_line == Some(line)
 }
 
-fn thread_covers_line(thread: &ApiCommentThread, path: &str, side: &str, line: u32) -> bool {
+fn thread_covers_line(thread: &ReviewThread, path: &str, side: &str, line: u32) -> bool {
     if thread.scope != THREAD_SCOPE_LINE
         || thread.path.as_deref() != Some(path)
         || thread.anchor.side.as_deref() != Some(side)
@@ -1024,7 +1025,7 @@ fn thread_covers_line(thread: &ApiCommentThread, path: &str, side: &str, line: u
     matches!((start, end), (Some(start), Some(end)) if line >= start && line <= end)
 }
 
-fn push_thread_block(rendered: &mut RenderedReview, thread: &ApiCommentThread) {
+fn push_thread_block(rendered: &mut RenderedReview, thread: &ReviewThread) {
     let status = if thread.resolved {
         COMMENT_STATUS_RESOLVED
     } else {
@@ -1051,20 +1052,20 @@ fn push_thread_block(rendered: &mut RenderedReview, thread: &ApiCommentThread) {
 
     for (index, comment) in thread.comments.iter().enumerate() {
         let invalidates_later_activity = index + 1 < thread.comments.len() || thread.resolved;
-        let marker = if comment.author_kind == "agent" {
+        let marker = if comment.comment.author.kind == AuthorKind::Agent {
             COMMENT_AGENT_MARKER
         } else {
             ""
         };
         let mut meta = format!(
             "{THREAD_BODY_PREFIX}{}{marker}{COMMENT_META_SEPARATOR}{}",
-            comment.author_name,
-            comment_timestamp(&comment.created_at)
+            comment.comment.author.display_name,
+            comment_timestamp(comment.comment.created_at.as_str())
         );
-        if let Some(edited_at) = &comment.edited_at {
+        if let Some(edited_at) = &comment.comment.edited_at {
             meta.push_str(&format!(
                 "{COMMENT_META_SEPARATOR}{COMMENT_EDITED_LABEL} {}",
-                comment_timestamp(edited_at)
+                comment_timestamp(edited_at.as_str())
             ));
         }
         push_thread_line(
@@ -1076,7 +1077,7 @@ fn push_thread_block(rendered: &mut RenderedReview, thread: &ApiCommentThread) {
             HIGHLIGHT_THREAD_META,
         );
 
-        for line in wrap_comment_body(&comment.body) {
+        for line in wrap_comment_body(&comment.comment.body) {
             push_thread_line(
                 rendered,
                 format!("{THREAD_BODY_PREFIX}{line}"),
@@ -1111,8 +1112,8 @@ fn push_thread_block(rendered: &mut RenderedReview, thread: &ApiCommentThread) {
 fn push_thread_line(
     rendered: &mut RenderedReview,
     line_text: String,
-    thread: &ApiCommentThread,
-    comment: Option<&ApiReviewComment>,
+    thread: &ReviewThread,
+    comment: Option<&ReviewComment>,
     invalidates_later_activity: bool,
     group: &'static str,
 ) {

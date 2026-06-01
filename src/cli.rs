@@ -486,6 +486,7 @@ async fn handle_clean(
     repo_root: &Path,
     author: crate::comments::Author,
 ) -> Result<()> {
+    validate_clean_args(&args)?;
     let state = load_peers_state(repo_root).await?;
     let candidates = clean_candidates(&state);
 
@@ -530,10 +531,28 @@ async fn handle_clean(
     }
 
     println!("Archived clean candidates.");
-    let _ = args.status;
-    let _ = args.older_than;
-    let _ = args.detached;
-    let _ = args.hidden;
+    Ok(())
+}
+
+fn validate_clean_args(args: &CleanArgs) -> Result<()> {
+    match args.status {
+        CleanStatus::Complete => {}
+    }
+    if let Some(older_than) = &args.older_than {
+        return Err(anyhow!(
+            "`peers clean --older-than {older_than}` is specified but age-based cleanup is not implemented yet"
+        ));
+    }
+    if args.detached {
+        return Err(anyhow!(
+            "`peers clean --detached` is specified but detached cleanup candidates are not implemented yet"
+        ));
+    }
+    if args.hidden {
+        return Err(anyhow!(
+            "`peers clean --hidden` is specified but projection-hidden cleanup candidates are not implemented yet"
+        ));
+    }
     Ok(())
 }
 
