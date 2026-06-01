@@ -2762,15 +2762,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "peers-typescript"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "peers",
- "vox-codegen",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3619,18 +3610,6 @@ dependencies = [
  "vox-stream",
  "vox-types",
  "vox-websocket",
-]
-
-[[package]]
-name = "vox-codegen"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ea428dceb5a721d59340e0738b3d2e017233013cb910073a172107ae87282bd"
-dependencies = [
- "facet-cbor",
- "facet-core",
- "heck",
- "vox-types",
 ]
 
 [[package]]

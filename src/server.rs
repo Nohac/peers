@@ -17,9 +17,7 @@ use crate::rpc::{PeersReviewDispatcher, ReviewApi};
 
 const LOOPBACK_BIND_HOST: &str = "127.0.0.1";
 const LOCALHOST: &str = "localhost";
-const FRONTEND_PORT: u16 = 3000;
 const VOX_SCHEME: &str = "ws";
-const HTTP_SCHEME: &str = "http";
 const VOX_BIND_ERROR: &str = "failed to bind local Peers Vox server";
 const SESSION_ENCODE_ERROR: &str = "failed to encode Peers session info";
 const SIGTERM_HANDLER_ERROR: &str = "failed to install SIGTERM handler";
@@ -69,14 +67,6 @@ impl LocalServer {
         self.nvim_lsp.url()
     }
 
-    pub fn frontend_url(&self) -> String {
-        format!(
-            "{HTTP_SCHEME}://{LOCALHOST}:{FRONTEND_PORT}/?vox={}&token={}",
-            self.vox_url(),
-            self.token
-        )
-    }
-
     pub async fn run_until_shutdown(self) -> Result<()> {
         let Self {
             listener,
@@ -97,11 +87,7 @@ impl LocalServer {
                 listener.local_addr()?.port()
             ),
             nvim_lsp_url: nvim_lsp.url(),
-            frontend_url: format!(
-                "{HTTP_SCHEME}://{LOCALHOST}:{FRONTEND_PORT}/?vox={VOX_SCHEME}://{LOCALHOST}:{}&token={}",
-                listener.local_addr()?.port(),
-                token
-            ),
+            frontend_url: None,
             token: token.clone(),
             realtime: true,
             nvim_listen: nvim_listen.clone(),
@@ -147,7 +133,7 @@ struct ReviewSessionInfo {
     view_kind: String,
     vox_url: String,
     nvim_lsp_url: String,
-    frontend_url: String,
+    frontend_url: Option<String>,
     token: String,
     realtime: bool,
     nvim_listen: Option<String>,

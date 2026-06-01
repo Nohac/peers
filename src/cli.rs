@@ -17,9 +17,6 @@ use crate::review_provider::{
 
 const VOX_RPC_LABEL: &str = "Vox RPC";
 const NEOVIM_LSP_LABEL: &str = "Neovim LSP";
-const REVIEW_UI_LABEL: &str = "Review UI";
-const FRONTEND_DEV_HINT: &str =
-    "Run `cd frontend && bun run dev` in another terminal, then open the Review UI URL.";
 const SESSION_STOP_HINT: &str = "Press Ctrl-C to stop the local Peers session.";
 const REVIEW_LABEL: &str = "Review";
 const TARGET_LABEL: &str = "Target";
@@ -309,8 +306,6 @@ async fn open_review_session(
             .await?;
     println!("{VOX_RPC_LABEL}: {}", server.vox_url());
     println!("{NEOVIM_LSP_LABEL}: {}", server.nvim_lsp_url());
-    println!("{REVIEW_UI_LABEL}: {}", server.frontend_url());
-    println!("{FRONTEND_DEV_HINT}");
     println!("{SESSION_STOP_HINT}");
     server.run_until_shutdown().await
 }
