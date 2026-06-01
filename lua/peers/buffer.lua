@@ -1,4 +1,5 @@
 local lsp = require("peers.lsp")
+local sidebar = require("peers.sidebar")
 
 local M = {}
 
@@ -1061,8 +1062,9 @@ local function setup_mirror_autocmds(buf)
   state.augroup = vim.api.nvim_create_augroup(AUTOCMD_GROUP_PREFIX .. buf, { clear = true })
   vim.api.nvim_create_autocmd(AUTOCMD_EVENTS, {
     group = state.augroup,
-    callback = function()
+    callback = function(args)
       schedule_visible_mirror(buf)
+      sidebar.update(buf, RENDER_STATES, false, args.event)
     end,
   })
   vim.api.nvim_create_autocmd(VIEW_SAVE_EVENTS, {
@@ -1076,6 +1078,7 @@ local function setup_mirror_autocmds(buf)
     group = state.augroup,
     buffer = buf,
     callback = function()
+      sidebar.mark_review_active(buf, RENDER_STATES)
       restore_current_view(buf)
       flush_pending_refresh(buf)
     end,
@@ -1084,6 +1087,10 @@ local function setup_mirror_autocmds(buf)
     group = state.augroup,
     buffer = buf,
     callback = function()
+      local current = RENDER_STATES[buf]
+      if current then
+        sidebar.detach(current)
+      end
       RENDER_STATES[buf] = nil
     end,
   })
@@ -1244,6 +1251,7 @@ function apply_render(root, buf, render, client_id)
   RENDER_STATES[buf] = {
     root = root,
     client_id = client_id,
+    lines = render.lines or {},
     rows = render.rows or {},
     source_buffers = {},
     source_lsp_buffers = {},
@@ -1252,8 +1260,19 @@ function apply_render(root, buf, render, client_id)
     pending_refresh = existing and existing.pending_refresh or false,
     refresh_retry_scheduled = existing and existing.refresh_retry_scheduled or false,
     view = remembered_view,
+    sidebar_buf = existing and existing.sidebar_buf or nil,
+    sidebar_win = existing and existing.sidebar_win or nil,
+    sidebar_mode = existing and existing.sidebar_mode or sidebar.MODE_FILES,
+    sidebar_requested = existing and existing.sidebar_requested,
+    sidebar_cursor_by_mode = existing and existing.sidebar_cursor_by_mode or {},
+    sidebar_augroup = existing and existing.sidebar_augroup or nil,
+    sidebar_has_focus = existing and existing.sidebar_has_focus or false,
   }
+  if existing == nil then
+    RENDER_STATES[buf].sidebar_requested = true
+  end
   restore_buffer_cursor_anchors(buf, cursor_anchors, render.rows or {})
+  sidebar.update(buf, RENDER_STATES, false)
   setup_mirror_autocmds(buf)
   mirror_visible_treesitter(buf)
 end
@@ -1424,6 +1443,10 @@ function M.is_review_buffer(buf)
   return RENDER_STATES[buf or vim.api.nvim_get_current_buf()] ~= nil
 end
 
+function M.remember_current_view(buf)
+  save_current_view(buf or vim.api.nvim_get_current_buf())
+end
+
 function M.open_source_at_cursor(buf)
   buf = buf or vim.api.nvim_get_current_buf()
   local state = RENDER_STATES[buf]
@@ -1506,6 +1529,7 @@ local function set_review_keymaps(buf)
     desc = OPEN_SOURCE_DESC,
     nowait = true,
   })
+  sidebar.set_review_keymaps(buf, RENDER_STATES)
 end
 
 function M.open(root, review_id, session)
