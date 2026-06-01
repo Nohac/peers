@@ -57,7 +57,6 @@ Create and manage comments:
 peers comment list
 peers comment list --status open
 peers comment list --status complete
-peers comment list current rev_123
 peers comment add --path src/foo.rs --side new --lines 42:47 --body "This needs validation."
 peers comment reply thr_123 --body "Fixed in the latest change."
 peers comment resolve thr_123
@@ -73,16 +72,14 @@ peers agent-context
 Neovim session usage:
 
 ```bash
-peers nvim
-peers nvim diff
-peers nvim diff --cached
-peers nvim diff --all
-peers nvim review --base main --head HEAD
-peers nvim --review rev_123
+peers diff
+peers diff --cached
+peers diff --all
+peers review --base main --head HEAD
 ```
 
-This starts the local Peers session for a review and prints the Vox and `peersdiff` LSP endpoints that a Neovim integration can attach to.
-The same connection details are written to `.peers/reviews/<review-id>/session.json` while the session is running.
+This starts the local Peers session for a repo-scoped projection and prints the Vox and `peersdiff` LSP endpoints that a Neovim integration can attach to.
+The same connection details are written to `.peers/session.json` while the session is running.
 
 Neovim plugin usage:
 
@@ -130,15 +127,18 @@ Reviews are planned to be stored in the reviewed repository:
 
 ```text
 .peers/
-  current
-  reviews/
-    rev_20260528_121530_a1b2c3/
-      events.jsonl
-      review.md
-      agent-context.md
+  events.jsonl
+  threads/
+    thr_123/
+      thread.json
+      comments/
+        cmt_123.json
+  session.json
+  review.md
+  agent-context.md
 ```
 
-`events.jsonl` is the canonical append-only review log. Markdown files are generated for humans and agents.
+`events.jsonl` is the canonical append-only action log. Thread/comment payload files hold bodies and anchors. Markdown files are generated for humans and agents.
 
 ## Development
 

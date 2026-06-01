@@ -43,52 +43,28 @@ impl Author {
 #[derive(Clone, Debug, Facet, PartialEq)]
 #[repr(C)]
 #[facet(tag = "kind", rename_all = "snake_case")]
-pub enum ReviewEvent {
-    ReviewCreated {
-        review_id: String,
-        created_at: String,
-        author: Author,
-        target: ReviewTarget,
-    },
-    ReviewDiffBaseCaptured {
-        review_id: String,
-        captured_at: String,
-        base_oid: Option<String>,
-    },
-    ReviewMetadataUpdated {
-        review_id: String,
-        updated_at: String,
-        author: Author,
-        title: Option<String>,
-    },
+pub enum PeersEvent {
     ThreadCreated {
         thread_id: String,
         comment_id: String,
         created_at: String,
         author: Author,
-        anchor: CommentAnchor,
-        body: String,
     },
     CommentAdded {
         thread_id: String,
         comment_id: String,
         created_at: String,
         author: Author,
-        body: String,
     },
     CommentEdited {
+        thread_id: String,
         comment_id: String,
         edited_at: String,
         author: Author,
-        body: String,
     },
     CommentDeleted {
-        comment_id: String,
-        deleted_at: String,
-        author: Author,
-    },
-    ThreadDeleted {
         thread_id: String,
+        comment_id: String,
         deleted_at: String,
         author: Author,
     },
@@ -102,24 +78,79 @@ pub enum ReviewEvent {
         reopened_at: String,
         author: Author,
     },
-    ThreadAnchored {
+    ThreadArchived {
         thread_id: String,
-        anchored_at: String,
+        archived_at: String,
         author: Author,
-        anchor: CommentAnchor,
+        reason: Option<String>,
     },
-    FileMarkedViewed {
-        path: String,
-        viewed: bool,
-        marked_at: String,
+    ThreadPruned {
+        thread_id: String,
+        pruned_at: String,
         author: Author,
+        reason: Option<String>,
     },
-    ReviewSubmitted {
-        review_id: String,
-        submitted_at: String,
-        author: Author,
-        body: Option<String>,
-    },
+}
+
+pub type ReviewEvent = PeersEvent;
+
+#[derive(Clone, Debug, Facet, PartialEq)]
+#[repr(u8)]
+#[facet(rename_all = "snake_case")]
+pub enum ThreadStatus {
+    Open,
+    Resolved,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq)]
+pub struct CreationProvenance {
+    pub view_kind: String,
+    pub branch: Option<String>,
+    pub head_oid: Option<String>,
+    pub merge_base_oid: Option<String>,
+}
+
+impl CreationProvenance {
+    pub fn from_target(target: &ReviewTarget) -> Self {
+        Self {
+            view_kind: target.label(),
+            branch: match target {
+                ReviewTarget::Branch { head, .. } => Some(head.clone()),
+                _ => None,
+            },
+            head_oid: None,
+            merge_base_oid: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Facet, PartialEq)]
+pub struct ThreadPayload {
+    pub id: String,
+    pub status: ThreadStatus,
+    pub anchor: CommentAnchor,
+    pub created_at: String,
+    pub updated_at: String,
+    pub provenance: CreationProvenance,
+    pub archived_at: Option<String>,
+    pub pruned_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq)]
+pub struct CommentPayload {
+    pub id: String,
+    pub thread_id: String,
+    pub author: Author,
+    pub body: String,
+    pub created_at: String,
+    pub edited_at: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PayloadStore {
+    pub threads: BTreeMap<String, ThreadPayload>,
+    pub comments: BTreeMap<String, CommentPayload>,
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
@@ -143,6 +174,20 @@ impl Comment {
     }
 }
 
+impl From<CommentPayload> for Comment {
+    fn from(payload: CommentPayload) -> Self {
+        Self {
+            id: payload.id,
+            thread_id: payload.thread_id,
+            author: payload.author,
+            body: payload.body,
+            created_at: payload.created_at,
+            edited_at: payload.edited_at,
+            deleted_at: payload.deleted_at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Facet, PartialEq)]
 pub struct CommentThread {
     pub id: String,
@@ -151,37 +196,33 @@ pub struct CommentThread {
     pub resolved: bool,
     pub created_at: String,
     pub updated_at: String,
+    pub archived_at: Option<String>,
+    pub pruned_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ReviewState {
-    pub review_id: Option<String>,
-    pub target: Option<ReviewTarget>,
-    pub diff_base_oid: Option<Option<String>>,
-    pub created_at: Option<String>,
-    pub author: Option<Author>,
-    pub title: Option<String>,
+pub struct PeersState {
     pub threads: BTreeMap<String, CommentThread>,
-    pub viewed_files: BTreeMap<String, bool>,
-    pub submitted_at: Option<String>,
 }
 
-impl ReviewState {
+impl PeersState {
     pub fn unresolved_threads(&self) -> impl Iterator<Item = &CommentThread> {
-        self.threads.values().filter(|thread| !thread.resolved)
+        self.threads
+            .values()
+            .filter(|thread| !thread.resolved && thread.archived_at.is_none())
     }
 }
 
 #[cfg(test)]
-async fn parse_events(input: &str) -> Result<Vec<ReviewEvent>> {
+async fn parse_events(input: &str) -> Result<Vec<PeersEvent>> {
     let mut events = Vec::new();
     for (index, line) in input.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let event = facet_json::from_str::<ReviewEvent>(line)
-            .with_context(|| format!("failed to parse review event on line {}", index + 1))?;
+        let event = facet_json::from_str::<PeersEvent>(line)
+            .with_context(|| format!("failed to parse Peers event on line {}", index + 1))?;
         events.push(event);
     }
     Ok(events)
@@ -189,7 +230,7 @@ async fn parse_events(input: &str) -> Result<Vec<ReviewEvent>> {
 
 pub async fn parse_events_from_reader(
     reader: impl AsyncBufRead + Unpin,
-) -> Result<Vec<ReviewEvent>> {
+) -> Result<Vec<PeersEvent>> {
     let mut lines = reader.lines();
     let mut events = Vec::new();
     let mut line_number = 0usize;
@@ -200,149 +241,144 @@ pub async fn parse_events_from_reader(
         if line.is_empty() {
             continue;
         }
-        let event = facet_json::from_str::<ReviewEvent>(line)
-            .with_context(|| format!("failed to parse review event on line {line_number}"))?;
+        let event = facet_json::from_str::<PeersEvent>(line)
+            .with_context(|| format!("failed to parse Peers event on line {line_number}"))?;
         events.push(event);
     }
 
     Ok(events)
 }
 
-pub fn encode_event(event: &ReviewEvent) -> Result<String> {
-    facet_json::to_string(event).context("failed to encode review event")
+pub fn encode_event(event: &PeersEvent) -> Result<String> {
+    facet_json::to_string(event).context("failed to encode Peers event")
 }
 
-pub fn replay_events(events: &[ReviewEvent]) -> Result<ReviewState> {
-    let mut state = ReviewState::default();
+pub fn encode_thread_payload(payload: &ThreadPayload) -> Result<String> {
+    facet_json::to_string(payload).context("failed to encode thread payload")
+}
+
+pub fn decode_thread_payload(input: &str) -> Result<ThreadPayload> {
+    facet_json::from_str(input).context("failed to decode thread payload")
+}
+
+pub fn encode_comment_payload(payload: &CommentPayload) -> Result<String> {
+    facet_json::to_string(payload).context("failed to encode comment payload")
+}
+
+pub fn decode_comment_payload(input: &str) -> Result<CommentPayload> {
+    facet_json::from_str(input).context("failed to decode comment payload")
+}
+
+pub fn replay_events(events: &[PeersEvent], payloads: &PayloadStore) -> Result<PeersState> {
+    let mut state = PeersState::default();
 
     for event in events {
-        apply_event(&mut state, event)?;
+        apply_event(&mut state, payloads, event)?;
     }
 
     Ok(state)
 }
 
-fn apply_event(state: &mut ReviewState, event: &ReviewEvent) -> Result<()> {
+fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEvent) -> Result<()> {
     match event {
-        ReviewEvent::ReviewCreated {
-            review_id,
-            created_at,
-            author,
-            target,
-        } => {
-            state.review_id = Some(review_id.clone());
-            state.created_at = Some(created_at.clone());
-            state.author = Some(author.clone());
-            state.target = Some(target.clone());
-        }
-        ReviewEvent::ReviewDiffBaseCaptured { base_oid, .. } => {
-            state.diff_base_oid = Some(base_oid.clone());
-        }
-        ReviewEvent::ReviewMetadataUpdated { title, .. } => {
-            state.title.clone_from(title);
-        }
-        ReviewEvent::ThreadCreated {
+        PeersEvent::ThreadCreated {
             thread_id,
             comment_id,
-            created_at,
-            author,
-            anchor,
-            body,
+            ..
         } => {
-            let comment = Comment {
-                id: comment_id.clone(),
-                thread_id: thread_id.clone(),
-                author: author.clone(),
-                body: body.clone(),
-                created_at: created_at.clone(),
-                edited_at: None,
-                deleted_at: None,
-            };
+            let payload = payloads
+                .threads
+                .get(thread_id)
+                .ok_or_else(|| anyhow!("thread event references missing payload `{thread_id}`"))?;
+            let comment = payloads.comments.get(comment_id).ok_or_else(|| {
+                anyhow!("thread event references missing comment payload `{comment_id}`")
+            })?;
             state.threads.insert(
                 thread_id.clone(),
                 CommentThread {
-                    id: thread_id.clone(),
-                    anchor: anchor.clone(),
-                    comments: vec![comment],
-                    resolved: false,
-                    created_at: created_at.clone(),
-                    updated_at: created_at.clone(),
+                    id: payload.id.clone(),
+                    anchor: payload.anchor.clone(),
+                    comments: visible_comments(vec![comment.clone().into()]),
+                    resolved: payload.status == ThreadStatus::Resolved,
+                    created_at: payload.created_at.clone(),
+                    updated_at: payload.updated_at.clone(),
+                    archived_at: payload.archived_at.clone(),
+                    pruned_at: payload.pruned_at.clone(),
                 },
             );
         }
-        ReviewEvent::CommentAdded {
+        PeersEvent::CommentAdded {
             thread_id,
             comment_id,
             created_at,
-            author,
-            body,
+            ..
         } => {
+            let comment = payloads.comments.get(comment_id).ok_or_else(|| {
+                anyhow!("comment event references missing payload `{comment_id}`")
+            })?;
             let thread = state
                 .threads
                 .get_mut(thread_id)
                 .ok_or_else(|| anyhow!("comment references unknown thread `{thread_id}`"))?;
-            thread.comments.push(Comment {
-                id: comment_id.clone(),
-                thread_id: thread_id.clone(),
-                author: author.clone(),
-                body: body.clone(),
-                created_at: created_at.clone(),
-                edited_at: None,
-                deleted_at: None,
-            });
+            thread.comments.push(comment.clone().into());
+            thread.comments = visible_comments(std::mem::take(&mut thread.comments));
             thread.updated_at = created_at.clone();
         }
-        ReviewEvent::CommentEdited {
+        PeersEvent::CommentEdited {
+            thread_id,
             comment_id,
             edited_at,
-            body,
             ..
         } => {
-            let (thread_id, comment_index) = find_comment_location(state, comment_id)?;
+            let payload = payloads
+                .comments
+                .get(comment_id)
+                .ok_or_else(|| anyhow!("edit references missing comment payload `{comment_id}`"))?;
             let thread = state
                 .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| anyhow!("unknown thread `{thread_id}`"))?;
-            thread.comments.truncate(comment_index + 1);
-            let comment = thread
+                .get_mut(thread_id)
+                .ok_or_else(|| anyhow!("edit references unknown thread `{thread_id}`"))?;
+            let comment_index = thread
                 .comments
-                .get_mut(comment_index)
+                .iter()
+                .position(|comment| comment.id == *comment_id)
                 .ok_or_else(|| anyhow!("unknown comment `{comment_id}`"))?;
-            comment.body = body.clone();
-            comment.edited_at = Some(edited_at.clone());
+            thread.comments.truncate(comment_index + 1);
+            thread.comments[comment_index] = payload.clone().into();
             thread.resolved = false;
             thread.updated_at = edited_at.clone();
         }
-        ReviewEvent::CommentDeleted {
+        PeersEvent::CommentDeleted {
+            thread_id,
             comment_id,
             deleted_at,
             ..
         } => {
-            let (thread_id, comment_index) = find_comment_location(state, comment_id)?;
+            let payload = payloads.comments.get(comment_id).ok_or_else(|| {
+                anyhow!("delete references missing comment payload `{comment_id}`")
+            })?;
             let remove_thread = {
                 let thread = state
                     .threads
-                    .get_mut(&thread_id)
-                    .ok_or_else(|| anyhow!("unknown thread `{thread_id}`"))?;
-                thread.comments.truncate(comment_index + 1);
-                if let Some(comment) = thread.comments.get_mut(comment_index) {
-                    comment.deleted_at = Some(deleted_at.clone());
-                }
-                thread
+                    .get_mut(thread_id)
+                    .ok_or_else(|| anyhow!("delete references unknown thread `{thread_id}`"))?;
+                let comment_index = thread
                     .comments
-                    .retain(|comment| comment.deleted_at.is_none());
+                    .iter()
+                    .position(|comment| comment.id == *comment_id)
+                    .ok_or_else(|| anyhow!("unknown comment `{comment_id}`"))?;
+                thread.comments.truncate(comment_index + 1);
+                thread.comments[comment_index] = payload.clone().into();
+                thread.comments = visible_comments(std::mem::take(&mut thread.comments));
                 thread.resolved = false;
                 thread.updated_at = deleted_at.clone();
                 thread.comments.is_empty()
             };
             if remove_thread {
-                state.threads.remove(&thread_id);
+                state.threads.remove(thread_id);
             }
         }
-        ReviewEvent::ThreadDeleted { thread_id, .. } => {
-            state.threads.remove(thread_id);
-        }
-        ReviewEvent::ThreadResolved {
+        PeersEvent::ThreadResolved {
             thread_id,
             resolved_at,
             ..
@@ -354,7 +390,7 @@ fn apply_event(state: &mut ReviewState, event: &ReviewEvent) -> Result<()> {
             thread.resolved = true;
             thread.updated_at = resolved_at.clone();
         }
-        ReviewEvent::ThreadReopened {
+        PeersEvent::ThreadReopened {
             thread_id,
             reopened_at,
             ..
@@ -366,56 +402,51 @@ fn apply_event(state: &mut ReviewState, event: &ReviewEvent) -> Result<()> {
             thread.resolved = false;
             thread.updated_at = reopened_at.clone();
         }
-        ReviewEvent::ThreadAnchored {
+        PeersEvent::ThreadArchived {
             thread_id,
-            anchored_at,
-            anchor,
+            archived_at,
             ..
         } => {
             let thread = state
                 .threads
                 .get_mut(thread_id)
-                .ok_or_else(|| anyhow!("anchor update references unknown thread `{thread_id}`"))?;
-            thread.anchor = anchor.clone();
-            thread.updated_at = anchored_at.clone();
+                .ok_or_else(|| anyhow!("archive references unknown thread `{thread_id}`"))?;
+            thread.archived_at = Some(archived_at.clone());
+            thread.updated_at = archived_at.clone();
         }
-        ReviewEvent::FileMarkedViewed { path, viewed, .. } => {
-            state.viewed_files.insert(path.clone(), *viewed);
-        }
-        ReviewEvent::ReviewSubmitted { submitted_at, .. } => {
-            state.submitted_at = Some(submitted_at.clone());
+        PeersEvent::ThreadPruned {
+            thread_id,
+            pruned_at,
+            ..
+        } => {
+            let thread = state
+                .threads
+                .get_mut(thread_id)
+                .ok_or_else(|| anyhow!("prune references unknown thread `{thread_id}`"))?;
+            thread.pruned_at = Some(pruned_at.clone());
+            thread.updated_at = pruned_at.clone();
         }
     }
 
     Ok(())
 }
 
-fn find_comment_location(state: &ReviewState, comment_id: &str) -> Result<(String, usize)> {
-    state
-        .threads
-        .iter()
-        .find_map(|(thread_id, thread)| {
-            thread
-                .comments
-                .iter()
-                .position(|comment| comment.id == comment_id)
-                .map(|index| (thread_id.clone(), index))
-        })
-        .ok_or_else(|| anyhow!("unknown comment `{comment_id}`"))
+fn visible_comments(comments: Vec<Comment>) -> Vec<Comment> {
+    comments
+        .into_iter()
+        .filter(|comment| comment.deleted_at.is_none())
+        .collect()
 }
 
 pub async fn render_agent_context(
-    state: &ReviewState,
+    state: &PeersState,
+    target: Option<&ReviewTarget>,
     mut out: impl AsyncWrite + Unpin,
 ) -> Result<()> {
-    let title = state
-        .review_id
-        .as_deref()
-        .map_or("Peers Review", |review_id| review_id);
-    out.write_all(format!("# Peers Review\n\nReview: {title}\n").as_bytes())
+    out.write_all(b"# Peers Review\n\nReview: repo-scoped comments\n")
         .await?;
 
-    if let Some(target) = &state.target {
+    if let Some(target) = target {
         out.write_all(format!("Target: {}\n", target.label()).as_bytes())
             .await?;
     }
@@ -434,11 +465,7 @@ pub async fn render_agent_context(
             .await?;
         out.write_all(format!("Thread: `{}`\n\n", thread.id).as_bytes())
             .await?;
-        for comment in thread
-            .comments
-            .iter()
-            .filter(|comment| comment.deleted_at.is_none())
-        {
+        for comment in &thread.comments {
             out.write_all(
                 format!(
                     "- {} ({:?}) at {}: {}\n",
@@ -458,16 +485,13 @@ pub async fn render_agent_context(
 }
 
 pub async fn render_review_markdown(
-    state: &ReviewState,
+    state: &PeersState,
+    target: Option<&ReviewTarget>,
     mut out: impl AsyncWrite + Unpin,
 ) -> Result<()> {
-    let title = state
-        .review_id
-        .as_deref()
-        .map_or("Peers Review", |review_id| review_id);
-    out.write_all(format!("# {title}\n\n").as_bytes()).await?;
+    out.write_all(b"# Peers Review\n\n").await?;
 
-    if let Some(target) = &state.target {
+    if let Some(target) = target {
         out.write_all(format!("Target: `{}`\n\n", target.label()).as_bytes())
             .await?;
     }
@@ -528,31 +552,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_roundtrip_replays_thread_state() {
+    async fn event_roundtrip_replays_payload_state() {
         let anchor = CommentAnchor::Line {
             line: LineAnchor::new("src/main.rs".to_string(), FileSide::New, 4, 6),
         };
+        let thread = ThreadPayload {
+            id: "thr_test".to_string(),
+            status: ThreadStatus::Open,
+            anchor,
+            created_at: "2026-05-28T12:01:00Z".to_string(),
+            updated_at: "2026-05-28T12:01:00Z".to_string(),
+            provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
+            archived_at: None,
+            pruned_at: None,
+        };
+        let comment = CommentPayload {
+            id: "cmt_test".to_string(),
+            thread_id: "thr_test".to_string(),
+            author: author(),
+            body: "Needs a testable event log.".to_string(),
+            created_at: "2026-05-28T12:01:00Z".to_string(),
+            edited_at: None,
+            deleted_at: None,
+        };
+        let payloads = PayloadStore {
+            threads: BTreeMap::from([(thread.id.clone(), thread)]),
+            comments: BTreeMap::from([(comment.id.clone(), comment)]),
+        };
         let events = vec![
-            ReviewEvent::ReviewCreated {
-                review_id: "rev_test".to_string(),
-                created_at: "2026-05-28T12:00:00Z".to_string(),
-                author: author(),
-                target: ReviewTarget::WorkingTree,
-            },
-            ReviewEvent::ReviewDiffBaseCaptured {
-                review_id: "rev_test".to_string(),
-                captured_at: "2026-05-28T12:00:01Z".to_string(),
-                base_oid: Some("abc123".to_string()),
-            },
-            ReviewEvent::ThreadCreated {
+            PeersEvent::ThreadCreated {
                 thread_id: "thr_test".to_string(),
                 comment_id: "cmt_test".to_string(),
                 created_at: "2026-05-28T12:01:00Z".to_string(),
                 author: author(),
-                anchor,
-                body: "Needs a testable event log.".to_string(),
             },
-            ReviewEvent::ThreadResolved {
+            PeersEvent::ThreadResolved {
                 thread_id: "thr_test".to_string(),
                 resolved_at: "2026-05-28T12:02:00Z".to_string(),
                 author: author(),
@@ -566,10 +600,27 @@ mod tests {
             .unwrap()
             .join("\n");
         let decoded = parse_events(&input).await.unwrap();
-        let state = replay_events(&decoded).unwrap();
+        let state = replay_events(&decoded, &payloads).unwrap();
 
-        assert_eq!(state.review_id.as_deref(), Some("rev_test"));
-        assert_eq!(state.diff_base_oid, Some(Some("abc123".to_string())));
         assert!(state.threads["thr_test"].resolved);
+        assert_eq!(
+            state.threads["thr_test"].comments[0].body,
+            "Needs a testable event log."
+        );
+    }
+
+    #[test]
+    fn payload_roundtrip() {
+        let payload = CommentPayload {
+            id: "cmt_test".to_string(),
+            thread_id: "thr_test".to_string(),
+            author: author(),
+            body: "hello".to_string(),
+            created_at: "2026-05-28T12:01:00Z".to_string(),
+            edited_at: None,
+            deleted_at: None,
+        };
+        let encoded = encode_comment_payload(&payload).unwrap();
+        assert_eq!(decode_comment_payload(&encoded).unwrap(), payload);
     }
 }

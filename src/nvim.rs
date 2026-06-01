@@ -200,7 +200,7 @@ impl PeersDiffLanguageServer {
                     .count();
                 format!(
                     "{REVIEW_HOVER_TITLE} `{}`\n\n{TARGET_LABEL}: `{}`\n{AUTHOR_LABEL}: `{}`\n{FILES_LABEL}: `{}`\n{THREADS_LABEL}: `{}` {TOTAL_THREADS_LABEL}, `{}` {UNRESOLVED_THREADS_LABEL}",
-                    review.review_id,
+                    "repo",
                     review.target_label,
                     self.provider.author().display_name,
                     review.files.len(),
@@ -208,10 +208,9 @@ impl PeersDiffLanguageServer {
                     unresolved_count
                 )
             }
-            Err(error) => format!(
-                "{REVIEW_HOVER_TITLE} `{}`\n\n{LOAD_REVIEW_STATE_ERROR}: {error:#}",
-                self.provider.review_id()
-            ),
+            Err(error) => {
+                format!("{REVIEW_HOVER_TITLE} `repo`\n\n{LOAD_REVIEW_STATE_ERROR}: {error:#}")
+            }
         }
     }
 
@@ -506,6 +505,7 @@ struct RenderedRow {
     can_edit: Option<bool>,
     invalidates_later_activity: Option<bool>,
     resolved: Option<bool>,
+    placement_state: Option<&'static str>,
 }
 
 impl RenderedRow {
@@ -522,6 +522,7 @@ impl RenderedRow {
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
+            placement_state: None,
         }
     }
 
@@ -538,6 +539,7 @@ impl RenderedRow {
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
+            placement_state: Some("file"),
         }
     }
 
@@ -554,6 +556,7 @@ impl RenderedRow {
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
+            placement_state: Some("inline"),
         }
     }
 
@@ -574,6 +577,7 @@ impl RenderedRow {
             can_edit: comment.map(|comment| comment.can_edit),
             invalidates_later_activity: comment.map(|_| invalidates_later_activity),
             resolved: Some(thread.resolved),
+            placement_state: Some("inline"),
         }
     }
 
@@ -612,6 +616,12 @@ impl RenderedRow {
         }
         if let Some(resolved) = self.resolved {
             object.insert("resolved".to_string(), LSPAny::Bool(resolved));
+        }
+        if let Some(placement_state) = self.placement_state {
+            object.insert(
+                "placement_state".to_string(),
+                LSPAny::String(placement_state.to_string()),
+            );
         }
         LSPAny::Object(object)
     }

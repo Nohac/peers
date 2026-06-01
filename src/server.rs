@@ -7,10 +7,11 @@ use tokio::fs;
 use tokio::net::TcpListener;
 
 use crate::comments::Author;
+use crate::diff::ReviewTarget;
 use crate::nvim::NvimLspServer;
 use crate::nvim_rpc::spawn_nvim_refresh_notifier;
 use crate::realtime::{ReviewUpdateBroadcaster, run_realtime_watcher};
-use crate::review::{now_rfc3339, review_paths};
+use crate::review::{ensure_storage, now_rfc3339, peers_paths};
 use crate::review_provider::ReviewProvider;
 use crate::rpc::{PeersReviewDispatcher, ReviewApi};
 
@@ -37,16 +38,17 @@ pub struct LocalServer {
 impl LocalServer {
     pub async fn bind(
         repo_root: PathBuf,
-        review_id: String,
+        target: ReviewTarget,
         author: Author,
         nvim_listen: Option<String>,
     ) -> Result<Self> {
+        ensure_storage(&repo_root).await?;
         let listener = TcpListener::bind((LOOPBACK_BIND_HOST, 0))
             .await
             .context(VOX_BIND_ERROR)?;
         let addr = listener.local_addr()?;
         let updates = ReviewUpdateBroadcaster::new();
-        let provider = ReviewProvider::new(repo_root, review_id, author, updates);
+        let provider = ReviewProvider::new(repo_root, target, author, updates);
         let nvim_lsp = NvimLspServer::bind(provider.clone()).await?;
 
         Ok(Self {
@@ -84,10 +86,12 @@ impl LocalServer {
             provider,
             ..
         } = self;
-        let session_path = review_paths(provider.repo_root(), provider.review_id()).session;
+        let session_path = peers_paths(provider.repo_root()).session;
         let session_info = ReviewSessionInfo {
             pid: std::process::id(),
-            review_id: provider.review_id().to_string(),
+            repo_root: provider.repo_root().display().to_string(),
+            target_label: provider.target().label(),
+            view_kind: session_view_kind(provider.target()).to_string(),
             vox_url: format!(
                 "{VOX_SCHEME}://{LOCALHOST}:{}",
                 listener.local_addr()?.port()
@@ -109,11 +113,7 @@ impl LocalServer {
         let api = ReviewApi::new(provider.clone(), token);
         let server = vox::serve_listener(ws_listener, PeersReviewDispatcher::new(api));
         let lsp_server = nvim_lsp.run();
-        spawn_realtime_watcher(
-            provider.repo_root().to_path_buf(),
-            provider.review_id().to_string(),
-            provider.updates(),
-        );
+        spawn_realtime_watcher(provider.repo_root().to_path_buf(), provider.updates());
         spawn_nvim_refresh_notifier(provider.updates(), nvim_listen);
 
         let result = tokio::select! {
@@ -131,9 +131,9 @@ impl LocalServer {
     }
 }
 
-fn spawn_realtime_watcher(repo_root: PathBuf, review_id: String, updates: ReviewUpdateBroadcaster) {
+fn spawn_realtime_watcher(repo_root: PathBuf, updates: ReviewUpdateBroadcaster) {
     tokio::spawn(async move {
-        if let Err(error) = run_realtime_watcher(repo_root, review_id, updates).await {
+        if let Err(error) = run_realtime_watcher(repo_root, updates).await {
             eprintln!("{REALTIME_WATCHER_ERROR}: {error:#}");
         }
     });
@@ -142,7 +142,9 @@ fn spawn_realtime_watcher(repo_root: PathBuf, review_id: String, updates: Review
 #[derive(Debug, Facet)]
 struct ReviewSessionInfo {
     pid: u32,
-    review_id: String,
+    repo_root: String,
+    target_label: String,
+    view_kind: String,
     vox_url: String,
     nvim_lsp_url: String,
     frontend_url: String,
@@ -150,6 +152,15 @@ struct ReviewSessionInfo {
     realtime: bool,
     nvim_listen: Option<String>,
     started_at: String,
+}
+
+fn session_view_kind(target: &ReviewTarget) -> &'static str {
+    match target {
+        ReviewTarget::WorkingTree => "diff",
+        ReviewTarget::Cached => "diff_cached",
+        ReviewTarget::All => "diff_all",
+        ReviewTarget::Branch { .. } => "review",
+    }
 }
 
 async fn write_session_info(path: &std::path::Path, info: &ReviewSessionInfo) -> Result<()> {

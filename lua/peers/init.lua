@@ -99,11 +99,7 @@ end
 function M.review(opts)
   opts = opts or {}
   local root = session.repo_root()
-  local review_id = opts.review or session.try_current_review_id(root)
-  if not review_id then
-    M.diff({})
-    return
-  end
+  local review_id = "repo"
   local active = session.read_live_session(root, review_id)
 
   if active then
@@ -111,7 +107,9 @@ function M.review(opts)
     return
   end
 
-  session.start(config, root, review_id)
+  session.start(config, root, {
+    mode = SUBCOMMAND_DIFF,
+  })
   session.wait_for_session(config, root, review_id, function(started)
     buffer.open(root, review_id, started)
   end)

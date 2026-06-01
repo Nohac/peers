@@ -31,7 +31,7 @@ Backend organization should be behavior-oriented:
 
 - `cli.rs`: command parsing and command dispatch.
 - `diff.rs`: review target resolution, diff loading, diff normalization, highlighting integration.
-- `review.rs`: review creation, review metadata, review lifecycle, current review selection.
+- `review.rs`: repo-scoped storage paths, payload IO, generated review artifacts, and repository discovery.
 - `comments.rs`: event model, JSONL parsing/encoding, replay, comment commands, agent context rendering.
 - `review_provider.rs`: cloneable async review provider shared by web RPC, Neovim LSP, and future local clients.
 - `rpc.rs`: Vox service trait and token-checking wrapper around the review provider.
@@ -46,9 +46,9 @@ Prefer:
 
 ```rust
 fn encode_event(event: &ReviewEvent) -> Result<String>;
-fn replay_events(events: &[ReviewEvent]) -> Result<ReviewState>;
-async fn parse_events_from_reader(reader: impl AsyncBufRead + Unpin) -> Result<Vec<ReviewEvent>>;
-async fn render_agent_context(state: &ReviewState, out: impl AsyncWrite + Unpin) -> Result<()>;
+fn replay_events(events: &[PeersEvent], payloads: &PayloadStore) -> Result<PeersState>;
+async fn parse_events_from_reader(reader: impl AsyncBufRead + Unpin) -> Result<Vec<PeersEvent>>;
+async fn render_agent_context(state: &PeersState, target: Option<&ReviewTarget>, out: impl AsyncWrite + Unpin) -> Result<()>;
 ```
 
 Keep path wrappers small and uninteresting:
@@ -81,11 +81,11 @@ Apply the same rule to Git access:
 
 ## Review Storage
 
-Canonical review data is append-only JSONL under `.peers/reviews/<review-id>/events.jsonl`.
+Canonical review data is repo-scoped. Lightweight transition events are append-only JSONL under `.peers/events.jsonl`; thread and comment payloads live under `.peers/threads/<thread-id>/`.
 
 Generated files such as `review.md` and `agent-context.md` are views over the event log, not canonical state.
 
-Agents should normally use CLI commands to add/reply/resolve comments, but the JSONL format must remain simple enough to inspect and append in emergencies.
+Agents should normally use CLI commands to add/reply/resolve comments. Payload files and the JSONL action log must remain simple enough to inspect in emergencies.
 
 ## Testing
 

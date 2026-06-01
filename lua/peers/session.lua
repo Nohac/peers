@@ -8,18 +8,15 @@ local SESSION_DECODE_WARNING = "Could not decode Peers session.json"
 local STALE_SESSION_MESSAGE = "Discarded stale Peers session"
 local NON_REALTIME_SESSION_MESSAGE = "Discarded Peers session without realtime support"
 local NO_GIT_REPO_ERROR = "Not inside a git repo"
-local NO_CURRENT_REVIEW_ERROR = "No current Peers review. Run `peers diff` or `peers review` first."
-local START_FAILURE_ERROR = "Failed to start `peers nvim`"
+local START_FAILURE_ERROR = "Failed to start Peers"
 local START_TIMEOUT_ERROR = "Peers session did not start"
 local NVIM_VERSION_ERROR_PREFIX = "Peers.nvim requires Neovim "
 local BINARY_NOT_EXECUTABLE_ERROR = "Peers binary is not executable"
 local CARGO_BINARY = "cargo"
 local CARGO_MANIFEST_FILE = "Cargo.toml"
 local CARGO_RUN_ARGS = { "run", "--manifest-path" }
-local COMMAND_NVIM = "nvim"
 local COMMAND_DIFF = "diff"
 local COMMAND_REVIEW = "review"
-local ARG_REVIEW = "--review"
 local ARG_NVIM_LISTEN = "--nvim-listen"
 local ARG_CACHED = "--cached"
 local ARG_ALL = "--all"
@@ -43,8 +40,8 @@ local function read_file(path)
   return body
 end
 
-local function session_path(root, review_id)
-  return root .. "/.peers/reviews/" .. review_id .. "/" .. SESSION_FILE_NAME
+local function session_path(root)
+  return root .. "/.peers/" .. SESSION_FILE_NAME
 end
 
 local function pid_is_live(pid)
@@ -56,8 +53,8 @@ local function pid_is_live(pid)
   return ok == 0 or ok == true
 end
 
-local function discard_session(root, review_id, active)
-  os.remove(session_path(root, review_id))
+local function discard_session(root, active)
+  os.remove(session_path(root))
   if active and active.pid then
     vim.notify(STALE_SESSION_MESSAGE .. " pid " .. tostring(active.pid), vim.log.levels.INFO)
   end
@@ -71,18 +68,7 @@ local function command_for_launch(config, root, launch)
     command = { config.binary }
   end
 
-  vim.list_extend(command, { COMMAND_NVIM, ARG_NVIM_LISTEN, M.nvim_server(root) })
-  if launch.review then
-    vim.list_extend(command, { ARG_REVIEW, launch.review })
-  elseif launch.mode == COMMAND_DIFF then
-    vim.list_extend(command, { COMMAND_DIFF })
-    if launch.cached then
-      vim.list_extend(command, { ARG_CACHED })
-    end
-    if launch.all then
-      vim.list_extend(command, { ARG_ALL })
-    end
-  elseif launch.mode == COMMAND_REVIEW then
+  if launch.mode == COMMAND_REVIEW then
     vim.list_extend(command, { COMMAND_REVIEW })
     if launch.base then
       vim.list_extend(command, { ARG_BASE, launch.base })
@@ -90,7 +76,16 @@ local function command_for_launch(config, root, launch)
     if launch.head then
       vim.list_extend(command, { ARG_HEAD, launch.head })
     end
+  else
+    vim.list_extend(command, { COMMAND_DIFF })
+    if launch.cached then
+      vim.list_extend(command, { ARG_CACHED })
+    end
+    if launch.all then
+      vim.list_extend(command, { ARG_ALL })
+    end
   end
+  vim.list_extend(command, { ARG_NVIM_LISTEN, M.nvim_server(root) })
   return command
 end
 
@@ -148,24 +143,9 @@ function M.repo_root()
   return vim.fs.dirname(git)
 end
 
-function M.current_review_id(root)
-  local body = read_file(root .. "/.peers/current")
-  if not body then
-    error(NO_CURRENT_REVIEW_ERROR)
-  end
-  return vim.trim(body)
-end
-
-function M.try_current_review_id(root)
-  local body = read_file(root .. "/.peers/current")
-  if not body then
-    return nil
-  end
-  local review_id = vim.trim(body)
-  if review_id == "" then
-    return nil
-  end
-  return review_id
+function M.repo_review_id(root)
+  local _ = root
+  return "repo"
 end
 
 function M.nvim_server(root)
@@ -181,15 +161,15 @@ function M.nvim_server(root)
   return nvim_servername
 end
 
-function M.read_session(root, review_id)
-  local body = read_file(session_path(root, review_id))
+function M.read_session(root, _review_id)
+  local body = read_file(session_path(root))
   if not body then
     return nil
   end
 
   local ok, decoded = pcall(vim.json.decode, body)
   if not ok then
-    discard_session(root, review_id)
+    discard_session(root)
     vim.notify(SESSION_DECODE_WARNING, vim.log.levels.WARN)
     return nil
   end
@@ -199,7 +179,7 @@ end
 function M.read_live_session(root, review_id)
   local active = M.read_session(root, review_id)
   if active and active.realtime ~= true then
-    discard_session(root, review_id, active)
+    discard_session(root, active)
     vim.notify(NON_REALTIME_SESSION_MESSAGE, vim.log.levels.INFO)
     return nil
   end
@@ -207,7 +187,7 @@ function M.read_live_session(root, review_id)
     return active
   end
   if active then
-    discard_session(root, review_id, active)
+    discard_session(root, active)
   end
   return nil
 end
@@ -216,10 +196,6 @@ function M.start(config, root, launch)
   if active_job then
     M.stop()
   end
-  if type(launch) == "string" then
-    launch = { review = launch }
-  end
-
   active_job = vim.fn.jobstart(executable_command(command_for_launch(config, root, launch or {})), {
     cwd = root,
     stdout_buffered = false,
@@ -268,8 +244,8 @@ function M.wait_for_current_session(config, root, on_ready)
   local remaining = math.max(1, math.floor(config.start_timeout_ms / config.poll_interval_ms))
 
   local function poll()
-    local review_id = M.try_current_review_id(root)
-    local active = review_id and M.read_live_session(root, review_id) or nil
+    local review_id = "repo"
+    local active = M.read_live_session(root, review_id)
     if active then
       on_ready(review_id, active)
       return

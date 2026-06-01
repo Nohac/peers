@@ -5,15 +5,19 @@ use anyhow::Result;
 use facet::Facet;
 use thiserror::Error;
 
-use crate::comments::{Author, AuthorKind, Comment, CommentThread, ReviewEvent, ReviewState};
+use crate::comments::{
+    Author, AuthorKind, Comment, CommentPayload, CommentThread, CreationProvenance, PeersEvent,
+    PeersState, ThreadPayload, ThreadStatus,
+};
 use crate::diff::{
     CommentAnchor, FileContent, FileDiff, FileSide, LineAnchor, ReviewDiffPayload, ReviewFile,
     ReviewTarget, load_review_diff,
 };
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
-    append_review_event, load_review_state, new_comment_id, new_thread_id, now_rfc3339,
-    regenerate_outputs, review_needs_fresh_successor,
+    append_peers_event, load_comment_payload, load_peers_state, load_thread_payload,
+    new_comment_id, new_thread_id, now_rfc3339, regenerate_outputs, write_comment_payload,
+    write_thread_payload,
 };
 
 const LINE_SCOPE: &str = "line";
@@ -26,8 +30,6 @@ const NEW_FILE_SIDE: &str = "new";
 
 #[derive(Debug, Error)]
 enum ReviewProviderError {
-    #[error("review `{review_id}` has no target")]
-    MissingTarget { review_id: String },
     #[error("line thread requires path")]
     LineThreadMissingPath,
     #[error("line thread requires start_line")]
@@ -38,12 +40,16 @@ enum ReviewProviderError {
     UnknownThreadScope { scope: String },
     #[error("comment body cannot be empty")]
     EmptyCommentBody,
+    #[error("unknown thread `{thread_id}`")]
+    UnknownThread { thread_id: String },
+    #[error("unknown comment `{comment_id}`")]
+    UnknownComment { comment_id: String },
 }
 
 #[derive(Clone, Debug)]
 pub struct ReviewProvider {
     repo_root: PathBuf,
-    review_id: String,
+    target: ReviewTarget,
     author: Author,
     updates: ReviewUpdateBroadcaster,
 }
@@ -51,20 +57,20 @@ pub struct ReviewProvider {
 impl ReviewProvider {
     pub fn new(
         repo_root: PathBuf,
-        review_id: String,
+        target: ReviewTarget,
         author: Author,
         updates: ReviewUpdateBroadcaster,
     ) -> Self {
         Self {
             repo_root,
-            review_id,
+            target,
             author,
             updates,
         }
     }
 
-    pub fn review_id(&self) -> &str {
-        &self.review_id
+    pub fn target(&self) -> &ReviewTarget {
+        &self.target
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -80,24 +86,13 @@ impl ReviewProvider {
     }
 
     pub async fn get_review(&self) -> Result<ApiReviewPayload> {
-        let state = load_review_state(&self.repo_root, &self.review_id).await?;
-        let target = state
-            .target
-            .clone()
-            .ok_or_else(|| ReviewProviderError::MissingTarget {
-                review_id: self.review_id.clone(),
-            })?;
-        let is_stale = review_needs_fresh_successor(&self.repo_root, &state).await?;
-        let diff = if is_stale {
-            empty_diff_payload()
-        } else {
-            load_review_diff(&self.repo_root, &target).await?
-        };
-        Ok(review_payload(&state, diff, &self.author, is_stale))
+        let state = load_peers_state(&self.repo_root).await?;
+        let diff = load_review_diff(&self.repo_root, &self.target).await?;
+        Ok(review_payload(&state, diff, &self.target, &self.author))
     }
 
     pub async fn refresh_diff(&self) -> Result<ApiReviewPayload> {
-        regenerate_outputs(&self.repo_root, &self.review_id).await?;
+        regenerate_outputs(&self.repo_root, Some(&self.target)).await?;
         let review = self.get_review().await?;
         self.updates.notify_diff_changed();
         Ok(review)
@@ -108,17 +103,43 @@ impl ReviewProvider {
         let body = required_body(request.body)?;
         let thread_id = new_thread_id();
         let comment_id = new_comment_id();
-        append_review_event(
+        let now = now_rfc3339()?;
+        write_thread_payload(
             &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::ThreadCreated {
+            &ThreadPayload {
+                id: thread_id.clone(),
+                status: ThreadStatus::Open,
+                anchor,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                provenance: CreationProvenance::from_target(&self.target),
+                archived_at: None,
+                pruned_at: None,
+            },
+        )
+        .await?;
+        write_comment_payload(
+            &self.repo_root,
+            &CommentPayload {
+                id: comment_id.clone(),
+                thread_id: thread_id.clone(),
+                author: self.author.clone(),
+                body,
+                created_at: now.clone(),
+                edited_at: None,
+                deleted_at: None,
+            },
+        )
+        .await?;
+        append_peers_event(
+            &self.repo_root,
+            &PeersEvent::ThreadCreated {
                 thread_id,
                 comment_id,
-                created_at: now_rfc3339()?,
+                created_at: now,
                 author: self.author.clone(),
-                anchor,
-                body,
             },
+            Some(&self.target),
         )
         .await?;
         let review = self.get_review().await?;
@@ -128,16 +149,31 @@ impl ReviewProvider {
 
     pub async fn reply_to_thread(&self, request: ThreadBodyRequest) -> Result<ApiReviewPayload> {
         let body = required_body(request.body)?;
-        append_review_event(
+        ensure_thread_exists(&self.repo_root, &request.thread_id).await?;
+        let comment_id = new_comment_id();
+        let now = now_rfc3339()?;
+        write_comment_payload(
             &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::CommentAdded {
-                thread_id: request.thread_id,
-                comment_id: new_comment_id(),
-                created_at: now_rfc3339()?,
+            &CommentPayload {
+                id: comment_id.clone(),
+                thread_id: request.thread_id.clone(),
                 author: self.author.clone(),
                 body,
+                created_at: now.clone(),
+                edited_at: None,
+                deleted_at: None,
             },
+        )
+        .await?;
+        append_peers_event(
+            &self.repo_root,
+            &PeersEvent::CommentAdded {
+                thread_id: request.thread_id,
+                comment_id,
+                created_at: now,
+                author: self.author.clone(),
+            },
+            Some(&self.target),
         )
         .await?;
         let review = self.get_review().await?;
@@ -147,15 +183,21 @@ impl ReviewProvider {
 
     pub async fn edit_comment(&self, request: EditCommentRequest) -> Result<ApiReviewPayload> {
         let body = required_body(request.body)?;
-        append_review_event(
+        let (thread_id, mut comment) =
+            find_comment_payload(&self.repo_root, &request.comment_id).await?;
+        let edited_at = now_rfc3339()?;
+        comment.body = body;
+        comment.edited_at = Some(edited_at.clone());
+        write_comment_payload(&self.repo_root, &comment).await?;
+        append_peers_event(
             &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::CommentEdited {
+            &PeersEvent::CommentEdited {
+                thread_id,
                 comment_id: request.comment_id,
-                edited_at: now_rfc3339()?,
+                edited_at,
                 author: self.author.clone(),
-                body,
             },
+            Some(&self.target),
         )
         .await?;
         let review = self.get_review().await?;
@@ -164,14 +206,20 @@ impl ReviewProvider {
     }
 
     pub async fn delete_comment(&self, request: CommentRequest) -> Result<ApiReviewPayload> {
-        append_review_event(
+        let (thread_id, mut comment) =
+            find_comment_payload(&self.repo_root, &request.comment_id).await?;
+        let deleted_at = now_rfc3339()?;
+        comment.deleted_at = Some(deleted_at.clone());
+        write_comment_payload(&self.repo_root, &comment).await?;
+        append_peers_event(
             &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::CommentDeleted {
+            &PeersEvent::CommentDeleted {
+                thread_id,
                 comment_id: request.comment_id,
-                deleted_at: now_rfc3339()?,
+                deleted_at,
                 author: self.author.clone(),
             },
+            Some(&self.target),
         )
         .await?;
         let review = self.get_review().await?;
@@ -180,14 +228,20 @@ impl ReviewProvider {
     }
 
     pub async fn delete_thread(&self, request: ThreadRequest) -> Result<ApiReviewPayload> {
-        append_review_event(
+        let mut thread = load_thread_payload(&self.repo_root, &request.thread_id).await?;
+        let archived_at = now_rfc3339()?;
+        thread.archived_at = Some(archived_at.clone());
+        thread.updated_at = archived_at.clone();
+        write_thread_payload(&self.repo_root, &thread).await?;
+        append_peers_event(
             &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::ThreadDeleted {
+            &PeersEvent::ThreadArchived {
                 thread_id: request.thread_id,
-                deleted_at: now_rfc3339()?,
+                archived_at,
                 author: self.author.clone(),
+                reason: Some("deleted through RPC".to_string()),
             },
+            Some(&self.target),
         )
         .await?;
         let review = self.get_review().await?;
@@ -196,14 +250,19 @@ impl ReviewProvider {
     }
 
     pub async fn resolve_thread(&self, request: ThreadRequest) -> Result<ApiReviewPayload> {
-        append_review_event(
+        let mut thread = load_thread_payload(&self.repo_root, &request.thread_id).await?;
+        let resolved_at = now_rfc3339()?;
+        thread.status = ThreadStatus::Resolved;
+        thread.updated_at = resolved_at.clone();
+        write_thread_payload(&self.repo_root, &thread).await?;
+        append_peers_event(
             &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::ThreadResolved {
+            &PeersEvent::ThreadResolved {
                 thread_id: request.thread_id,
-                resolved_at: now_rfc3339()?,
+                resolved_at,
                 author: self.author.clone(),
             },
+            Some(&self.target),
         )
         .await?;
         let review = self.get_review().await?;
@@ -212,14 +271,19 @@ impl ReviewProvider {
     }
 
     pub async fn reopen_thread(&self, request: ThreadRequest) -> Result<ApiReviewPayload> {
-        append_review_event(
+        let mut thread = load_thread_payload(&self.repo_root, &request.thread_id).await?;
+        let reopened_at = now_rfc3339()?;
+        thread.status = ThreadStatus::Open;
+        thread.updated_at = reopened_at.clone();
+        write_thread_payload(&self.repo_root, &thread).await?;
+        append_peers_event(
             &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::ThreadReopened {
+            &PeersEvent::ThreadReopened {
                 thread_id: request.thread_id,
-                reopened_at: now_rfc3339()?,
+                reopened_at,
                 author: self.author.clone(),
             },
+            Some(&self.target),
         )
         .await?;
         let review = self.get_review().await?;
@@ -229,38 +293,14 @@ impl ReviewProvider {
 
     pub async fn mark_file_viewed(
         &self,
-        request: MarkFileViewedRequest,
+        _request: MarkFileViewedRequest,
     ) -> Result<ApiReviewPayload> {
-        append_review_event(
-            &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::FileMarkedViewed {
-                path: request.path,
-                viewed: request.viewed,
-                marked_at: now_rfc3339()?,
-                author: self.author.clone(),
-            },
-        )
-        .await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
         Ok(review)
     }
 
-    pub async fn submit_review(&self, request: SubmitReviewRequest) -> Result<ApiReviewPayload> {
-        append_review_event(
-            &self.repo_root,
-            &self.review_id,
-            &ReviewEvent::ReviewSubmitted {
-                review_id: self.review_id.clone(),
-                submitted_at: now_rfc3339()?,
-                author: self.author.clone(),
-                body: request.body,
-            },
-        )
-        .await?;
+    pub async fn submit_review(&self, _request: SubmitReviewRequest) -> Result<ApiReviewPayload> {
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
         Ok(review)
     }
 }
@@ -384,20 +424,17 @@ pub struct SubmitReviewRequest {
 }
 
 fn review_payload(
-    state: &ReviewState,
+    state: &PeersState,
     mut diff: ReviewDiffPayload,
+    target: &ReviewTarget,
     current_author: &Author,
-    is_stale: bool,
 ) -> ApiReviewPayload {
-    let threads: Vec<_> = if is_stale {
-        Vec::new()
-    } else {
-        state
-            .threads
-            .values()
-            .map(|thread| api_thread(thread, current_author))
-            .collect()
-    };
+    let threads: Vec<_> = state
+        .threads
+        .values()
+        .filter(|thread| thread.pruned_at.is_none() && thread.archived_at.is_none())
+        .map(|thread| api_thread(thread, current_author))
+        .collect();
     let mut comment_counts = BTreeMap::<String, u32>::new();
     for thread in &threads {
         if !thread.resolved
@@ -407,11 +444,10 @@ fn review_payload(
         }
     }
     for file in &mut diff.files {
-        file.viewed = state.viewed_files.get(&file.path).copied().unwrap_or(false);
+        file.viewed = false;
         file.comment_count = comment_counts.get(&file.path).copied().unwrap_or(0);
     }
 
-    let target = state.target.clone().unwrap_or(ReviewTarget::WorkingTree);
     let review_threads = threads
         .iter()
         .filter(|thread| thread.scope == REVIEW_SCOPE)
@@ -419,7 +455,7 @@ fn review_payload(
         .collect();
 
     ApiReviewPayload {
-        review_id: state.review_id.clone().unwrap_or_default(),
+        review_id: "repo".to_string(),
         target_label: target.label(),
         is_branch_review: target.is_branch(),
         files: diff.files,
@@ -428,14 +464,6 @@ fn review_payload(
         threads,
         review_threads,
         commits: Vec::new(),
-    }
-}
-
-fn empty_diff_payload() -> ReviewDiffPayload {
-    ReviewDiffPayload {
-        files: Vec::new(),
-        file_contents_by_path: BTreeMap::new(),
-        file_diffs_by_path: BTreeMap::new(),
     }
 }
 
@@ -519,4 +547,37 @@ fn required_body(body: String) -> Result<String> {
         return Err(ReviewProviderError::EmptyCommentBody.into());
     }
     Ok(body)
+}
+
+async fn ensure_thread_exists(repo_root: &Path, thread_id: &str) -> Result<()> {
+    load_thread_payload(repo_root, thread_id)
+        .await
+        .map(|_| ())
+        .map_err(|_| {
+            ReviewProviderError::UnknownThread {
+                thread_id: thread_id.to_string(),
+            }
+            .into()
+        })
+}
+
+async fn find_comment_payload(
+    repo_root: &Path,
+    comment_id: &str,
+) -> Result<(String, CommentPayload)> {
+    let state = load_peers_state(repo_root).await?;
+    for thread in state.threads.values() {
+        if thread
+            .comments
+            .iter()
+            .any(|comment| comment.id == comment_id)
+        {
+            let payload = load_comment_payload(repo_root, &thread.id, comment_id).await?;
+            return Ok((thread.id.clone(), payload));
+        }
+    }
+    Err(ReviewProviderError::UnknownComment {
+        comment_id: comment_id.to_string(),
+    }
+    .into())
 }

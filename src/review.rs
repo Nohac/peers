@@ -6,14 +6,17 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::comments::{
-    Author, AuthorKind, ReviewEvent, ReviewState, encode_event, parse_events_from_reader,
-    render_agent_context, render_review_markdown, replay_events,
+    Author, AuthorKind, CommentPayload, PayloadStore, PeersEvent, PeersState, ThreadPayload,
+    decode_comment_payload, decode_thread_payload, encode_comment_payload, encode_event,
+    encode_thread_payload, parse_events_from_reader, render_agent_context, render_review_markdown,
+    replay_events,
 };
 use crate::diff::ReviewTarget;
 
-const CURRENT_REVIEW_STALE_CONTEXT: &str = "failed to inspect current review freshness";
 const CURRENT_HEAD_ERROR: &str = "failed to inspect current HEAD";
 const HEAD_REF: &str = "HEAD";
+const THREAD_JSON: &str = "thread.json";
+const COMMENTS_DIR: &str = "comments";
 
 pub struct RepoContext {
     pub root: PathBuf,
@@ -113,9 +116,10 @@ fn git_author(repo: &gix::Repository) -> Option<Author> {
     })
 }
 
-pub struct ReviewPaths {
-    pub dir: PathBuf,
+pub struct PeersPaths {
+    pub root: PathBuf,
     pub events: PathBuf,
+    pub threads: PathBuf,
     pub review_md: PathBuf,
     pub agent_context: PathBuf,
     pub session: PathBuf,
@@ -125,125 +129,185 @@ pub fn storage_root(repo_root: &Path) -> PathBuf {
     repo_root.join(".peers")
 }
 
-pub fn current_path(repo_root: &Path) -> PathBuf {
-    storage_root(repo_root).join("current")
-}
-
-pub fn review_paths(repo_root: &Path, review_id: &str) -> ReviewPaths {
-    let dir = storage_root(repo_root).join("reviews").join(review_id);
-    ReviewPaths {
-        events: dir.join("events.jsonl"),
-        review_md: dir.join("review.md"),
-        agent_context: dir.join("agent-context.md"),
-        session: dir.join("session.json"),
-        dir,
+pub fn peers_paths(repo_root: &Path) -> PeersPaths {
+    let root = storage_root(repo_root);
+    PeersPaths {
+        events: root.join("events.jsonl"),
+        threads: root.join("threads"),
+        review_md: root.join("review.md"),
+        agent_context: root.join("agent-context.md"),
+        session: root.join("session.json"),
+        root,
     }
 }
 
-pub async fn create_review(
-    repo_root: &Path,
-    author: Author,
-    target: ReviewTarget,
-) -> Result<String> {
-    let now = now_rfc3339()?;
-    let review_id = new_review_id(&now);
-    let paths = review_paths(repo_root, &review_id);
-    fs::create_dir_all(&paths.dir).await?;
-
-    append_event_file(
-        &paths.events,
-        &ReviewEvent::ReviewCreated {
-            review_id: review_id.clone(),
-            created_at: now,
-            author,
-            target: target.clone(),
-        },
-    )
-    .await?;
-    if target.is_local_diff() {
-        append_event_file(
-            &paths.events,
-            &ReviewEvent::ReviewDiffBaseCaptured {
-                review_id: review_id.clone(),
-                captured_at: now_rfc3339()?,
-                base_oid: current_head_oid(repo_root).await?,
-            },
-        )
-        .await?;
+pub async fn ensure_storage(repo_root: &Path) -> Result<()> {
+    let paths = peers_paths(repo_root);
+    fs::create_dir_all(&paths.threads).await?;
+    if !paths.events.exists() {
+        append_raw_events_file(&paths.events, "").await?;
     }
-    write_current(repo_root, &review_id).await?;
-    regenerate_outputs(repo_root, &review_id).await?;
-
-    Ok(review_id)
-}
-
-pub async fn write_current(repo_root: &Path, review_id: &str) -> Result<()> {
-    fs::create_dir_all(storage_root(repo_root)).await?;
-    fs::write(current_path(repo_root), format!("{review_id}\n")).await?;
     Ok(())
 }
 
-pub async fn current_review_id(repo_root: &Path) -> Result<String> {
-    let id = fs::read_to_string(current_path(repo_root))
-        .await
-        .context("no current review exists; create one with `peers review create`")?;
-    let id = id.trim();
-    if id.is_empty() {
-        return Err(anyhow!("current review file is empty"));
-    }
-    Ok(id.to_string())
+pub async fn load_events_file(path: &Path) -> Result<Vec<PeersEvent>> {
+    let Ok(file) = fs::File::open(path).await else {
+        return Ok(Vec::new());
+    };
+    parse_events_from_reader(BufReader::new(file)).await
 }
 
-pub async fn current_or_create_fresh_review_id(repo_root: &Path, author: Author) -> Result<String> {
-    let review_id = current_review_id(repo_root).await?;
-    let state = load_review_state(repo_root, &review_id).await?;
-    if !review_needs_fresh_successor(repo_root, &state)
-        .await
-        .context(CURRENT_REVIEW_STALE_CONTEXT)?
-    {
-        return Ok(review_id);
-    }
-
-    let target = state
-        .target
-        .ok_or_else(|| anyhow!("current review has no target"))?;
-    create_review(repo_root, author, target).await
+pub async fn load_peers_state(repo_root: &Path) -> Result<PeersState> {
+    let paths = peers_paths(repo_root);
+    let events = load_events_file(&paths.events).await?;
+    let payloads = load_payload_store(repo_root).await?;
+    replay_events(&events, &payloads)
 }
 
-pub async fn current_or_create_review_id(
+pub async fn load_payload_store(repo_root: &Path) -> Result<PayloadStore> {
+    let paths = peers_paths(repo_root);
+    let mut payloads = PayloadStore::default();
+    let Ok(mut thread_entries) = fs::read_dir(paths.threads).await else {
+        return Ok(payloads);
+    };
+
+    while let Some(entry) = thread_entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let thread_path = entry.path().join(THREAD_JSON);
+        if let Ok(thread) = read_thread_payload_file(&thread_path).await {
+            payloads.threads.insert(thread.id.clone(), thread);
+        }
+
+        let comments_dir = entry.path().join(COMMENTS_DIR);
+        let Ok(mut comment_entries) = fs::read_dir(comments_dir).await else {
+            continue;
+        };
+        while let Some(comment_entry) = comment_entries.next_entry().await? {
+            if !comment_entry.file_type().await?.is_file() {
+                continue;
+            }
+            if let Ok(comment) = read_comment_payload_file(&comment_entry.path()).await {
+                payloads.comments.insert(comment.id.clone(), comment);
+            }
+        }
+    }
+
+    Ok(payloads)
+}
+
+pub async fn write_thread_payload(repo_root: &Path, payload: &ThreadPayload) -> Result<()> {
+    write_thread_payload_file(&thread_payload_path(repo_root, &payload.id), payload).await
+}
+
+pub async fn write_comment_payload(repo_root: &Path, payload: &CommentPayload) -> Result<()> {
+    write_comment_payload_file(
+        &comment_payload_path(repo_root, &payload.thread_id, &payload.id),
+        payload,
+    )
+    .await
+}
+
+pub async fn load_thread_payload(repo_root: &Path, thread_id: &str) -> Result<ThreadPayload> {
+    read_thread_payload_file(&thread_payload_path(repo_root, thread_id)).await
+}
+
+pub async fn load_comment_payload(
     repo_root: &Path,
-    author: Author,
-    target: ReviewTarget,
-) -> Result<String> {
-    let Ok(review_id) = current_review_id(repo_root).await else {
-        return create_review(repo_root, author, target).await;
-    };
-    let Ok(state) = load_review_state(repo_root, &review_id).await else {
-        return create_review(repo_root, author, target).await;
-    };
-    if state.target.as_ref() != Some(&target) {
-        return create_review(repo_root, author, target).await;
-    }
-    if review_needs_fresh_successor(repo_root, &state)
-        .await
-        .context(CURRENT_REVIEW_STALE_CONTEXT)?
-    {
-        return create_review(repo_root, author, target).await;
-    }
-    Ok(review_id)
+    thread_id: &str,
+    comment_id: &str,
+) -> Result<CommentPayload> {
+    read_comment_payload_file(&comment_payload_path(repo_root, thread_id, comment_id)).await
 }
 
-pub async fn review_needs_fresh_successor(repo_root: &Path, state: &ReviewState) -> Result<bool> {
-    let Some(target) = &state.target else {
-        return Ok(false);
-    };
-    if !target.is_local_diff() {
-        return Ok(false);
+async fn read_thread_payload_file(path: &Path) -> Result<ThreadPayload> {
+    let input = fs::read_to_string(path).await?;
+    decode_thread_payload(&input)
+}
+
+async fn read_comment_payload_file(path: &Path) -> Result<CommentPayload> {
+    let input = fs::read_to_string(path).await?;
+    decode_comment_payload(&input)
+}
+
+async fn write_thread_payload_file(path: &Path, payload: &ThreadPayload) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
     }
-    let Some(captured_base) = &state.diff_base_oid else {
-        return Ok(false);
-    };
-    Ok(*captured_base != current_head_oid(repo_root).await?)
+    let json = encode_thread_payload(payload)?;
+    fs::write(path, format!("{json}\n")).await?;
+    Ok(())
+}
+
+async fn write_comment_payload_file(path: &Path, payload: &CommentPayload) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let json = encode_comment_payload(payload)?;
+    fs::write(path, format!("{json}\n")).await?;
+    Ok(())
+}
+
+fn thread_payload_path(repo_root: &Path, thread_id: &str) -> PathBuf {
+    peers_paths(repo_root)
+        .threads
+        .join(thread_id)
+        .join(THREAD_JSON)
+}
+
+fn comment_payload_path(repo_root: &Path, thread_id: &str, comment_id: &str) -> PathBuf {
+    peers_paths(repo_root)
+        .threads
+        .join(thread_id)
+        .join(COMMENTS_DIR)
+        .join(format!("{comment_id}.json"))
+}
+
+pub async fn append_event_file(path: &Path, event: &PeersEvent) -> Result<()> {
+    let line = encode_event(event)?;
+    append_raw_events_file(path, &format!("{line}\n")).await
+}
+
+async fn append_raw_events_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(contents.as_bytes()).await?;
+    file.flush().await?;
+
+    Ok(())
+}
+
+pub async fn append_peers_event(
+    repo_root: &Path,
+    event: &PeersEvent,
+    target: Option<&ReviewTarget>,
+) -> Result<()> {
+    let paths = peers_paths(repo_root);
+    append_event_file(&paths.events, event).await?;
+    regenerate_outputs(repo_root, target).await
+}
+
+pub async fn regenerate_outputs(repo_root: &Path, target: Option<&ReviewTarget>) -> Result<()> {
+    let paths = peers_paths(repo_root);
+    let state = load_peers_state(repo_root).await?;
+
+    let mut review_md = fs::File::create(&paths.review_md).await?;
+    render_review_markdown(&state, target, &mut review_md).await?;
+    review_md.flush().await?;
+
+    let mut agent_context = fs::File::create(&paths.agent_context).await?;
+    render_agent_context(&state, target, &mut agent_context).await?;
+    agent_context.flush().await?;
+
+    Ok(())
 }
 
 pub async fn current_head_oid(repo_root: &Path) -> Result<Option<String>> {
@@ -259,90 +323,10 @@ pub async fn current_head_oid(repo_root: &Path) -> Result<Option<String>> {
     .context(CURRENT_HEAD_ERROR)?
 }
 
-pub async fn list_reviews(repo_root: &Path) -> Result<Vec<String>> {
-    let reviews_dir = storage_root(repo_root).join("reviews");
-    let mut ids = Vec::new();
-    let Ok(mut entries) = fs::read_dir(reviews_dir).await else {
-        return Ok(ids);
-    };
-
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_dir() {
-            ids.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-
-    ids.sort();
-    Ok(ids)
-}
-
-pub async fn load_events_file(path: &Path) -> Result<Vec<ReviewEvent>> {
-    let file = fs::File::open(path).await?;
-    parse_events_from_reader(BufReader::new(file)).await
-}
-
-pub async fn load_review_state(repo_root: &Path, review_id: &str) -> Result<ReviewState> {
-    let paths = review_paths(repo_root, review_id);
-    let events = load_events_file(&paths.events).await?;
-    replay_events(&events)
-}
-
-pub async fn append_event_file(path: &Path, event: &ReviewEvent) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
-    let line = encode_event(event)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    file.write_all(line.as_bytes()).await?;
-    file.write_all(b"\n").await?;
-    file.flush().await?;
-
-    Ok(())
-}
-
-pub async fn append_review_event(
-    repo_root: &Path,
-    review_id: &str,
-    event: &ReviewEvent,
-) -> Result<()> {
-    let paths = review_paths(repo_root, review_id);
-    append_event_file(&paths.events, event).await?;
-    regenerate_outputs(repo_root, review_id).await
-}
-
-pub async fn regenerate_outputs(repo_root: &Path, review_id: &str) -> Result<()> {
-    let paths = review_paths(repo_root, review_id);
-    let state = load_review_state(repo_root, review_id).await?;
-
-    let mut review_md = fs::File::create(&paths.review_md).await?;
-    render_review_markdown(&state, &mut review_md).await?;
-    review_md.flush().await?;
-
-    let mut agent_context = fs::File::create(&paths.agent_context).await?;
-    render_agent_context(&state, &mut agent_context).await?;
-    agent_context.flush().await?;
-
-    Ok(())
-}
-
 pub fn now_rfc3339() -> Result<String> {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("failed to format timestamp")
-}
-
-pub fn new_review_id(now: &str) -> String {
-    let compact: String = now
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(15)
-        .collect();
-    format!("rev_{compact}_{}", id_suffix())
 }
 
 pub fn new_thread_id() -> String {
@@ -367,47 +351,54 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::comments::{CreationProvenance, ThreadStatus};
+    use crate::diff::{CommentAnchor, FileSide, LineAnchor};
 
     const TEST_AUTHOR_NAME: &str = "Jonas";
     const TEST_AUTHOR_EMAIL: &str = "jonas@example.com";
-    const TEST_FILE: &str = "file.txt";
-    const TEST_INITIAL_BODY: &str = "initial\n";
-    const TEST_NEXT_BODY: &str = "next\n";
-    const TEST_INITIAL_COMMIT: &str = "initial";
-    const TEST_NEXT_COMMIT: &str = "next";
-    const GIT_USER_NAME_FIELD: &str = "name";
-    const GIT_USER_EMAIL_FIELD: &str = "email";
 
     #[tokio::test]
-    async fn local_diff_current_review_rotates_when_head_changes() {
-        let root = test_root("head_change");
+    async fn repo_scoped_state_loads_thread_and_comment_payloads() {
+        let root = test_root("repo_state");
         fs::create_dir_all(&root).unwrap();
-        init_repo(&root);
-        fs::write(root.join(TEST_FILE), TEST_INITIAL_BODY).unwrap();
-        commit_file(&root, TEST_INITIAL_COMMIT, TEST_INITIAL_BODY);
 
-        let review_id = create_review(&root, author(), ReviewTarget::WorkingTree)
-            .await
-            .unwrap();
-        let state = load_review_state(&root, &review_id).await.unwrap();
-        assert!(!review_needs_fresh_successor(&root, &state).await.unwrap());
+        let thread = ThreadPayload {
+            id: "thr_test".to_string(),
+            status: ThreadStatus::Open,
+            anchor: CommentAnchor::Line {
+                line: LineAnchor::new("src/main.rs".to_string(), FileSide::New, 1, 1),
+            },
+            created_at: "2026-05-28T12:01:00Z".to_string(),
+            updated_at: "2026-05-28T12:01:00Z".to_string(),
+            provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
+            archived_at: None,
+            pruned_at: None,
+        };
+        let comment = CommentPayload {
+            id: "cmt_test".to_string(),
+            thread_id: thread.id.clone(),
+            author: author(),
+            body: "body".to_string(),
+            created_at: thread.created_at.clone(),
+            edited_at: None,
+            deleted_at: None,
+        };
+        write_thread_payload(&root, &thread).await.unwrap();
+        write_comment_payload(&root, &comment).await.unwrap();
+        append_event_file(
+            &peers_paths(&root).events,
+            &PeersEvent::ThreadCreated {
+                thread_id: thread.id.clone(),
+                comment_id: comment.id.clone(),
+                created_at: thread.created_at.clone(),
+                author: author(),
+            },
+        )
+        .await
+        .unwrap();
 
-        fs::write(root.join(TEST_FILE), TEST_NEXT_BODY).unwrap();
-        commit_file(&root, TEST_NEXT_COMMIT, TEST_NEXT_BODY);
-
-        let state = load_review_state(&root, &review_id).await.unwrap();
-        assert!(review_needs_fresh_successor(&root, &state).await.unwrap());
-
-        let next_review_id = current_or_create_fresh_review_id(&root, author())
-            .await
-            .unwrap();
-        assert_ne!(review_id, next_review_id);
-
-        let next_state = load_review_state(&root, &next_review_id).await.unwrap();
-        assert_eq!(
-            next_state.diff_base_oid,
-            Some(current_head_oid(&root).await.unwrap())
-        );
+        let state = load_peers_state(&root).await.unwrap();
+        assert_eq!(state.threads["thr_test"].comments[0].body, "body");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -426,37 +417,5 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("peers_review_{name}_{nonce}"))
-    }
-
-    fn init_repo(root: &Path) {
-        gix::init(root).expect("failed to init gix");
-        let config_path = root.join(".git").join("config");
-        let mut config = fs::read_to_string(&config_path).unwrap();
-        config.push_str(&format!(
-            "\n[user]\n\t{} = {}\n\t{} = {}\n",
-            GIT_USER_NAME_FIELD, TEST_AUTHOR_NAME, GIT_USER_EMAIL_FIELD, TEST_AUTHOR_EMAIL
-        ));
-        fs::write(config_path, config).unwrap();
-    }
-
-    fn commit_file(root: &Path, message: &str, body: &str) {
-        let repo = gix::open(root).unwrap();
-        let blob_id = repo.write_blob(body.as_bytes()).unwrap().detach();
-        let tree = gix::objs::Tree {
-            entries: vec![gix::objs::tree::Entry {
-                mode: gix::objs::tree::EntryKind::Blob.into(),
-                filename: TEST_FILE.into(),
-                oid: blob_id,
-            }],
-        };
-        let tree_id = repo.write_object(tree).unwrap().detach();
-        let parents = current_head_oid_blocking(&repo)
-            .into_iter()
-            .collect::<Vec<_>>();
-        repo.commit(HEAD_REF, message, tree_id, parents).unwrap();
-    }
-
-    fn current_head_oid_blocking(repo: &gix::Repository) -> Option<gix::ObjectId> {
-        repo.rev_parse_single(HEAD_REF).ok().map(|id| id.detach())
     }
 }

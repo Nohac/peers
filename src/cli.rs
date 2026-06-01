@@ -1,15 +1,18 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
-use crate::comments::{AuthorKind, CommentThread, ReviewEvent, ReviewState, hash_text};
-use crate::diff::{FileSide, LineAnchor, ReviewTarget};
+use crate::comments::{AuthorKind, CommentThread, PeersEvent, PeersState};
+use crate::diff::{FileSide, ReviewTarget};
+use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
-    AuthorOverride, append_review_event, create_review, current_or_create_fresh_review_id,
-    current_or_create_review_id, current_review_id, discover_repo, list_reviews, load_review_state,
-    new_comment_id, new_thread_id, now_rfc3339, review_paths,
+    AuthorOverride, append_peers_event, discover_repo, load_peers_state, load_thread_payload,
+    now_rfc3339, peers_paths, regenerate_outputs, write_thread_payload,
+};
+use crate::review_provider::{
+    CreateThreadRequest, EditCommentRequest, ReviewProvider, ThreadBodyRequest, ThreadRequest,
 };
 
 const VOX_RPC_LABEL: &str = "Vox RPC";
@@ -18,7 +21,6 @@ const REVIEW_UI_LABEL: &str = "Review UI";
 const FRONTEND_DEV_HINT: &str =
     "Run `cd frontend && bun run dev` in another terminal, then open the Review UI URL.";
 const SESSION_STOP_HINT: &str = "Press Ctrl-C to stop the local Peers session.";
-const CURRENT_REVIEW_ALIAS: &str = "current";
 const REVIEW_LABEL: &str = "Review";
 const TARGET_LABEL: &str = "Target";
 const THREADS_LABEL: &str = "Threads";
@@ -30,7 +32,7 @@ const HUMAN_AUTHOR_KIND_LABEL: &str = "human";
 const AGENT_AUTHOR_KIND_LABEL: &str = "agent";
 const RESOLVED_THREAD_STATUS: &str = "resolved";
 const UNRESOLVED_THREAD_STATUS: &str = "unresolved";
-const PEERS_SKILL_TEXT: &str = r#"Peers is a local Git review tool. It stores review comments in `.peers/`
+const PEERS_SKILL_TEXT: &str = r#"Peers is a local Git review tool. It stores repo-scoped comments in `.peers/`
 inside the reviewed repository so humans and agents can share the same review state.
 
 Agent workflow:
@@ -43,35 +45,19 @@ Agent workflow:
 7. If a comment cannot be addressed, reply with the blocker instead of resolving it.
 
 Core commands:
-- `peers skill`
-  Print this overview.
-- `peers review current`
-  Print the current review id.
-- `peers review list`
-  List stored reviews.
-- `peers comment list`
-  List all visible comments for the current review.
+- `peers diff`
+- `peers diff --cached`
+- `peers diff --all`
+- `peers review --base main --head HEAD`
 - `peers comment list --status open`
-  List unresolved threads only. Use this first when asked to address comments.
-- `peers comment list --status complete`
-  List resolved threads only.
-- `peers comment list current rev_123`
-  List comments for multiple reviews. `current` means the current review.
-- `peers --agent comment reply <thread-id> --body "Done: ..."`
-  Add an agent reply to a thread.
-- `peers --agent comment resolve <thread-id>`
-  Mark a thread complete.
-- `peers --agent comment reopen <thread-id>`
-  Reopen a thread if follow-up work is needed.
-- `peers --agent comment edit <comment-id> --body "..."`
-  Edit one of your comments. Editing can invalidate later dependent activity.
-- `peers --agent comment delete <comment-id>`
-  Delete one of your comments. Deleting can invalidate later dependent activity.
+- `peers comment add --path src/foo.rs --side new --lines 42:47 --body "..."`
+- `peers comment reply <thread-id> --body "Done: ..."`
+- `peers comment resolve <thread-id>`
+- `peers clean --dry-run`
 - `peers agent-context`
-  Print the path to the generated agent context file for the current review.
 
 Notes:
-- Prefer the CLI over editing `.peers/reviews/<review-id>/events.jsonl` manually.
+- Prefer the CLI over editing `.peers/events.jsonl` or payload files manually.
 - Comment ids start with `cmt_`; thread ids start with `thr_`.
 - Open means unresolved. Complete means resolved.
 - Use `--body-file -` to read a multiline reply body from stdin.
@@ -89,6 +75,8 @@ pub struct Cli {
     author_name: Option<String>,
     #[arg(long)]
     author_email: Option<String>,
+    #[arg(long, hide = true, global = true)]
+    nvim_listen: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -103,11 +91,11 @@ enum Command {
         #[command(subcommand)]
         command: CommentCommand,
     },
-    AgentContext(AgentContextArgs),
-    Nvim(NvimArgs),
+    Clean(CleanArgs),
+    AgentContext,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct DiffArgs {
     #[arg(long)]
     cached: bool,
@@ -121,32 +109,6 @@ struct ReviewArgs {
     base: String,
     #[arg(long, default_value = "HEAD")]
     head: String,
-    #[command(subcommand)]
-    command: Option<ReviewCommand>,
-}
-
-#[derive(Subcommand)]
-enum ReviewCommand {
-    Create(CreateReviewArgs),
-    List,
-    Current,
-}
-
-#[derive(Args)]
-struct CreateReviewArgs {
-    #[arg(long, value_enum)]
-    kind: Option<CreateReviewKind>,
-    #[arg(long)]
-    base: Option<String>,
-    #[arg(long, default_value = "HEAD")]
-    head: String,
-}
-
-#[derive(Clone, ValueEnum)]
-enum CreateReviewKind {
-    WorkingTree,
-    Cached,
-    All,
 }
 
 #[derive(Subcommand)]
@@ -165,8 +127,8 @@ enum CommentCommand {
 struct ListCommentsArgs {
     #[arg(long, value_enum, default_value = "all")]
     status: CommentListStatus,
-    #[arg(value_name = "REVIEW")]
-    reviews: Vec<String>,
+    #[arg(long, value_enum, default_value = "repo")]
+    scope: CommentListScope,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -174,6 +136,13 @@ enum CommentListStatus {
     All,
     Open,
     Complete,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CommentListScope {
+    View,
+    Repo,
+    Detached,
 }
 
 #[derive(Args)]
@@ -219,33 +188,24 @@ struct ThreadCommandArgs {
 }
 
 #[derive(Args)]
-struct AgentContextArgs {
+struct CleanArgs {
     #[arg(long)]
-    review: Option<String>,
+    dry_run: bool,
+    #[arg(long, value_enum, default_value = "complete")]
+    status: CleanStatus,
+    #[arg(long)]
+    older_than: Option<String>,
+    #[arg(long)]
+    detached: bool,
+    #[arg(long)]
+    hidden: bool,
+    #[arg(long)]
+    no_interactive: bool,
 }
 
-#[derive(Args)]
-struct NvimArgs {
-    #[arg(long)]
-    review: Option<String>,
-    #[arg(long)]
-    nvim_listen: Option<String>,
-    #[command(subcommand)]
-    command: Option<NvimCommand>,
-}
-
-#[derive(Subcommand)]
-enum NvimCommand {
-    Diff(DiffArgs),
-    Review(NvimReviewArgs),
-}
-
-#[derive(Args)]
-struct NvimReviewArgs {
-    #[arg(long, default_value = "main")]
-    base: String,
-    #[arg(long, default_value = "HEAD")]
-    head: String,
+#[derive(Clone, Copy, ValueEnum)]
+enum CleanStatus {
+    Complete,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -298,89 +258,34 @@ pub async fn run() -> Result<()> {
         agent: cli.agent,
     })?;
 
+    let nvim_listen = cli.nvim_listen;
+
     match cli.command {
         Command::Skill => unreachable!("skill exits before repository discovery"),
         Command::Diff(args) => {
-            let target = if args.all {
-                ReviewTarget::All
-            } else if args.cached {
-                ReviewTarget::Cached
-            } else {
-                ReviewTarget::WorkingTree
-            };
-            let review_id = create_review(&repo.root, repo.author.clone(), target.clone()).await?;
-            open_review_session(&repo.root, &review_id, repo.author, None).await?;
+            open_review_session(&repo.root, diff_target(args), repo.author, nvim_listen).await?;
         }
-        Command::Review(args) => match args.command {
-            Some(ReviewCommand::Create(create_args)) => {
-                let target = create_review_target(create_args);
-                let review_id =
-                    create_review(&repo.root, repo.author.clone(), target.clone()).await?;
-                println!("Created review `{review_id}` for {}.", target.label());
-            }
-            Some(ReviewCommand::List) => {
-                for review_id in list_reviews(&repo.root).await? {
-                    println!("{review_id}");
-                }
-            }
-            Some(ReviewCommand::Current) => {
-                let review_id = current_review_id(&repo.root).await?;
-                println!("{review_id}");
-            }
-            None => {
-                let target = ReviewTarget::Branch {
+        Command::Review(args) => {
+            open_review_session(
+                &repo.root,
+                ReviewTarget::Branch {
                     base: args.base,
                     head: args.head,
-                };
-                let review_id =
-                    create_review(&repo.root, repo.author.clone(), target.clone()).await?;
-                open_review_session(&repo.root, &review_id, repo.author, None).await?;
-            }
-        },
-        Command::Comment { command } => handle_comment(command, &repo.root, repo.author).await?,
-        Command::AgentContext(args) => {
-            let review_id = match args.review {
-                Some(review_id) => review_id,
-                None => current_review_id(&repo.root).await?,
-            };
-            let paths = review_paths(&repo.root, &review_id);
-            println!("{}", paths.agent_context.display());
+                },
+                repo.author,
+                nvim_listen,
+            )
+            .await?;
         }
-        Command::Nvim(args) => {
-            let nvim_listen = args.nvim_listen.clone();
-            let review_id = nvim_review_id(&repo.root, repo.author.clone(), args).await?;
-            open_review_session(&repo.root, &review_id, repo.author, nvim_listen).await?;
+        Command::Comment { command } => handle_comment(command, &repo.root, repo.author).await?,
+        Command::Clean(args) => handle_clean(args, &repo.root, repo.author).await?,
+        Command::AgentContext => {
+            regenerate_outputs(&repo.root, None).await?;
+            println!("{}", peers_paths(&repo.root).agent_context.display());
         }
     }
 
     Ok(())
-}
-
-async fn nvim_review_id(
-    repo_root: &std::path::Path,
-    author: crate::comments::Author,
-    args: NvimArgs,
-) -> Result<String> {
-    if let Some(review_id) = args.review {
-        return Ok(review_id);
-    }
-
-    match args.command {
-        Some(NvimCommand::Diff(diff_args)) => {
-            current_or_create_review_id(repo_root, author, diff_target(diff_args)).await
-        }
-        Some(NvimCommand::Review(review_args)) => {
-            let target = ReviewTarget::Branch {
-                base: review_args.base,
-                head: review_args.head,
-            };
-            create_review(repo_root, author, target).await
-        }
-        None => match current_or_create_fresh_review_id(repo_root, author.clone()).await {
-            Ok(review_id) => Ok(review_id),
-            Err(_) => create_review(repo_root, author, ReviewTarget::WorkingTree).await,
-        },
-    }
 }
 
 fn diff_target(args: DiffArgs) -> ReviewTarget {
@@ -394,18 +299,14 @@ fn diff_target(args: DiffArgs) -> ReviewTarget {
 }
 
 async fn open_review_session(
-    repo_root: &std::path::Path,
-    review_id: &str,
+    repo_root: &Path,
+    target: ReviewTarget,
     author: crate::comments::Author,
     nvim_listen: Option<String>,
 ) -> Result<()> {
-    let server = crate::server::LocalServer::bind(
-        repo_root.to_path_buf(),
-        review_id.to_string(),
-        author,
-        nvim_listen,
-    )
-    .await?;
+    let server =
+        crate::server::LocalServer::bind(repo_root.to_path_buf(), target, author, nvim_listen)
+            .await?;
     println!("{VOX_RPC_LABEL}: {}", server.vox_url());
     println!("{NEOVIM_LSP_LABEL}: {}", server.nvim_lsp_url());
     println!("{REVIEW_UI_LABEL}: {}", server.frontend_url());
@@ -414,21 +315,9 @@ async fn open_review_session(
     server.run_until_shutdown().await
 }
 
-fn create_review_target(args: CreateReviewArgs) -> ReviewTarget {
-    match args.kind {
-        Some(CreateReviewKind::WorkingTree) => ReviewTarget::WorkingTree,
-        Some(CreateReviewKind::Cached) => ReviewTarget::Cached,
-        Some(CreateReviewKind::All) => ReviewTarget::All,
-        None => ReviewTarget::Branch {
-            base: args.base.unwrap_or_else(|| "main".to_string()),
-            head: args.head,
-        },
-    }
-}
-
 async fn handle_comment(
     command: CommentCommand,
-    repo_root: &std::path::Path,
+    repo_root: &Path,
     author: crate::comments::Author,
 ) -> Result<()> {
     match command {
@@ -439,119 +328,83 @@ async fn handle_comment(
 
 async fn handle_comment_mutation(
     command: CommentCommand,
-    repo_root: &std::path::Path,
+    repo_root: &Path,
     author: crate::comments::Author,
 ) -> Result<()> {
-    let review_id = current_review_id(repo_root).await?;
+    let provider = ReviewProvider::new(
+        repo_root.to_path_buf(),
+        ReviewTarget::WorkingTree,
+        author,
+        ReviewUpdateBroadcaster::new(),
+    );
     match command {
         CommentCommand::List(_) => unreachable!("list commands are handled before mutations"),
         CommentCommand::Add(args) => {
             let body = read_body(args.body, args.body_file).await?;
-            let now = now_rfc3339()?;
-            let thread_id = new_thread_id();
-            let comment_id = new_comment_id();
-            let selected_text_hash = Some(hash_text(&body));
-            let mut anchor = LineAnchor::new(
-                args.path,
-                args.side.into(),
-                args.lines.start,
-                args.lines.end,
-            );
-            anchor.selected_text_hash = selected_text_hash;
-            append_review_event(
-                repo_root,
-                &review_id,
-                &ReviewEvent::ThreadCreated {
-                    thread_id: thread_id.clone(),
-                    comment_id: comment_id.clone(),
-                    created_at: now,
-                    author,
-                    anchor: crate::diff::CommentAnchor::Line { line: anchor },
+            let review = provider
+                .create_thread(CreateThreadRequest {
+                    scope: "line".to_string(),
+                    path: Some(args.path),
+                    side: Some(args.side.into()),
+                    start_line: Some(args.lines.start),
+                    end_line: Some(args.lines.end),
                     body,
-                },
-            )
-            .await?;
-            println!("Created thread `{thread_id}` with comment `{comment_id}`.");
+                })
+                .await?;
+            println!(
+                "Created thread. Repo now has {} thread(s).",
+                review.threads.len()
+            );
         }
         CommentCommand::Reply(args) => {
             let body = read_body(args.body, args.body_file).await?;
-            let comment_id = new_comment_id();
-            append_review_event(
-                repo_root,
-                &review_id,
-                &ReviewEvent::CommentAdded {
+            provider
+                .reply_to_thread(ThreadBodyRequest {
                     thread_id: args.thread_id.clone(),
-                    comment_id: comment_id.clone(),
-                    created_at: now_rfc3339()?,
-                    author,
                     body,
-                },
-            )
-            .await?;
-            println!(
-                "Added comment `{comment_id}` to thread `{}`.",
-                args.thread_id
-            );
+                })
+                .await?;
+            println!("Added reply to thread `{}`.", args.thread_id);
         }
         CommentCommand::Edit(args) => {
             let body = read_body(args.body, args.body_file).await?;
-            append_review_event(
-                repo_root,
-                &review_id,
-                &ReviewEvent::CommentEdited {
+            provider
+                .edit_comment(EditCommentRequest {
                     comment_id: args.comment_id.clone(),
-                    edited_at: now_rfc3339()?,
-                    author,
                     body,
-                },
-            )
-            .await?;
+                })
+                .await?;
             println!("Edited comment `{}`.", args.comment_id);
         }
         CommentCommand::Delete(args) => {
-            append_review_event(
-                repo_root,
-                &review_id,
-                &ReviewEvent::CommentDeleted {
+            provider
+                .delete_comment(crate::review_provider::CommentRequest {
                     comment_id: args.comment_id.clone(),
-                    deleted_at: now_rfc3339()?,
-                    author,
-                },
-            )
-            .await?;
+                })
+                .await?;
             println!("Deleted comment `{}`.", args.comment_id);
         }
         CommentCommand::Resolve(args) => {
-            append_review_event(
-                repo_root,
-                &review_id,
-                &ReviewEvent::ThreadResolved {
+            provider
+                .resolve_thread(ThreadRequest {
                     thread_id: args.thread_id.clone(),
-                    resolved_at: now_rfc3339()?,
-                    author,
-                },
-            )
-            .await?;
+                })
+                .await?;
             println!("Resolved thread `{}`.", args.thread_id);
         }
         CommentCommand::Reopen(args) => {
-            append_review_event(
-                repo_root,
-                &review_id,
-                &ReviewEvent::ThreadReopened {
+            provider
+                .reopen_thread(ThreadRequest {
                     thread_id: args.thread_id.clone(),
-                    reopened_at: now_rfc3339()?,
-                    author,
-                },
-            )
-            .await?;
+                })
+                .await?;
             println!("Reopened thread `{}`.", args.thread_id);
         }
     }
 
-    let state = load_review_state(repo_root, &review_id).await?;
+    let state = load_peers_state(repo_root).await?;
     println!(
-        "Review `{review_id}` now has {} thread(s), {} unresolved.",
+        "Repo comments now have {} thread(s), {} unresolved.",
         state.threads.len(),
         state.unresolved_threads().count()
     );
@@ -559,47 +412,19 @@ async fn handle_comment_mutation(
     Ok(())
 }
 
-async fn handle_comment_list(args: ListCommentsArgs, repo_root: &std::path::Path) -> Result<()> {
-    let status = args.status;
-    let review_ids = resolve_comment_list_reviews(repo_root, args.reviews).await?;
-
-    for (index, review_id) in review_ids.iter().enumerate() {
-        if index > 0 {
-            println!();
-        }
-
-        let state = load_review_state(repo_root, review_id).await?;
-        print_comment_list(review_id, &state, status);
-    }
-
+async fn handle_comment_list(args: ListCommentsArgs, repo_root: &Path) -> Result<()> {
+    let state = load_peers_state(repo_root).await?;
+    print_comment_list(&state, args.status, args.scope);
     Ok(())
 }
 
-async fn resolve_comment_list_reviews(
-    repo_root: &std::path::Path,
-    reviews: Vec<String>,
-) -> Result<Vec<String>> {
-    if reviews.is_empty() {
-        return Ok(vec![current_review_id(repo_root).await?]);
-    }
-
-    let mut review_ids = Vec::with_capacity(reviews.len());
-    for review in reviews {
-        if review == CURRENT_REVIEW_ALIAS {
-            review_ids.push(current_review_id(repo_root).await?);
-        } else {
-            review_ids.push(review);
-        }
-    }
-
-    Ok(review_ids)
-}
-
-fn print_comment_list(review_id: &str, state: &ReviewState, status_filter: CommentListStatus) {
-    println!("{REVIEW_LABEL}: {review_id}");
-    if let Some(target) = &state.target {
-        println!("{TARGET_LABEL}: {}", target.label());
-    }
+fn print_comment_list(
+    state: &PeersState,
+    status_filter: CommentListStatus,
+    _scope: CommentListScope,
+) {
+    println!("{REVIEW_LABEL}: repo");
+    println!("{TARGET_LABEL}: repo-scoped");
     println!(
         "{THREADS_LABEL}: {}, {} unresolved",
         state.threads.len(),
@@ -610,6 +435,7 @@ fn print_comment_list(review_id: &str, state: &ReviewState, status_filter: Comme
         .threads
         .values()
         .filter(|thread| comment_list_status_matches(thread, &status_filter))
+        .filter(|thread| thread.pruned_at.is_none() && thread.archived_at.is_none())
         .collect();
 
     if visible_threads.is_empty() {
@@ -658,6 +484,79 @@ fn print_comment_thread(thread: &CommentThread) {
         );
         print_indented_body(&comment.body);
     }
+}
+
+async fn handle_clean(
+    args: CleanArgs,
+    repo_root: &Path,
+    author: crate::comments::Author,
+) -> Result<()> {
+    let state = load_peers_state(repo_root).await?;
+    let candidates = clean_candidates(&state);
+
+    if candidates.is_empty() {
+        println!("No clean candidates.");
+        return Ok(());
+    }
+
+    for thread in &candidates {
+        println!(
+            "{}: resolved thread hidden from default open lists",
+            thread.id
+        );
+    }
+
+    if args.dry_run {
+        println!("Dry run: no changes written.");
+        return Ok(());
+    }
+    if !args.no_interactive && !confirm_clean(candidates.len()).await? {
+        println!("Clean cancelled.");
+        return Ok(());
+    }
+
+    for thread in candidates {
+        let mut payload = load_thread_payload(repo_root, &thread.id).await?;
+        let archived_at = now_rfc3339()?;
+        payload.archived_at = Some(archived_at.clone());
+        payload.updated_at = archived_at.clone();
+        write_thread_payload(repo_root, &payload).await?;
+        append_peers_event(
+            repo_root,
+            &PeersEvent::ThreadArchived {
+                thread_id: thread.id.clone(),
+                archived_at,
+                author: author.clone(),
+                reason: Some("peers clean".to_string()),
+            },
+            None,
+        )
+        .await?;
+    }
+
+    println!("Archived clean candidates.");
+    let _ = args.status;
+    let _ = args.older_than;
+    let _ = args.detached;
+    let _ = args.hidden;
+    Ok(())
+}
+
+fn clean_candidates(state: &PeersState) -> Vec<&CommentThread> {
+    state
+        .threads
+        .values()
+        .filter(|thread| thread.resolved)
+        .filter(|thread| thread.archived_at.is_none() && thread.pruned_at.is_none())
+        .collect()
+}
+
+async fn confirm_clean(candidate_count: usize) -> Result<bool> {
+    println!("Archive {candidate_count} thread(s)? Type `yes` to continue:");
+    let mut line = String::new();
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    reader.read_line(&mut line).await?;
+    Ok(line.trim() == "yes")
 }
 
 fn print_indented_body(body: &str) {

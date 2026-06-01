@@ -14,7 +14,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
 
-use crate::review::{regenerate_outputs, review_paths};
+use crate::review::{peers_paths, regenerate_outputs};
 
 const REVIEW_CHANGED: &str = "review_changed";
 const DIFF_CHANGED: &str = "diff_changed";
@@ -85,16 +85,17 @@ impl Default for ReviewUpdateBroadcaster {
 
 pub async fn run_realtime_watcher(
     repo_root: PathBuf,
-    review_id: String,
     updates: ReviewUpdateBroadcaster,
 ) -> Result<()> {
-    let paths = review_paths(&repo_root, &review_id);
+    let paths = peers_paths(&repo_root);
     let events_path = paths.events;
+    let threads_path = paths.threads;
     let peers_dir = repo_root.join(DOT_PEERS_DIR);
     let git_dir = repo_root.join(DOT_GIT_DIR);
     let gitignore = build_gitignore(&repo_root).context(GITIGNORE_BUILD_ERROR)?;
     let (mut watcher, mut watch_rx, mut watched_dirs) =
-        start_notify_watcher(&repo_root, &events_path).context(WATCHER_START_ERROR)?;
+        start_notify_watcher(&repo_root, &events_path, &threads_path)
+            .context(WATCHER_START_ERROR)?;
 
     let mut snapshot = WatchSnapshot::capture(&repo_root, &events_path);
 
@@ -107,6 +108,7 @@ pub async fn run_realtime_watcher(
         classify_watch_result(
             event,
             &events_path,
+            &threads_path,
             &repo_root,
             &peers_dir,
             &git_dir,
@@ -119,6 +121,7 @@ pub async fn run_realtime_watcher(
             classify_watch_result(
                 event,
                 &events_path,
+                &threads_path,
                 &repo_root,
                 &peers_dir,
                 &git_dir,
@@ -133,18 +136,17 @@ pub async fn run_realtime_watcher(
             }
         }
 
-        publish_pending(&repo_root, &review_id, &updates, pending).await?;
+        publish_pending(&repo_root, &updates, pending).await?;
     }
 }
 
 async fn publish_pending(
     repo_root: &Path,
-    review_id: &str,
     updates: &ReviewUpdateBroadcaster,
     pending: PendingUpdate,
 ) -> Result<()> {
     if pending.review_changed {
-        regenerate_outputs(repo_root, review_id)
+        regenerate_outputs(repo_root, None)
             .await
             .context(REGENERATE_OUTPUTS_ERROR)?;
         updates.notify_review_changed();
@@ -158,6 +160,7 @@ async fn publish_pending(
 fn start_notify_watcher(
     repo_root: &Path,
     events_path: &Path,
+    threads_path: &Path,
 ) -> Result<(
     RecommendedWatcher,
     mpsc::Receiver<notify::Result<Event>>,
@@ -173,6 +176,11 @@ fn start_notify_watcher(
     watcher
         .watch(events_path, RecursiveMode::NonRecursive)
         .context(WATCH_EVENTS_ERROR)?;
+    if threads_path.exists() {
+        watcher
+            .watch(threads_path, RecursiveMode::Recursive)
+            .context(WATCH_EVENTS_ERROR)?;
+    }
     Ok((watcher, watch_rx, watched_dirs))
 }
 
@@ -360,6 +368,7 @@ struct PendingUpdate {
 fn classify_watch_result(
     event: notify::Result<Event>,
     events_path: &Path,
+    threads_path: &Path,
     repo_root: &Path,
     peers_dir: &Path,
     git_dir: &Path,
@@ -370,6 +379,7 @@ fn classify_watch_result(
         Ok(event) => classify_event(
             event,
             events_path,
+            threads_path,
             repo_root,
             peers_dir,
             git_dir,
@@ -383,6 +393,7 @@ fn classify_watch_result(
 fn classify_event(
     event: Event,
     events_path: &Path,
+    threads_path: &Path,
     repo_root: &Path,
     peers_dir: &Path,
     git_dir: &Path,
@@ -399,6 +410,9 @@ fn classify_event(
             continue;
         }
         if path.starts_with(peers_dir) {
+            if path.starts_with(threads_path) {
+                pending.review_changed = true;
+            }
             continue;
         }
         if path.starts_with(git_dir) {
@@ -443,16 +457,15 @@ mod tests {
 
     use super::*;
 
-    const TEST_REVIEW_ID: &str = "rev_test";
     const TEST_FILE: &str = "src/rpc.rs";
-    const TEST_EVENTS: &str = ".peers/reviews/rev_test/events.jsonl";
+    const TEST_EVENTS: &str = ".peers/events.jsonl";
     const TEST_WATCHER_STARTUP_MS: u64 = 1000;
 
     #[tokio::test]
     async fn realtime_watcher_broadcasts_diff_change_after_snapshot() {
         let root = test_root("diff_change");
         fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join(".peers/reviews").join(TEST_REVIEW_ID)).unwrap();
+        fs::create_dir_all(root.join(".peers")).unwrap();
         gix::init(&root).unwrap();
         fs::write(root.join(TEST_FILE), "before\n").unwrap();
         fs::write(root.join(TEST_EVENTS), "").unwrap();
@@ -462,8 +475,7 @@ mod tests {
         let watcher_updates = updates.clone();
         let watcher_root = root.clone();
         let watcher = tokio::spawn(async move {
-            let _ = run_realtime_watcher(watcher_root, TEST_REVIEW_ID.to_string(), watcher_updates)
-                .await;
+            let _ = run_realtime_watcher(watcher_root, watcher_updates).await;
         });
 
         time::sleep(Duration::from_millis(TEST_WATCHER_STARTUP_MS)).await;
