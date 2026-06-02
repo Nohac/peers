@@ -252,7 +252,11 @@ local function review_width(review_buf)
 end
 
 local function can_show(review_buf, state)
-  return review_width(review_buf) > MIN_REVIEW_WIDTH
+  local width = review_width(review_buf)
+  if window_valid(state) then
+    return width > MIN_REVIEW_WIDTH
+  end
+  return width - WIDTH > MIN_REVIEW_WIDTH
 end
 
 local function current_window_kind(review_buf, state)

@@ -361,7 +361,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                 CommentThread {
                     id: payload.id.clone(),
                     anchor: payload.anchor.clone(),
-                    comments: visible_comments(vec![comment.clone()]),
+                    comments: vec![comment.clone()],
                     resolved: payload.status == ThreadStatus::Resolved,
                     created_at: payload.created_at.clone(),
                     updated_at: payload.updated_at.clone(),
@@ -384,7 +384,6 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                 .get_mut(thread_id)
                 .ok_or_else(|| anyhow!("comment references unknown thread `{thread_id}`"))?;
             thread.comments.push(comment.clone());
-            thread.comments = visible_comments(std::mem::take(&mut thread.comments));
             thread.updated_at = created_at.clone();
         }
         PeersEvent::CommentEdited {
@@ -682,6 +681,54 @@ mod tests {
             state.threads[&thread_id()].comments[0].body,
             "Needs a testable event log."
         );
+    }
+
+    #[test]
+    fn replay_deletes_comment_payload_with_latest_deleted_state() {
+        let anchor = CommentAnchor::Line {
+            line: LineAnchor::new("src/main.rs".to_string(), FileSide::New, 4, 4),
+        };
+        let thread = ThreadPayload {
+            id: thread_id(),
+            status: ThreadStatus::Open,
+            anchor,
+            created_at: timestamp("2026-05-28T12:01:00Z"),
+            updated_at: timestamp("2026-05-28T12:02:00Z"),
+            provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
+            archived_at: None,
+            pruned_at: None,
+        };
+        let comment = Comment {
+            id: comment_id(),
+            thread_id: thread_id(),
+            author: author(),
+            body: "Delete this.".to_string(),
+            created_at: timestamp("2026-05-28T12:01:00Z"),
+            edited_at: None,
+            deleted_at: Some(timestamp("2026-05-28T12:02:00Z")),
+        };
+        let payloads = PayloadStore {
+            threads: BTreeMap::from([(thread.id.clone(), thread)]),
+            comments: BTreeMap::from([(comment.id.clone(), comment)]),
+        };
+        let events = vec![
+            PeersEvent::ThreadCreated {
+                thread_id: thread_id(),
+                comment_id: comment_id(),
+                created_at: timestamp("2026-05-28T12:01:00Z"),
+                author: author(),
+            },
+            PeersEvent::CommentDeleted {
+                thread_id: thread_id(),
+                comment_id: comment_id(),
+                deleted_at: timestamp("2026-05-28T12:02:00Z"),
+                author: author(),
+            },
+        ];
+
+        let state = replay_events(&events, &payloads).unwrap();
+
+        assert!(!state.threads.contains_key(&thread_id()));
     }
 
     #[test]
