@@ -112,6 +112,8 @@ peers comment reply thr_123 --body "I fixed this."
 peers comment reply thr_123 --body-file -
 peers comment list
 peers comment list --status open
+peers comment list --status open --context
+peers comment list --status open --context 5
 peers comment list --status complete
 peers comment list --scope repo
 peers comment edit cmt_123 --body "Updated comment."
@@ -323,25 +325,32 @@ Line/range anchors should store layered evidence:
 - selected text
 - selected/range hash
 - per-line hashes
-- nearby context text and context hashes
+- nearby context text and context hashes, including original before/after snippets captured at creation time
 - creation provenance such as branch name, head oid, merge-base oid, and view kind
 
 Anchor relocation should try, in order:
 
 1. Same path or renamed path with exact selected/range hash.
-2. Same path with exact per-line hashes.
-3. Same path with context-before/context-after match.
+2. Same path with exact per-line hashes for the selected range.
+3. Same path with before/after context match.
 4. Any changed file with exact selected/range hash.
-5. Any tracked file with exact selected/range hash.
-6. Same file with approximate text similarity.
-7. File-level fallback.
-8. Detached.
+5. Any tracked file with exact selected/range hash, to catch moved or split code.
+6. Same file with approximate text similarity, only when confidence is high enough to avoid silently attaching feedback to unrelated code.
+7. Original line/range numbers as a weak fallback.
+8. File-level fallback.
+9. Detached.
+
+Line-number fallback must not be treated as a trusted relocation. If content and context evidence no longer match but the original line/range still exists, the placement should be marked as weak/stale/line-fallback in projection metadata. Unresolved threads may still render at that weak placement so the user can act on them, but resolved threads with weak placement should hide from default diff/editor projections and remain available only in explicit complete/global listings and cleanup previews.
+
+In visual review surfaces, stale/weak placements should be immediately distinguishable from confident inline placements. The normal thread rail/card border can stay blue for exact or strong relocations, while weak/stale/line-fallback placements should render that same border/rail in red. This should be metadata-driven from the placement state rather than inferred by the UI from text labels.
 
 Unresolved comments should be surfaced aggressively. If an unresolved anchor can only be weakly relocated, show it with moved/stale/changed metadata rather than hiding it. If it cannot be relocated, keep it visible in an unresolved detached section and diagnostics/list output.
 
 Open comments are part of the projection, not decoration on top of changed hunks. If the current Git diff has no changed files or no hunk for a commented region, unresolved comments should still create enough review surface to read and act on them. For line/range comments, render a synthetic comment-context hunk around the relocated anchor with unchanged source lines and the inline thread. For file-level comments, render the file header and thread even if the file is currently unchanged. For detached unresolved comments, render a detached section instead of hiding them behind an empty state.
 
 Resolved comments should be hidden more aggressively as context changes. Exact matches may remain available behind a show-resolved option. Weak matches, file-only matches, and detached resolved comments should be hidden from normal diff/editor projections by default, while remaining available through explicit complete/resolved/global listing and cleanup previews.
+
+`peers comment list --context [lines]` should eventually render context from the projection, not only from live file line numbers. When an anchor still relocates cleanly, it can show current source context. When the source has drifted, moved, or detached, it should fall back to the stored original selected text and before/after snippets so agents can still see what the comment originally referred to. The output should label current, moved/stale, and original-only context distinctly.
 
 ## Cleanup
 
