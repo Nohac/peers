@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 use crate::comments::{AuthorKind, CommentThread, PeersEvent, PeersState};
-use crate::diff::{FileSide, ReviewTarget};
+use crate::diff::{CommentAnchor, FileSide, ReviewTarget};
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
     AuthorOverride, append_peers_event, discover_repo, load_peers_state, load_thread_payload,
@@ -35,7 +35,7 @@ const PEERS_SKILL_TEXT: &str = r#"Peers is a local Git review tool. It stores re
 inside the reviewed repository so humans and agents can share the same review state.
 
 Agent workflow:
-1. Run `peers comment list --status open` to see unresolved review comments.
+1. Run `peers comment list --status open --context` to see unresolved review comments with source context.
 2. Use each thread anchor to inspect the referenced file and line/range.
 3. Make the requested code changes in the working tree.
 4. Run the relevant project checks.
@@ -48,7 +48,8 @@ Core commands:
 - `peers diff --cached`
 - `peers diff --all`
 - `peers review --base main --head HEAD`
-- `peers comment list --status open`
+- `peers comment list --status open --context`
+- `peers comment list --status open --context 5`
 - `peers comment add --path src/foo.rs --side new --lines 42:47 --body "..."`
 - `peers comment reply <thread-id> --body "Done: ..."`
 - `peers comment resolve <thread-id>`
@@ -128,6 +129,14 @@ struct ListCommentsArgs {
     status: CommentListStatus,
     #[arg(long, value_enum, default_value = "repo")]
     scope: CommentListScope,
+    #[arg(
+        long,
+        alias = "conext",
+        num_args = 0..=1,
+        default_missing_value = "3",
+        value_name = "LINES"
+    )]
+    context: Option<usize>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -411,15 +420,29 @@ async fn handle_comment_mutation(
 
 async fn handle_comment_list(args: ListCommentsArgs, repo_root: &Path) -> Result<()> {
     let state = load_peers_state(repo_root).await?;
-    print_comment_list(&state, args.status, args.scope);
+    print_comment_list(
+        &state,
+        args.status,
+        args.scope,
+        repo_root,
+        args.context.map(|lines| CommentListContext { lines }),
+    )
+    .await?;
     Ok(())
 }
 
-fn print_comment_list(
+#[derive(Clone, Copy)]
+struct CommentListContext {
+    lines: usize,
+}
+
+async fn print_comment_list(
     state: &PeersState,
     status_filter: CommentListStatus,
     _scope: CommentListScope,
-) {
+    repo_root: &Path,
+    context: Option<CommentListContext>,
+) -> Result<()> {
     println!("{REVIEW_LABEL}: repo");
     println!("{TARGET_LABEL}: repo-scoped");
     println!(
@@ -437,12 +460,16 @@ fn print_comment_list(
 
     if visible_threads.is_empty() {
         println!("{NO_COMMENTS_MESSAGE}");
-        return;
+        return Ok(());
     }
 
     for thread in visible_threads {
         print_comment_thread(thread);
+        if let Some(context) = context {
+            print_comment_context(repo_root, thread, context).await?;
+        }
     }
+    Ok(())
 }
 
 fn comment_list_status_matches(thread: &CommentThread, status_filter: &CommentListStatus) -> bool {
@@ -481,6 +508,60 @@ fn print_comment_thread(thread: &CommentThread) {
         );
         print_indented_body(&comment.body);
     }
+}
+
+async fn print_comment_context(
+    repo_root: &Path,
+    thread: &CommentThread,
+    context: CommentListContext,
+) -> Result<()> {
+    let CommentAnchor::Line { line } = &thread.anchor else {
+        return Ok(());
+    };
+
+    let path = match line.side {
+        FileSide::Old => line.old_path.as_ref().unwrap_or(&line.path),
+        FileSide::New => &line.path,
+    };
+    let full_path = repo_root.join(path);
+    let source = match tokio::fs::read_to_string(&full_path).await {
+        Ok(source) => source,
+        Err(error) => {
+            println!("Context: unavailable for `{path}` ({error})");
+            return Ok(());
+        }
+    };
+    let source_lines: Vec<_> = source.lines().collect();
+    if source_lines.is_empty() {
+        println!("Context: `{path}` is empty");
+        return Ok(());
+    }
+
+    let anchor_start = line.start_line.max(1) as usize;
+    let anchor_end = line.end_line.max(line.start_line).max(1) as usize;
+    if anchor_start > source_lines.len() {
+        println!(
+            "Context: `{path}` lines {anchor_start}-{anchor_end} are outside the current file ({} lines)",
+            source_lines.len()
+        );
+        return Ok(());
+    }
+    let first = anchor_start.saturating_sub(context.lines).max(1);
+    let last = anchor_end
+        .saturating_add(context.lines)
+        .min(source_lines.len());
+    let width = last.to_string().len().max(anchor_end.to_string().len());
+    println!("Context: `{path}` lines {first}-{last}");
+    for number in first..=last {
+        let marker = if number >= anchor_start && number <= anchor_end {
+            ">"
+        } else {
+            " "
+        };
+        let text = source_lines.get(number - 1).copied().unwrap_or_default();
+        println!("{marker} {number:>width$} | {text}");
+    }
+    Ok(())
 }
 
 async fn handle_clean(

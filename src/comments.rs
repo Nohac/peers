@@ -220,8 +220,37 @@ pub struct ThreadPayload {
     pub created_at: PeersTimestamp,
     pub updated_at: PeersTimestamp,
     pub provenance: CreationProvenance,
+    pub resolved_head_oid: Option<String>,
     pub archived_at: Option<PeersTimestamp>,
     pub pruned_at: Option<PeersTimestamp>,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq)]
+struct LegacyThreadPayload {
+    pub id: ThreadId,
+    pub status: ThreadStatus,
+    pub anchor: CommentAnchor,
+    pub created_at: PeersTimestamp,
+    pub updated_at: PeersTimestamp,
+    pub provenance: CreationProvenance,
+    pub archived_at: Option<PeersTimestamp>,
+    pub pruned_at: Option<PeersTimestamp>,
+}
+
+impl LegacyThreadPayload {
+    fn into_thread_payload(self) -> ThreadPayload {
+        ThreadPayload {
+            id: self.id,
+            status: self.status,
+            anchor: self.anchor,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            provenance: self.provenance,
+            resolved_head_oid: None,
+            archived_at: self.archived_at,
+            pruned_at: self.pruned_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
@@ -257,6 +286,7 @@ pub struct CommentThread {
     pub anchor: CommentAnchor,
     pub comments: Vec<Comment>,
     pub resolved: bool,
+    pub resolved_head_oid: Option<String>,
     pub created_at: PeersTimestamp,
     pub updated_at: PeersTimestamp,
     pub archived_at: Option<PeersTimestamp>,
@@ -321,7 +351,12 @@ pub fn encode_thread_payload(payload: &ThreadPayload) -> Result<String> {
 }
 
 pub fn decode_thread_payload(input: &str) -> Result<ThreadPayload> {
-    facet_json::from_str(input).context("failed to decode thread payload")
+    match facet_json::from_str::<ThreadPayload>(input) {
+        Ok(payload) => Ok(payload),
+        Err(current_error) => facet_json::from_str::<LegacyThreadPayload>(input)
+            .map(LegacyThreadPayload::into_thread_payload)
+            .with_context(|| format!("failed to decode thread payload: {current_error}")),
+    }
 }
 
 pub fn encode_comment_payload(payload: &Comment) -> Result<String> {
@@ -363,6 +398,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                     anchor: payload.anchor.clone(),
                     comments: vec![comment.clone()],
                     resolved: payload.status == ThreadStatus::Resolved,
+                    resolved_head_oid: payload.resolved_head_oid.clone(),
                     created_at: payload.created_at.clone(),
                     updated_at: payload.updated_at.clone(),
                     archived_at: payload.archived_at.clone(),
@@ -408,6 +444,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
             thread.comments.truncate(comment_index + 1);
             thread.comments[comment_index] = payload.clone();
             thread.resolved = false;
+            thread.resolved_head_oid = None;
             thread.updated_at = edited_at.clone();
         }
         PeersEvent::CommentDeleted {
@@ -433,6 +470,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                 thread.comments[comment_index] = payload.clone();
                 thread.comments = visible_comments(std::mem::take(&mut thread.comments));
                 thread.resolved = false;
+                thread.resolved_head_oid = None;
                 thread.updated_at = deleted_at.clone();
                 thread.comments.is_empty()
             };
@@ -449,7 +487,10 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                 .threads
                 .get_mut(thread_id)
                 .ok_or_else(|| anyhow!("resolve references unknown thread `{thread_id}`"))?;
+            let payload = payloads.threads.get(thread_id);
             thread.resolved = true;
+            thread.resolved_head_oid =
+                payload.and_then(|payload| payload.resolved_head_oid.clone());
             thread.updated_at = resolved_at.clone();
         }
         PeersEvent::ThreadReopened {
@@ -462,6 +503,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                 .get_mut(thread_id)
                 .ok_or_else(|| anyhow!("reopen references unknown thread `{thread_id}`"))?;
             thread.resolved = false;
+            thread.resolved_head_oid = None;
             thread.updated_at = reopened_at.clone();
         }
         PeersEvent::ThreadArchived {
@@ -637,6 +679,7 @@ mod tests {
             created_at: timestamp("2026-05-28T12:01:00Z"),
             updated_at: timestamp("2026-05-28T12:01:00Z"),
             provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
+            resolved_head_oid: None,
             archived_at: None,
             pruned_at: None,
         };
@@ -695,6 +738,7 @@ mod tests {
             created_at: timestamp("2026-05-28T12:01:00Z"),
             updated_at: timestamp("2026-05-28T12:02:00Z"),
             provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
+            resolved_head_oid: None,
             archived_at: None,
             pruned_at: None,
         };

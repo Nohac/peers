@@ -12,7 +12,7 @@ use crate::diff::{DiffSection, FileSide, LineRange};
 use crate::review_provider::ReviewProvider;
 use crate::review_provider::{
     CommentRequest, CreateThreadRequest, EditCommentRequest, ReviewComment, ReviewProjection,
-    ReviewThread, ThreadBodyRequest, ThreadRequest,
+    ReviewThread, ThreadBodyRequest, ThreadRequest, thread_visible_in_default_projection,
 };
 
 const LOOPBACK_BIND_HOST: &str = "127.0.0.1";
@@ -446,6 +446,7 @@ struct RenderedReview {
     rows: Vec<RenderedRow>,
     highlights: Vec<RenderedHighlight>,
     symbols: Vec<RenderedSymbol>,
+    sidebar_counts: RenderedSidebarCounts,
 }
 
 impl RenderedReview {
@@ -484,6 +485,22 @@ impl RenderedReview {
                     .collect(),
             ),
         );
+        object.insert("sidebar_counts".to_string(), self.sidebar_counts.into_lsp());
+        LSPAny::Object(object)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RenderedSidebarCounts {
+    files: u32,
+    comments: u32,
+}
+
+impl RenderedSidebarCounts {
+    fn into_lsp(self) -> LSPAny {
+        let mut object = LSPObject::new();
+        object.insert("files".to_string(), lsp_number(self.files));
+        object.insert("comments".to_string(), lsp_number(self.comments));
         LSPAny::Object(object)
     }
 }
@@ -496,11 +513,13 @@ struct RenderedRow {
     added_lines: Option<u32>,
     removed_lines: Option<u32>,
     side: Option<&'static str>,
+    source_start_line: Option<u32>,
     source_line: Option<u32>,
     code_start_col: Option<u32>,
     thread_id: Option<String>,
     comment_id: Option<String>,
     comment_body: Option<String>,
+    comment_meta: Option<String>,
     can_edit: Option<bool>,
     invalidates_later_activity: Option<bool>,
     resolved: Option<bool>,
@@ -516,11 +535,13 @@ impl RenderedRow {
             added_lines: None,
             removed_lines: None,
             side: None,
+            source_start_line: None,
             source_line: None,
             code_start_col: None,
             thread_id: None,
             comment_id: None,
             comment_body: None,
+            comment_meta: None,
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
@@ -536,11 +557,13 @@ impl RenderedRow {
             added_lines: None,
             removed_lines: None,
             side: None,
+            source_start_line: None,
             source_line: None,
             code_start_col: None,
             thread_id: None,
             comment_id: None,
             comment_body: None,
+            comment_meta: None,
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
@@ -556,11 +579,13 @@ impl RenderedRow {
             added_lines: Some(file.added_lines),
             removed_lines: Some(file.removed_lines),
             side: None,
+            source_start_line: None,
             source_line: None,
             code_start_col: None,
             thread_id: None,
             comment_id: None,
             comment_body: None,
+            comment_meta: None,
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
@@ -576,11 +601,13 @@ impl RenderedRow {
             added_lines: None,
             removed_lines: None,
             side: Some(side),
+            source_start_line: Some(source_line),
             source_line: Some(source_line),
             code_start_col: Some(LINE_PREFIX_WIDTH),
             thread_id: None,
             comment_id: None,
             comment_body: None,
+            comment_meta: None,
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
@@ -600,11 +627,13 @@ impl RenderedRow {
             added_lines: None,
             removed_lines: None,
             side: thread.anchor.side.as_deref().and_then(rendered_side_name),
+            source_start_line: thread.anchor.start_line,
             source_line: thread.anchor.end_line,
             code_start_col: None,
             thread_id: Some(thread.id.clone()),
             comment_id: comment.map(|comment| comment.comment.id.to_string()),
             comment_body: comment.map(|comment| comment.comment.body.clone()),
+            comment_meta: comment.map(comment_meta),
             can_edit: comment.map(|comment| comment.can_edit),
             invalidates_later_activity: comment.map(|_| invalidates_later_activity),
             resolved: Some(thread.resolved),
@@ -630,6 +659,12 @@ impl RenderedRow {
         if let Some(side) = self.side {
             object.insert("side".to_string(), LSPAny::String(side.to_string()));
         }
+        if let Some(source_start_line) = self.source_start_line {
+            object.insert(
+                "source_start_line".to_string(),
+                lsp_number(source_start_line),
+            );
+        }
         if let Some(source_line) = self.source_line {
             object.insert("source_line".to_string(), lsp_number(source_line));
         }
@@ -644,6 +679,9 @@ impl RenderedRow {
         }
         if let Some(comment_body) = self.comment_body {
             object.insert("comment_body".to_string(), LSPAny::String(comment_body));
+        }
+        if let Some(comment_meta) = self.comment_meta {
+            object.insert("comment_meta".to_string(), LSPAny::String(comment_meta));
         }
         if let Some(can_edit) = self.can_edit {
             object.insert("can_edit".to_string(), LSPAny::Bool(can_edit));
@@ -702,6 +740,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         rows: Vec::new(),
         highlights: Vec::new(),
         symbols: Vec::new(),
+        sidebar_counts: RenderedSidebarCounts::default(),
     };
 
     if !review.files.iter().any(review_file_is_visible) {
@@ -713,6 +752,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         if !review_file_is_visible(file) {
             continue;
         }
+        rendered.sidebar_counts.files += 1;
 
         let file_line = rendered.push_line(
             format!(
@@ -744,9 +784,10 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         let file_threads: Vec<_> = review
             .threads
             .iter()
-            .filter(|thread| !thread.resolved)
+            .filter(|thread| review_thread_visible_in_default_projection(thread, &review))
             .filter(|thread| thread.path.as_deref() == Some(file.path.as_str()))
             .collect();
+        rendered.sidebar_counts.comments += file_threads.len() as u32;
 
         for hunk in &diff.hunks {
             let hunk_text = hunk_header(hunk.old, hunk.new);
@@ -898,6 +939,17 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
 
 fn review_file_is_visible(file: &crate::diff::ReviewFile) -> bool {
     file.is_changed || file.comment_count > 0
+}
+
+fn review_thread_visible_in_default_projection(
+    thread: &ReviewThread,
+    review: &ReviewProjection,
+) -> bool {
+    thread_visible_in_default_projection(
+        thread.resolved,
+        thread.resolved_head_oid.as_deref(),
+        review.current_head_oid.as_deref(),
+    )
 }
 
 fn render_empty_review(rendered: &mut RenderedReview) {
@@ -1096,22 +1148,7 @@ fn push_thread_block(rendered: &mut RenderedReview, thread: &ReviewThread) {
 
     for (index, comment) in thread.comments.iter().enumerate() {
         let invalidates_later_activity = index + 1 < thread.comments.len() || thread.resolved;
-        let marker = if comment.comment.author.kind == AuthorKind::Agent {
-            COMMENT_AGENT_MARKER
-        } else {
-            ""
-        };
-        let mut meta = format!(
-            "{THREAD_BODY_PREFIX}{}{marker}{COMMENT_META_SEPARATOR}{}",
-            comment.comment.author.display_name,
-            comment_timestamp(comment.comment.created_at.as_str())
-        );
-        if let Some(edited_at) = &comment.comment.edited_at {
-            meta.push_str(&format!(
-                "{COMMENT_META_SEPARATOR}{COMMENT_EDITED_LABEL} {}",
-                comment_timestamp(edited_at.as_str())
-            ));
-        }
+        let meta = format!("{THREAD_BODY_PREFIX}{}", comment_meta(comment));
         push_thread_line(
             rendered,
             meta,
@@ -1173,6 +1210,26 @@ fn push_thread_line(
         THREAD_RAIL_END_COL,
         HIGHLIGHT_THREAD_RAIL,
     );
+}
+
+fn comment_meta(comment: &ReviewComment) -> String {
+    let marker = if comment.comment.author.kind == AuthorKind::Agent {
+        COMMENT_AGENT_MARKER
+    } else {
+        ""
+    };
+    let mut meta = format!(
+        "{}{marker}{COMMENT_META_SEPARATOR}{}",
+        comment.comment.author.display_name,
+        comment_timestamp(comment.comment.created_at.as_str())
+    );
+    if let Some(edited_at) = &comment.comment.edited_at {
+        meta.push_str(&format!(
+            "{COMMENT_META_SEPARATOR}{COMMENT_EDITED_LABEL} {}",
+            comment_timestamp(edited_at.as_str())
+        ));
+    }
+    meta
 }
 
 fn wrap_comment_body(body: &str) -> Vec<String> {
@@ -1758,6 +1815,7 @@ mod tests {
         let rendered = render_review_payload(ReviewProjection {
             review_id: "repo".to_string(),
             target_label: "working tree".to_string(),
+            current_head_oid: Some("head-1".to_string()),
             is_branch_review: false,
             files: vec![ReviewFile {
                 path: "src/main.rs".to_string(),
@@ -1787,6 +1845,8 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("src/main.rs"))
         );
+        assert_eq!(rendered.sidebar_counts.files, 1);
+        assert_eq!(rendered.sidebar_counts.comments, 0);
         assert!(!rendered.lines.iter().any(|line| line.contains(EMPTY_TITLE)));
     }
 
@@ -1795,6 +1855,7 @@ mod tests {
         let rendered = render_review_payload(ReviewProjection {
             review_id: "repo".to_string(),
             target_label: "working tree".to_string(),
+            current_head_oid: Some("head-2".to_string()),
             is_branch_review: false,
             files: vec![ReviewFile {
                 path: "src/main.rs".to_string(),
@@ -1838,6 +1899,7 @@ mod tests {
                     end_line: Some(1),
                 },
                 resolved: true,
+                resolved_head_oid: Some("head-1".to_string()),
                 comments: Vec::new(),
             }],
             review_threads: Vec::new(),
@@ -1850,5 +1912,71 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(COMMENT_STATUS_RESOLVED))
         );
+    }
+
+    #[test]
+    fn renders_resolved_threads_from_current_head() {
+        let rendered = render_review_payload(ReviewProjection {
+            review_id: "repo".to_string(),
+            target_label: "working tree".to_string(),
+            current_head_oid: Some("head-1".to_string()),
+            is_branch_review: false,
+            files: vec![ReviewFile {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                is_changed: true,
+                comment_count: 1,
+                added_lines: 1,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                crate::diff::FileContent {
+                    old: None,
+                    new: Some(vec!["fn main() {}".to_string()]),
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                FileDiff {
+                    path: "src/main.rs".to_string(),
+                    hunks: vec![crate::diff::DiffHunk {
+                        old: None,
+                        new: Some(crate::diff::LineRange { start: 1, end: 1 }),
+                        sections: vec![crate::diff::DiffSection::Added {
+                            added: crate::diff::NewRange {
+                                new: crate::diff::LineRange { start: 1, end: 1 },
+                            },
+                        }],
+                    }],
+                },
+            )]),
+            threads: vec![ReviewThread {
+                id: "thread-1".to_string(),
+                scope: THREAD_SCOPE_LINE.to_string(),
+                path: Some("src/main.rs".to_string()),
+                line_label: "src/main.rs:1".to_string(),
+                anchor: ReviewThreadAnchor {
+                    side: Some(SIDE_NEW.to_string()),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                },
+                resolved: true,
+                resolved_head_oid: Some("head-1".to_string()),
+                comments: Vec::new(),
+            }],
+            review_threads: Vec::new(),
+            commits: Vec::new(),
+        });
+
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.contains(COMMENT_STATUS_RESOLVED))
+        );
+        assert_eq!(rendered.sidebar_counts.files, 1);
+        assert_eq!(rendered.sidebar_counts.comments, 1);
     }
 }

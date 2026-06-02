@@ -372,6 +372,7 @@ mod tests {
             created_at: timestamp("2026-05-28T12:01:00Z"),
             updated_at: timestamp("2026-05-28T12:01:00Z"),
             provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
+            resolved_head_oid: None,
             archived_at: None,
             pruned_at: None,
         };

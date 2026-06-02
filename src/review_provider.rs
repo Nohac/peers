@@ -15,9 +15,9 @@ use crate::diff::{
 };
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
-    append_peers_event, load_comment_payload, load_peers_state, load_thread_payload,
-    new_comment_id, new_thread_id, now_rfc3339, regenerate_outputs, write_comment_payload,
-    write_thread_payload,
+    append_peers_event, current_head_oid as repo_current_head_oid, load_comment_payload,
+    load_peers_state, load_thread_payload, new_comment_id, new_thread_id, now_rfc3339,
+    regenerate_outputs, write_comment_payload, write_thread_payload,
 };
 
 const LINE_SCOPE: &str = "line";
@@ -85,9 +85,16 @@ impl ReviewProvider {
 
     pub async fn get_review(&self) -> Result<ReviewProjection> {
         let state = load_peers_state(&self.repo_root).await?;
-        let contexts = open_comment_contexts(&state);
+        let current_head_oid = repo_current_head_oid(&self.repo_root).await?;
+        let contexts = open_comment_contexts(&state, current_head_oid.as_deref());
         let diff = load_review_diff_with_contexts(&self.repo_root, &self.target, &contexts).await?;
-        Ok(review_payload(&state, diff, &self.target, &self.author))
+        Ok(review_payload(
+            &state,
+            diff,
+            &self.target,
+            &self.author,
+            current_head_oid,
+        ))
     }
 
     pub async fn refresh_diff(&self) -> Result<ReviewProjection> {
@@ -112,6 +119,7 @@ impl ReviewProvider {
                 created_at: now.clone(),
                 updated_at: now.clone(),
                 provenance: CreationProvenance::from_target(&self.target),
+                resolved_head_oid: None,
                 archived_at: None,
                 pruned_at: None,
             },
@@ -255,6 +263,7 @@ impl ReviewProvider {
         let mut thread = load_thread_payload(&self.repo_root, &thread_id).await?;
         let resolved_at = now_rfc3339()?;
         thread.status = ThreadStatus::Resolved;
+        thread.resolved_head_oid = repo_current_head_oid(&self.repo_root).await?;
         thread.updated_at = resolved_at.clone();
         write_thread_payload(&self.repo_root, &thread).await?;
         append_peers_event(
@@ -277,6 +286,7 @@ impl ReviewProvider {
         let mut thread = load_thread_payload(&self.repo_root, &thread_id).await?;
         let reopened_at = now_rfc3339()?;
         thread.status = ThreadStatus::Open;
+        thread.resolved_head_oid = None;
         thread.updated_at = reopened_at.clone();
         write_thread_payload(&self.repo_root, &thread).await?;
         append_peers_event(
@@ -299,6 +309,7 @@ impl ReviewProvider {
 pub struct ReviewProjection {
     pub review_id: String,
     pub target_label: String,
+    pub current_head_oid: Option<String>,
     pub is_branch_review: bool,
     pub files: Vec<ReviewFile>,
     pub file_contents_by_path: BTreeMap<String, FileContent>,
@@ -322,6 +333,7 @@ pub struct ReviewThread {
     pub line_label: String,
     pub anchor: ReviewThreadAnchor,
     pub resolved: bool,
+    pub resolved_head_oid: Option<String>,
     pub comments: Vec<ReviewComment>,
 }
 
@@ -402,6 +414,7 @@ fn review_payload(
     mut diff: ReviewDiffPayload,
     target: &ReviewTarget,
     current_author: &Author,
+    current_head_oid: Option<String>,
 ) -> ReviewProjection {
     let threads: Vec<_> = state
         .threads
@@ -411,8 +424,11 @@ fn review_payload(
         .collect();
     let mut comment_counts = BTreeMap::<String, u32>::new();
     for thread in &threads {
-        if !thread.resolved
-            && let Some(path) = &thread.path
+        if thread_visible_in_default_projection(
+            thread.resolved,
+            thread.resolved_head_oid.as_deref(),
+            current_head_oid.as_deref(),
+        ) && let Some(path) = &thread.path
         {
             *comment_counts.entry(path.clone()).or_default() += 1;
         }
@@ -430,6 +446,7 @@ fn review_payload(
     ReviewProjection {
         review_id: "repo".to_string(),
         target_label: target.label(),
+        current_head_oid,
         is_branch_review: target.is_branch(),
         files: diff.files,
         file_contents_by_path: diff.file_contents_by_path,
@@ -440,12 +457,20 @@ fn review_payload(
     }
 }
 
-fn open_comment_contexts(state: &PeersState) -> Vec<FileContextRequest> {
+fn open_comment_contexts(
+    state: &PeersState,
+    current_head_oid: Option<&str>,
+) -> Vec<FileContextRequest> {
     state
         .threads
         .values()
         .filter(|thread| {
-            !thread.resolved && thread.archived_at.is_none() && thread.pruned_at.is_none()
+            thread_visible_in_default_projection(
+                thread.resolved,
+                thread.resolved_head_oid.as_deref(),
+                current_head_oid,
+            ) && thread.archived_at.is_none()
+                && thread.pruned_at.is_none()
         })
         .filter_map(|thread| match &thread.anchor {
             CommentAnchor::Line { line } => Some(FileContextRequest {
@@ -505,6 +530,7 @@ fn review_thread(thread: &CommentThread, current_author: &Author) -> ReviewThrea
         line_label: thread.anchor.label(),
         anchor,
         resolved: thread.resolved,
+        resolved_head_oid: thread.resolved_head_oid.clone(),
         comments: thread
             .comments
             .iter()
@@ -512,6 +538,20 @@ fn review_thread(thread: &CommentThread, current_author: &Author) -> ReviewThrea
             .map(|comment| review_comment(comment, current_author))
             .collect(),
     }
+}
+
+pub(crate) fn thread_visible_in_default_projection(
+    resolved: bool,
+    resolved_head_oid: Option<&str>,
+    current_head_oid: Option<&str>,
+) -> bool {
+    if !resolved {
+        return true;
+    }
+
+    resolved_head_oid.is_some()
+        && current_head_oid.is_some()
+        && resolved_head_oid == current_head_oid
 }
 
 fn review_comment(comment: &Comment, current_author: &Author) -> ReviewComment {

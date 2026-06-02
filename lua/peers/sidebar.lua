@@ -4,12 +4,9 @@ local BUFFER_PREFIX = "peers://review-sidebar/"
 local FILETYPE = "peerssidebar"
 local MODE_FILES = "files"
 local MODE_COMMENTS = "comments"
-local TITLE_FILES = "Files"
-local TITLE_COMMENTS = "Comments"
 local EMPTY_FILES = "No files"
 local EMPTY_COMMENTS = "No comments"
 local WIDTH = 36
-local CONTENT_WIDTH = WIDTH - 2
 local MIN_REVIEW_WIDTH = 90
 local ROW_KIND_FILE_HEADER = "file_header"
 local ROW_KIND_COMMENT = "comment"
@@ -19,11 +16,7 @@ local KEY_COMMENTS = "i"
 local KEY_HIDE = "q"
 local KEY_OPEN = "<CR>"
 local NAMESPACE = vim.api.nvim_create_namespace("peers-sidebar")
-local TOP_LEFT = "╭"
-local BOTTOM_LEFT = "╰"
-local BRANCH = "├"
-local VERTICAL = "│"
-local HORIZONTAL = "─"
+local FOLDER_ICON = "󰉋"
 local OPEN_STATUS = "●"
 local RESOLVED_STATUS = "✓"
 local STATUS_SIGNS = {
@@ -47,6 +40,13 @@ local HIGHLIGHT_DELTA_REMOVED = "PeersSidebarDeltaRemoved"
 local HIGHLIGHT_DELTA_POSITIVE = "PeersSidebarDeltaPositive"
 local HIGHLIGHT_DELTA_NEGATIVE = "PeersSidebarDeltaNegative"
 local HIGHLIGHT_DELTA_NEUTRAL = "PeersSidebarDeltaNeutral"
+local HIGHLIGHT_TAB_ACTIVE = "PeersSidebarTabActive"
+local HIGHLIGHT_TAB_INACTIVE = "PeersSidebarTabInactive"
+local HIGHLIGHT_TAB_FILL = "PeersSidebarTabFill"
+local HIGHLIGHT_THREAD_META = "PeersSidebarThreadMeta"
+local HIGHLIGHT_COMMENT_ELISION = "PeersSidebarCommentElision"
+local HIGHLIGHT_THREAD_RESOLVED = "PeersSidebarThreadResolved"
+local STATUSLINE_ESCAPE_PATTERN = "([%%])"
 
 M.MODE_FILES = MODE_FILES
 M.MODE_COMMENTS = MODE_COMMENTS
@@ -81,6 +81,12 @@ local function define_highlights()
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_DELTA_POSITIVE, { default = true, fg = add_fg })
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_DELTA_NEGATIVE, { default = true, fg = delete_fg })
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_DELTA_NEUTRAL, { default = true, fg = muted_fg })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_TAB_ACTIVE, { default = true, link = "TabLineSel" })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_TAB_INACTIVE, { default = true, link = "TabLine" })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_TAB_FILL, { default = true, link = "TabLineFill" })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_THREAD_META, { default = true, link = "PeersDiffThreadMeta" })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_COMMENT_ELISION, { default = true, link = "Comment" })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_THREAD_RESOLVED, { default = true, fg = add_fg, bold = true })
 end
 
 local function existing_buffer(name)
@@ -119,6 +125,9 @@ local function set_window_options(win)
   vim.wo[win].cursorline = true
   vim.wo[win].winfixbuf = true
   vim.wo[win].winfixwidth = true
+  pcall(function()
+    vim.wo[win].winbar = " "
+  end)
 end
 
 local function review_buf_for(buf, states)
@@ -359,23 +368,85 @@ local function shorten(text, width)
   return marker .. result
 end
 
-local function pad_right(text, width)
-  local padding = math.max(0, width - display_width(text))
-  return text .. string.rep(" ", padding)
-end
-
-local function frame_line(left, label)
-  label = label or ""
-  local prefix = left .. HORIZONTAL
-  if label ~= "" then
-    prefix = prefix .. " " .. label .. " "
+local function shorten_end(text, width)
+  text = text or ""
+  if display_width(text) <= width then
+    return text
   end
-  return pad_right(shorten(prefix, WIDTH), WIDTH)
+  if width <= 1 then
+    return vim.fn.strcharpart(text, 0, width)
+  end
+
+  local marker = "…"
+  local remaining = width - display_width(marker)
+  local result = ""
+  for index = 0, vim.fn.strchars(text) - 1 do
+    local char = vim.fn.strcharpart(text, index, 1)
+    if display_width(result .. char) > remaining then
+      break
+    end
+    result = result .. char
+  end
+  return result .. marker
 end
 
 local function push_line(lines, rows, text, target)
   table.insert(lines, text)
   table.insert(rows, target or {})
+end
+
+local function sidebar_counts(state)
+  if state.sidebar_counts then
+    return {
+      files = state.sidebar_counts.files or 0,
+      comments = state.sidebar_counts.comments or 0,
+    }
+  end
+
+  local files = {}
+  local threads = {}
+  local file_count = 0
+  local comment_count = 0
+  for _, row in ipairs(state.rows or {}) do
+    if row.kind == ROW_KIND_FILE_HEADER and row.path and not files[row.path] then
+      files[row.path] = true
+      file_count = file_count + 1
+    elseif row.kind == ROW_KIND_COMMENT and row.thread_id and not threads[row.thread_id] then
+      threads[row.thread_id] = true
+      comment_count = comment_count + 1
+    end
+  end
+  return {
+    files = file_count,
+    comments = comment_count,
+  }
+end
+
+local function tab_part(mode, key, label, count, active_mode)
+  local highlight = mode == active_mode and HIGHLIGHT_TAB_ACTIVE or HIGHLIGHT_TAB_INACTIVE
+  return {
+    text = string.format(" [%s] %s %d ", key, label, count),
+    highlight = highlight,
+  }
+end
+
+local function statusline_escape(text)
+  return text:gsub(STATUSLINE_ESCAPE_PATTERN, "%%%1")
+end
+
+local function sidebar_winbar(state)
+  local counts = sidebar_counts(state)
+  local active_mode = state.sidebar_mode or MODE_FILES
+  local tabs = {
+    tab_part(MODE_COMMENTS, KEY_COMMENTS, "Comments", counts.comments, active_mode),
+    tab_part(MODE_FILES, KEY_FILES, "Files", counts.files, active_mode),
+  }
+  local parts = {}
+  for _, tab in ipairs(tabs) do
+    table.insert(parts, "%#" .. tab.highlight .. "#" .. statusline_escape(tab.text))
+  end
+  table.insert(parts, "%#" .. HIGHLIGHT_TAB_FILL .. "#")
+  return table.concat(parts, "")
 end
 
 local function dirname(path)
@@ -460,7 +531,6 @@ local function build_files(state)
   local group_order = {}
   local seen = {}
   local counts = comment_counts(state.rows)
-  push_line(lines, rows, frame_line(TOP_LEFT, TITLE_FILES), { title = true })
 
   for index, row in ipairs(state.rows or {}) do
     if row.kind == ROW_KIND_FILE_HEADER and row.path and not seen[row.path] then
@@ -482,12 +552,11 @@ local function build_files(state)
     end
   end
 
-  for group_index, dir in ipairs(group_order) do
+  for _, dir in ipairs(group_order) do
     local files = groups[dir]
-    local is_last_group = group_index == #group_order
-    local group_prefix = is_last_group and BOTTOM_LEFT or BRANCH
-    local file_prefix = is_last_group and "   " or (VERTICAL .. "  ")
-    push_line(lines, rows, group_prefix .. HORIZONTAL .. " " .. shorten(dir, CONTENT_WIDTH), {
+    local file_prefix = "  "
+    local folder_prefix = FOLDER_ICON .. " "
+    push_line(lines, rows, folder_prefix .. shorten(dir, WIDTH - display_width(folder_prefix)), {
       target_line = files[1] and files[1].target_line,
       path = files[1] and files[1].path,
     })
@@ -522,61 +591,132 @@ local function build_files(state)
   end
 
   if #group_order == 0 then
-    push_line(lines, rows, VERTICAL .. " " .. EMPTY_FILES, {})
+    push_line(lines, rows, EMPTY_FILES, {})
   end
   return lines, rows
 end
 
 local function thread_label(row)
-  local path = row.path or "review"
-  if row.source_line then
-    return path .. ":" .. row.source_line
+  local name = basename(row.path or "review")
+  local start_line = row.source_start_line or row.source_line
+  local end_line = row.source_line or row.source_start_line
+  if start_line and end_line and start_line ~= end_line then
+    return string.format("%s:%d-%d", name, start_line, end_line)
   end
-  return path
+  if end_line then
+    return name .. ":" .. end_line
+  end
+  return name
 end
 
 local function build_comments(state)
-  local threads = {}
+  local groups = {}
+  local group_order = {}
   local by_id = {}
   for index, row in ipairs(state.rows or {}) do
     if row.kind == ROW_KIND_COMMENT and row.thread_id then
       local thread = by_id[row.thread_id]
       if not thread then
+        local dir = dirname(row.path or "review")
+        if not groups[dir] then
+          groups[dir] = {}
+          table.insert(group_order, dir)
+        end
         thread = {
+          comments = {},
+          seen_comments = {},
           target_line = index,
           label = thread_label(row),
           resolved = row.resolved == true,
         }
         by_id[row.thread_id] = thread
-        table.insert(threads, thread)
+        table.insert(groups[dir], thread)
       end
-      if row.comment_body and not thread.body then
-        thread.body = row.comment_body
+      if row.comment_id and row.comment_body and not thread.seen_comments[row.comment_id] then
+        thread.seen_comments[row.comment_id] = true
+        table.insert(thread.comments, {
+          body = row.comment_body,
+          meta = row.comment_meta,
+          target_line = index,
+        })
       end
     end
   end
 
   local lines = {}
   local rows = {}
-  push_line(lines, rows, frame_line(TOP_LEFT, TITLE_COMMENTS), { title = true })
 
-  for index, thread in ipairs(threads) do
-    local is_last_thread = index == #threads
-    local branch = is_last_thread and BOTTOM_LEFT or BRANCH
-    local body_prefix = is_last_thread and "   " or (VERTICAL .. "  ")
-    local status = thread.resolved and RESOLVED_STATUS or OPEN_STATUS
-    push_line(lines, rows, branch .. HORIZONTAL .. " " .. status .. " " .. shorten(thread.label, WIDTH - 6), {
+  local function push_comment(comment, border_highlight)
+    if comment.meta then
+      local meta_prefix = "│ "
+      local meta = meta_prefix .. shorten(comment.meta, WIDTH - display_width(meta_prefix))
+      push_line(lines, rows, meta, {
+        border_highlight = border_highlight,
+        border_width = #meta_prefix,
+        meta_highlight = HIGHLIGHT_THREAD_META,
+        meta_col = #meta_prefix,
+        meta_width = #meta - #meta_prefix,
+        target_line = comment.target_line,
+      })
+    end
+    local body_prefix = "│ "
+    push_line(lines, rows, body_prefix .. shorten_end((comment.body or ""):match("[^\n]*") or "", WIDTH - display_width(body_prefix)), {
+      border_highlight = border_highlight,
+      border_width = #body_prefix,
+      target_line = comment.target_line,
+    })
+  end
+
+  local function push_comment_elision(thread, hidden_count, border_highlight)
+    local elision_prefix = "│ "
+    local label = "… " .. hidden_count .. " comments hidden …"
+    local line = elision_prefix .. shorten_end(label, WIDTH - display_width(elision_prefix))
+    push_line(lines, rows, line, {
+      border_highlight = border_highlight,
+      border_width = #elision_prefix,
+      elision_col = #elision_prefix,
+      elision_highlight = HIGHLIGHT_COMMENT_ELISION,
+      elision_width = #line - #elision_prefix,
       target_line = thread.target_line,
     })
-    if thread.body then
-      push_line(lines, rows, body_prefix .. shorten(thread.body, WIDTH - display_width(body_prefix)), {
+  end
+
+  for _, dir in ipairs(group_order) do
+    local folder_prefix = FOLDER_ICON .. " "
+    push_line(lines, rows, folder_prefix .. shorten(dir, WIDTH - display_width(folder_prefix)), {
+      target_line = groups[dir][1] and groups[dir][1].target_line,
+    })
+
+    for _, thread in ipairs(groups[dir]) do
+      local status = thread.resolved and RESOLVED_STATUS or OPEN_STATUS
+      local border_highlight = thread.resolved and HIGHLIGHT_THREAD_RESOLVED or nil
+      local header_prefix = "╭─ " .. status .. " "
+      local header = header_prefix .. shorten(thread.label, WIDTH - display_width(header_prefix))
+      push_line(lines, rows, header, {
+        border_highlight = border_highlight,
+        border_width = #header_prefix,
+        target_line = thread.target_line,
+      })
+      if #thread.comments > 3 then
+        push_comment(thread.comments[1], border_highlight)
+        local hidden_count = #thread.comments - 2
+        push_comment_elision(thread, hidden_count, border_highlight)
+        push_comment(thread.comments[#thread.comments], border_highlight)
+      else
+        for _, comment in ipairs(thread.comments) do
+          push_comment(comment, border_highlight)
+        end
+      end
+      push_line(lines, rows, "╰─", {
+        border_highlight = border_highlight,
+        border_width = #"╰─",
         target_line = thread.target_line,
       })
     end
   end
 
-  if #threads == 0 then
-    push_line(lines, rows, VERTICAL .. " " .. EMPTY_COMMENTS, {})
+  if #group_order == 0 then
+    push_line(lines, rows, EMPTY_COMMENTS, {})
   end
   return lines, rows
 end
@@ -617,8 +757,31 @@ local function render(review_buf, state)
   end
   set_lines(sidebar_buf, lines)
   state.sidebar_rows = rows
+  if window_valid(state) then
+    pcall(function()
+      vim.wo[state.sidebar_win].winbar = sidebar_winbar(state)
+    end)
+  end
   vim.api.nvim_buf_clear_namespace(sidebar_buf, NAMESPACE, 0, -1)
   for index, row in ipairs(rows) do
+    if row.border_highlight then
+      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, 0, {
+        end_col = row.border_width or 0,
+        hl_group = row.border_highlight,
+      })
+    end
+    if row.meta_highlight then
+      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, row.meta_col or 0, {
+        end_col = (row.meta_col or 0) + (row.meta_width or 0),
+        hl_group = row.meta_highlight,
+      })
+    end
+    if row.elision_highlight then
+      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, row.elision_col or 0, {
+        end_col = (row.elision_col or 0) + (row.elision_width or 0),
+        hl_group = row.elision_highlight,
+      })
+    end
     if row.status_col and row.status_highlight then
       vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, row.status_col, {
         end_col = row.status_col + 1,

@@ -382,6 +382,7 @@ local function mask_dirty_file_diffs(root, render)
     rows = {},
     highlights = {},
     diagnostics = diagnostics,
+    sidebar_counts = render.sidebar_counts,
   }
   local index = 1
 
@@ -1293,6 +1294,7 @@ function apply_render(root, buf, render, client_id)
     client_id = client_id,
     lines = render.lines or {},
     rows = render.rows or {},
+    sidebar_counts = render.sidebar_counts or {},
     source_buffers = {},
     source_lsp_buffers = {},
     source_segments = {},
