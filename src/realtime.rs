@@ -13,6 +13,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
+use tracing::{debug, instrument};
 
 use crate::review::{peers_paths, regenerate_outputs};
 
@@ -70,6 +71,7 @@ impl ReviewUpdateBroadcaster {
 
     fn notify(&self, kind: &str) {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        debug!(kind, sequence, "broadcasting review update");
         let _ = self.sender.send(ReviewUpdate {
             kind: kind.to_string(),
             sequence,
@@ -140,6 +142,14 @@ pub async fn run_realtime_watcher(
     }
 }
 
+#[instrument(
+    name = "realtime.publish_pending",
+    skip_all,
+    fields(
+        review_changed = pending.review_changed,
+        diff_changed = pending.diff_changed
+    )
+)]
 async fn publish_pending(
     repo_root: &Path,
     updates: &ReviewUpdateBroadcaster,
@@ -241,9 +251,15 @@ impl WatchSnapshot {
     ) {
         let next = Self::capture(repo_root, events_path);
         if self.events != next.events {
+            debug!("watch snapshot detected event log change");
             pending.review_changed = true;
         }
         if self.tree != next.tree {
+            debug!(
+                previous_hash = self.tree.hash,
+                next_hash = next.tree.hash,
+                "watch snapshot detected repo diff change"
+            );
             pending.diff_changed = true;
         }
         *self = next;
@@ -401,21 +417,28 @@ fn classify_event(
     pending: &mut PendingUpdate,
 ) {
     if matches!(event.kind, EventKind::Access(_)) {
+        debug!(kind = ?event.kind, "ignoring access watch event");
         return;
     }
 
+    let kind = event.kind.clone();
     for path in event.paths {
         if same_path(&path, events_path) {
+            debug!(kind = ?kind, path = %path.display(), "classified watch path as review event log");
             pending.review_changed = true;
             continue;
         }
         if path.starts_with(peers_dir) {
             if path.starts_with(threads_path) {
+                debug!(kind = ?kind, path = %path.display(), "classified watch path as review thread payload");
                 pending.review_changed = true;
+            } else {
+                debug!(kind = ?kind, path = %path.display(), "ignoring internal peers watch path");
             }
             continue;
         }
         if path.starts_with(git_dir) {
+            debug!(kind = ?kind, path = %path.display(), "ignoring git internal watch path");
             continue;
         }
         let gitignore_path = path.strip_prefix(repo_root).unwrap_or(&path);
@@ -423,8 +446,10 @@ fn classify_event(
             .matched_path_or_any_parents(gitignore_path, path.is_dir())
             .is_ignore()
         {
+            debug!(kind = ?kind, path = %path.display(), "ignoring gitignored watch path");
             continue;
         }
+        debug!(kind = ?kind, path = %path.display(), "classified watch path as diff change");
         pending.diff_changed = true;
     }
 }

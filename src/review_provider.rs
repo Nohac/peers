@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use facet::Facet;
 use thiserror::Error;
+use tracing::instrument;
 
 use crate::anchors::{
     AnchorIndex, AnchorLinePlacement, AnchorPlacement, RelocatedLineAnchor,
@@ -88,20 +89,19 @@ impl ReviewProvider {
         self.updates.clone()
     }
 
+    #[instrument(name = "provider.get_review", skip_all, fields(target = %self.target.label()))]
     pub async fn get_review(&self) -> Result<ReviewProjection> {
         let state = load_peers_state(&self.repo_root).await?;
         let current_head_oid = repo_current_head_oid(&self.repo_root).await?;
         let contexts = open_comment_contexts(&state, current_head_oid.as_deref());
-        let initial_diff =
-            load_review_diff_with_contexts(&self.repo_root, &self.target, &contexts).await?;
+        let initial_diff = load_initial_diff(&self.repo_root, &self.target, &contexts).await?;
         let projected_threads = review_threads(&state, &self.author, &initial_diff);
         let relocated_contexts =
             review_thread_contexts(&projected_threads, current_head_oid.as_deref());
         let diff = if relocated_contexts == contexts {
             initial_diff
         } else {
-            load_review_diff_with_contexts(&self.repo_root, &self.target, &relocated_contexts)
-                .await?
+            load_relocated_diff(&self.repo_root, &self.target, &relocated_contexts).await?
         };
         Ok(review_payload(
             &state,
@@ -337,6 +337,24 @@ impl ReviewProvider {
         self.updates.notify_review_changed();
         Ok(review)
     }
+}
+
+#[instrument(name = "load_initial_diff", skip_all, fields(contexts = contexts.len()))]
+async fn load_initial_diff(
+    repo_root: &Path,
+    target: &ReviewTarget,
+    contexts: &[FileContextRequest],
+) -> Result<ReviewDiffPayload> {
+    load_review_diff_with_contexts(repo_root, target, contexts).await
+}
+
+#[instrument(name = "load_relocated_diff", skip_all, fields(contexts = contexts.len()))]
+async fn load_relocated_diff(
+    repo_root: &Path,
+    target: &ReviewTarget,
+    contexts: &[FileContextRequest],
+) -> Result<ReviewDiffPayload> {
+    load_review_diff_with_contexts(repo_root, target, contexts).await
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
@@ -587,17 +605,36 @@ fn review_thread_contexts(
         .collect()
 }
 
+#[instrument(
+    name = "provider.review_threads",
+    skip_all,
+    fields(threads = state.threads.len(), files = diff.files.len())
+)]
 fn review_threads(
     state: &PeersState,
     current_author: &Author,
     diff: &ReviewDiffPayload,
 ) -> Vec<ReviewThread> {
-    let anchor_indexes = ReviewAnchorIndexes::new(diff);
+    let anchor_indexes = build_anchor_indexes(diff);
+    relocate_threads(state, current_author, &anchor_indexes)
+}
+
+#[instrument(name = "anchor_indexes", skip_all)]
+fn build_anchor_indexes(diff: &ReviewDiffPayload) -> ReviewAnchorIndexes {
+    ReviewAnchorIndexes::new(diff)
+}
+
+#[instrument(name = "relocate_threads", skip_all)]
+fn relocate_threads(
+    state: &PeersState,
+    current_author: &Author,
+    anchor_indexes: &ReviewAnchorIndexes,
+) -> Vec<ReviewThread> {
     state
         .threads
         .values()
         .filter(|thread| thread.pruned_at.is_none() && thread.archived_at.is_none())
-        .map(|thread| review_thread(thread, current_author, &anchor_indexes))
+        .map(|thread| review_thread(thread, current_author, anchor_indexes))
         .collect()
 }
 

@@ -340,6 +340,8 @@ Anchor relocation should try, in order:
 8. File-level fallback.
 9. Detached.
 
+Multi-line anchors need a bounded expansion pass before weak line fallback. If most original per-line hashes still appear in order inside a slightly larger current window, such as when a line is inserted inside a commented function, the relocated block should expand to cover that current window instead of marking the whole thread stale. This placement should carry per-line mapping/confidence metadata: unchanged original lines stay strong, inserted or changed lines inside the block are marked weaker, and the thread border/card can explain the mixed location state. The expansion must stay conservative, prefer the smallest confident window, avoid splitting one original block across unrelated regions, and have table-driven tests for single-line, multi-line, inserted-line, moved-window, and ambiguous-window cases.
+
 Line-number fallback must not be treated as a trusted relocation. If content and context evidence no longer match but the original line/range still exists, the placement should be marked as weak/stale/line-fallback in projection metadata. Unresolved threads may still render at that weak placement so the user can act on them, but resolved threads with weak placement should hide from default diff/editor projections and remain available only in explicit complete/global listings and cleanup previews.
 
 In visual review surfaces, stale/weak placements should be immediately distinguishable from confident inline placements. The normal thread rail/card border can stay blue for exact or strong relocations, while weak/stale/line-fallback placements should render that same border/rail in red. This should be metadata-driven from the placement state rather than inferred by the UI from text labels.
@@ -676,7 +678,7 @@ Cursor and viewport stability during live updates:
 - After rendering the new projection, restore the cursor to the best matching row for that semantic anchor. If the exact comment, thread, or source line still exists, move the cursor there even if inserted/removed lines changed its Neovim row number.
 - If the exact row no longer exists, fall back to the nearest meaningful context in the same thread, then same source line/range, then same hunk, then same file header, then the nearest surviving row by old render order.
 - Preserve the viewport around the restored semantic row where practical, so live updates do not jump the user away from the code/comment they were reading.
-- Composer windows should pin to the semantic anchor they were opened from. If that anchor disappears during a live update, keep the draft text and move the composer to the nearest fallback row with a visible warning rather than silently closing or submitting stale context.
+- Composer windows should pin to the semantic anchor they were opened from. If that anchor disappears during a live update, keep the draft text and move the composer to the nearest fallback row with a visible warning rather than silently closing or submitting stale context. Peers-owned composers may pause live refresh while the user is typing, but third-party floating windows must not pause refresh globally; LSP progress UIs such as fidget should not delay diff updates until the underlying language server finishes.
 - Direct user-initiated navigation should win over delayed refreshes. If a refresh completes after the user has moved the cursor, do not restore an older cursor anchor over the newer position.
 
 For current-side rows, Neovim should open the real file in a hidden source buffer so the user's normal Tree-sitter and language server setup attaches. Hidden buffers are used first for syntax mirroring, and Peers can then proxy LSP-like requests from the `peersdiff` buffer to that hidden real buffer. The bundled plugin may transparently wrap normal `vim.lsp.buf` entry points while the active buffer is a Peers review buffer so existing user mappings keep working, but source code actions must remain disabled so review-owned actions stay predictable. Deleted/base-side rows may initially provide Peers metadata only; hidden base-version buffers can be added later as a best-effort enhancement.
@@ -1062,6 +1064,14 @@ Do not test:
 - Simple DTO mappings.
 - CLI flag plumbing unless it becomes subtle.
 - Basic component wrappers.
+
+## Performance Profiling
+
+Use structured Rust tracing before guessing at realtime refresh performance. Run Peers with `PEERS_LOG=peers=info` or `RUST_LOG=peers=info` to emit span-close timings for provider projection, diff loading, anchor indexing/relocation, LSP rendering, and realtime publish paths. Use `PEERS_LOG=peers=debug` when diagnosing update spam; update broadcasts log their kind and sequence at debug level. Backend traces are written to `.peers/backend.log` for repo commands, so use `tail -f .peers/backend.log` while reproducing slow refreshes.
+
+Use sampling profilers for CPU flamegraphs rather than custom timers. The expected workflow is to start a Peers session with symbols enabled, trigger the slow refresh path from Neovim, and capture the running `peers` process with `cargo flamegraph`, `perf`, or an equivalent platform profiler. Rust tracing identifies the slow logical phase; the flamegraph identifies the hot functions inside that phase.
+
+Neovim-side work remains outside Rust tracing. Lua may use lightweight `PEERS_TIMING=1` instrumentation for render RPC roundtrip, buffer application, sidebar update, and viewport Tree-sitter mirroring timings. Plugin timings are appended to `.peers/nvim.log`, so use `tail -f .peers/nvim.log` alongside the backend log.
 
 ## Feature Status
 

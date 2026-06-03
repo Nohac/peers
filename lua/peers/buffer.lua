@@ -1,5 +1,6 @@
 local lsp = require("peers.lsp")
 local sidebar = require("peers.sidebar")
+local timing = require("peers.timing")
 
 local M = {}
 
@@ -956,6 +957,7 @@ local function path_is_under(root, path)
 end
 
 local function mirror_visible_treesitter(buf)
+  local start = timing.now()
   local state = RENDER_STATES[buf]
   if not state or not vim.api.nvim_buf_is_valid(buf) then
     return
@@ -963,14 +965,17 @@ local function mirror_visible_treesitter(buf)
 
   vim.api.nvim_buf_clear_namespace(buf, SOURCE_NAMESPACE, 0, -1)
 
+  local mirrored = 0
   for _, range in ipairs(visible_row_ranges(buf)) do
     for review_row = range.first, range.last do
       local row = state.rows[review_row + 1]
       if row_is_mirrorable(row) then
         apply_line_segments(buf, review_row, row.code_start_col or 0, segments_for_row(state, row))
+        mirrored = mirrored + 1
       end
     end
   end
+  timing.log(state.root, "buffer", string.format("mirror_visible_treesitter %.1fms rows=%d buf=%s", timing.ms(start), mirrored, tostring(buf)))
 end
 
 local function schedule_visible_mirror(buf)
@@ -1004,20 +1009,18 @@ local function composer_is_open(state)
     )
 end
 
-local function floating_window_is_open()
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_is_valid(win) then
-      local config = vim.api.nvim_win_get_config(win)
-      if config and config.relative and config.relative ~= "" then
-        return true
-      end
-    end
+local function review_refresh_pause_reason(state)
+  if composer_is_open(state) then
+    return "composer"
   end
-  return false
+  if vim.fn.pumvisible() == 1 then
+    return "popup menu"
+  end
+  return nil
 end
 
 local function review_refresh_is_paused(state)
-  return composer_is_open(state) or floating_window_is_open()
+  return review_refresh_pause_reason(state) ~= nil
 end
 
 local function render_review_now(buf, state)
@@ -1025,8 +1028,11 @@ local function render_review_now(buf, state)
     return
   end
 
+  local start = timing.now()
+  timing.log(state.root, "buffer", "render_review_now start buf=" .. tostring(buf))
   state.pending_refresh = false
   lsp.render_now(state.client_id, buf, function(render)
+    timing.log(state.root, "buffer", string.format("render_review_now rpc %.1fms buf=%s", timing.ms(start), tostring(buf)))
     apply_render(state.root, buf, render, state.client_id)
   end)
 end
@@ -1049,10 +1055,12 @@ local function schedule_pending_refresh_check(buf, state)
     if not review_buffer_is_visible(buf) then
       return
     end
-    local paused = review_refresh_is_paused(current)
-    if not paused then
+    local pause_reason = review_refresh_pause_reason(current)
+    if not pause_reason then
+      timing.log(current.root, "buffer", "pending_refresh flush buf=" .. tostring(buf))
       render_review_now(buf, current)
-    elseif paused then
+    else
+      timing.log(current.root, "buffer", "pending_refresh still paused reason=" .. pause_reason .. " buf=" .. tostring(buf))
       schedule_pending_refresh_check(buf, current)
     end
   end, PAUSED_REFRESH_CHECK_MS)
@@ -1063,13 +1071,24 @@ local function request_review_refresh(buf, state)
     return
   end
 
-  if review_buffer_is_visible(buf) and not review_refresh_is_paused(state) then
+  local visible = review_buffer_is_visible(buf)
+  local pause_reason = review_refresh_pause_reason(state)
+  if visible and not pause_reason then
+    timing.log(state.root, "buffer", "request_refresh immediate buf=" .. tostring(buf))
     render_review_now(buf, state)
     return
   end
 
+  local was_pending = state.pending_refresh
   state.pending_refresh = true
-  if review_buffer_is_visible(buf) then
+  if not was_pending then
+    local reason = "not visible"
+    if visible and pause_reason then
+      reason = "paused " .. pause_reason
+    end
+    timing.log(state.root, "buffer", "request_refresh pending reason=" .. reason .. " buf=" .. tostring(buf))
+  end
+  if visible then
     schedule_pending_refresh_check(buf, state)
   end
 end
@@ -1329,17 +1348,32 @@ function apply_render(root, buf, render, client_id)
     return
   end
 
+  local total_start = timing.now()
+  local stage_start = total_start
   local existing = RENDER_STATES[buf]
   local cursor_anchors = save_buffer_cursor_anchors(buf)
   local remembered_view = existing and existing.view or nil
   if existing then
     close_composer(existing)
   end
+  local prepare_ms = timing.ms(stage_start)
 
+  stage_start = timing.now()
   render = mask_dirty_file_diffs(root, render)
+  local mask_ms = timing.ms(stage_start)
+
+  stage_start = timing.now()
   set_lines(buf, render.lines)
+  local set_lines_ms = timing.ms(stage_start)
+
+  stage_start = timing.now()
   apply_structural_highlights(buf, render.highlights)
+  local highlights_ms = timing.ms(stage_start)
+
+  stage_start = timing.now()
   apply_diagnostics(buf, render.diagnostics)
+  local diagnostics_ms = timing.ms(stage_start)
+
   RENDER_STATES[buf] = {
     root = root,
     client_id = client_id,
@@ -1364,10 +1398,39 @@ function apply_render(root, buf, render, client_id)
   if existing == nil then
     RENDER_STATES[buf].sidebar_requested = true
   end
+
+  stage_start = timing.now()
   restore_buffer_cursor_anchors(buf, cursor_anchors, render.rows or {})
+  local restore_ms = timing.ms(stage_start)
+
+  stage_start = timing.now()
   sidebar.update_preserving_focus(buf, RENDER_STATES)
+  local sidebar_ms = timing.ms(stage_start)
+
+  stage_start = timing.now()
   setup_mirror_autocmds(buf)
+  local autocmd_ms = timing.ms(stage_start)
+
+  stage_start = timing.now()
   mirror_visible_treesitter(buf)
+  local mirror_ms = timing.ms(stage_start)
+
+  timing.log(root, "buffer", string.format(
+    "apply_render prepare=%.1fms mask=%.1fms lines=%.1fms highlights=%.1fms diagnostics=%.1fms restore=%.1fms sidebar=%.1fms autocmd=%.1fms mirror=%.1fms total=%.1fms rows=%d lines=%d buf=%s",
+    prepare_ms,
+    mask_ms,
+    set_lines_ms,
+    highlights_ms,
+    diagnostics_ms,
+    restore_ms,
+    sidebar_ms,
+    autocmd_ms,
+    mirror_ms,
+    timing.ms(total_start),
+    #(render.rows or {}),
+    #(render.lines or {}),
+    tostring(buf)
+  ))
 end
 
 function M.comment_current(buf, anchor)
@@ -1569,6 +1632,7 @@ end
 function M.refresh_from_client(client_id)
   for buf, state in pairs(RENDER_STATES) do
     if state.client_id == client_id and vim.api.nvim_buf_is_valid(buf) then
+      timing.log(state.root, "buffer", "refresh_from_client client=" .. tostring(client_id) .. " buf=" .. tostring(buf))
       request_review_refresh(buf, state)
     end
   end
@@ -1577,6 +1641,7 @@ end
 function M.refresh_all()
   for buf, state in pairs(RENDER_STATES) do
     if vim.api.nvim_buf_is_valid(buf) then
+      timing.log(state.root, "buffer", "refresh_all buf=" .. tostring(buf))
       request_review_refresh(buf, state)
     end
   end

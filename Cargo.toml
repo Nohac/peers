@@ -17,5 +17,7 @@ time = { version = "0.3.47", features = ["formatting", "macros"] }
 thiserror = "2.0"
 tokio = { version = "1.52.3", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tower-lsp-server = "0.23.0"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 vox = { version = "0.8.2", features = ["transport-websocket"] }
 humantime = "2.3.0"

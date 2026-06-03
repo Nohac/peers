@@ -123,6 +123,8 @@ pub struct PeersPaths {
     pub review_md: PathBuf,
     pub agent_context: PathBuf,
     pub session: PathBuf,
+    pub backend_log: PathBuf,
+    pub nvim_log: PathBuf,
 }
 
 pub fn storage_root(repo_root: &Path) -> PathBuf {
@@ -137,6 +139,8 @@ pub fn peers_paths(repo_root: &Path) -> PeersPaths {
         review_md: root.join("review.md"),
         agent_context: root.join("agent-context.md"),
         session: root.join("session.json"),
+        backend_log: root.join("backend.log"),
+        nvim_log: root.join("nvim.log"),
         root,
     }
 }

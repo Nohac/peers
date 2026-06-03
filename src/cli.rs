@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 use crate::comments::{AuthorKind, CommentThread, PeersEvent, PeersState};
 use crate::diff::{CommentAnchor, FileSide, ReviewTarget};
+use crate::logging;
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
     AuthorOverride, append_peers_event, discover_repo, load_peers_state, load_thread_payload,
@@ -255,6 +256,7 @@ struct LineRange {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Command::Skill = &cli.command {
+        logging::init();
         print!("{PEERS_SKILL_TEXT}");
         return Ok(());
     }
@@ -265,6 +267,7 @@ pub async fn run() -> Result<()> {
         email: cli.author_email,
         agent: cli.agent,
     })?;
+    logging::init_file(&peers_paths(&repo.root).backend_log);
 
     let nvim_listen = cli.nvim_listen;
 

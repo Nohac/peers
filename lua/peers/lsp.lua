@@ -1,3 +1,5 @@
+local timing = require("peers.timing")
+
 local M = {}
 
 local PEERS_LSP_NAME = "peersdiff"
@@ -26,6 +28,16 @@ local ATTACH_TIMEOUT_ERROR = "Peers LSP did not become ready"
 local RENDER_TIMEOUT_ERROR = "Peers render request timed out"
 
 local pending_refreshes = {}
+
+local function context_root(context)
+  local client = context and context.client_id and vim.lsp.get_client_by_id(context.client_id) or nil
+  return client and client.config and client.config.root_dir or nil
+end
+
+local function client_root(client)
+  -- comment
+  return client and client.config and client.config.root_dir or nil
+end
 
 local COMMAND_HANDLERS = {
   [COMMAND_ADD_COMMENT] = "comment_current",
@@ -63,13 +75,17 @@ local function review_updated_handler(_, _, context)
   if not context or not context.client_id then
     return
   end
+  local root = context_root(context)
   if pending_refreshes[context.client_id] then
+    timing.log(root, "lsp", "reviewUpdated coalesced client=" .. tostring(context.client_id))
     return
   end
 
+  timing.log(root, "lsp", "reviewUpdated scheduled client=" .. tostring(context.client_id))
   pending_refreshes[context.client_id] = true
   vim.defer_fn(function()
     pending_refreshes[context.client_id] = nil
+    timing.log(root, "lsp", "reviewUpdated firing client=" .. tostring(context.client_id))
     require("peers.buffer").refresh_from_client(context.client_id)
   end, REFRESH_DEBOUNCE_MS)
 end
@@ -148,7 +164,9 @@ function M.attach_when_ready(buf, root, session, on_ready)
 end
 
 local function request_render(client, buf, on_render)
+  local start = timing.now()
   client:request(RENDER_METHOD, nil, function(error, result)
+    timing.log(client_root(client), "lsp", string.format("render rpc callback %.1fms buf=%s", timing.ms(start), tostring(buf)))
     if error then
       vim.notify(error.message or tostring(error), vim.log.levels.ERROR)
       return

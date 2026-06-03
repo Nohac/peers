@@ -6,6 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tower_lsp_server::jsonrpc::{Error as LspError, Result as LspResult};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+use tracing::instrument;
 
 use crate::comments::AuthorKind;
 use crate::diff::{DiffSection, FileSide, LineRange};
@@ -218,13 +219,14 @@ impl PeersDiffLanguageServer {
         }
     }
 
+    #[instrument(name = "lsp.render_review", skip_all)]
     async fn render_review(&self) -> LspResult<LSPAny> {
         let review = self
             .provider
             .get_review()
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(render_review_payload(review).into_lsp())
+        Ok(rendered_review_into_lsp(render_payload(review)))
     }
 
     async fn create_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -494,6 +496,16 @@ impl RenderedReview {
         object.insert("sidebar_counts".to_string(), self.sidebar_counts.into_lsp());
         LSPAny::Object(object)
     }
+}
+
+#[instrument(name = "render_payload", skip_all)]
+fn render_payload(review: ReviewProjection) -> RenderedReview {
+    render_review_payload(review)
+}
+
+#[instrument(name = "into_lsp", skip_all)]
+fn rendered_review_into_lsp(rendered: RenderedReview) -> LSPAny {
+    rendered.into_lsp()
 }
 
 #[derive(Debug, Default)]
