@@ -11,6 +11,9 @@ local DIAGNOSTIC_NAMESPACE = vim.api.nvim_create_namespace("peers-review-diagnos
 local ADD_FALLBACK_FG = "#3fb950"
 local DELETE_FALLBACK_FG = "#f85149"
 local THREAD_FALLBACK_FG = "#58a6ff"
+local THREAD_CONTEXT_FALLBACK_FG = "#d29922"
+local THREAD_STALE_FALLBACK_FG = "#f85149"
+local THREAD_DETACHED_FALLBACK_FG = "#8b949e"
 local NORMAL_FALLBACK_FG = "#f0f6fc"
 local NORMAL_FALLBACK_BG = "#000000"
 local HIGHLIGHT_FG = "fg"
@@ -44,6 +47,20 @@ local DELETE_BACKGROUND_GROUPS = {
 local THREAD_FOREGROUND_GROUPS = {
   "DiagnosticInfo",
   "Identifier",
+}
+local THREAD_CONTEXT_FOREGROUND_GROUPS = {
+  "DiagnosticWarn",
+  "WarningMsg",
+  "GitSignsChange",
+}
+local THREAD_STALE_FOREGROUND_GROUPS = {
+  "DiagnosticError",
+  "ErrorMsg",
+  "GitSignsDelete",
+}
+local THREAD_DETACHED_FOREGROUND_GROUPS = {
+  "Comment",
+  "LineNr",
 }
 local HIGHLIGHT_GROUPS = {
   PeersDiffFileHeader = { link = "Title" },
@@ -243,6 +260,21 @@ local function define_diff_gutter_highlights()
     default = true,
     [HIGHLIGHT_FG] = thread_fg,
   })
+  local thread_context_fg = foreground_from(THREAD_CONTEXT_FOREGROUND_GROUPS, THREAD_CONTEXT_FALLBACK_FG)
+  local thread_stale_fg = foreground_from(THREAD_STALE_FOREGROUND_GROUPS, THREAD_STALE_FALLBACK_FG)
+  local thread_detached_fg = foreground_from(THREAD_DETACHED_FOREGROUND_GROUPS, THREAD_DETACHED_FALLBACK_FG)
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadBorderContext", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_context_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadBorderStale", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_stale_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadBorderDetached", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_detached_fg,
+  })
   pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadHeader", {
     default = true,
     [HIGHLIGHT_FG] = normal_fg,
@@ -252,10 +284,29 @@ local function define_diff_gutter_highlights()
     default = true,
     [HIGHLIGHT_FG] = thread_fg,
   })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadLocationNote", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_detached_fg,
+  })
   pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadRail", {
     default = true,
     [HIGHLIGHT_FG] = thread_fg,
     [HIGHLIGHT_BG] = thread_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadRailContext", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_context_fg,
+    [HIGHLIGHT_BG] = thread_context_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadRailStale", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_stale_fg,
+    [HIGHLIGHT_BG] = thread_stale_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadRailDetached", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_detached_fg,
+    [HIGHLIGHT_BG] = thread_detached_fg,
   })
 end
 

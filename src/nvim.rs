@@ -107,9 +107,15 @@ const HIGHLIGHT_LINE_NUMBER: &str = "PeersDiffLineNumber";
 const HIGHLIGHT_THREAD_ATTACHMENT: &str = "PeersDiffThreadAttachment";
 const HIGHLIGHT_THREAD_BODY: &str = "PeersDiffThreadBody";
 const HIGHLIGHT_THREAD_BORDER: &str = "PeersDiffThreadBorder";
-const HIGHLIGHT_THREAD_HEADER: &str = "PeersDiffThreadHeader";
+const HIGHLIGHT_THREAD_BORDER_CONTEXT: &str = "PeersDiffThreadBorderContext";
+const HIGHLIGHT_THREAD_BORDER_STALE: &str = "PeersDiffThreadBorderStale";
+const HIGHLIGHT_THREAD_BORDER_DETACHED: &str = "PeersDiffThreadBorderDetached";
 const HIGHLIGHT_THREAD_META: &str = "PeersDiffThreadMeta";
 const HIGHLIGHT_THREAD_RAIL: &str = "PeersDiffThreadRail";
+const HIGHLIGHT_THREAD_RAIL_CONTEXT: &str = "PeersDiffThreadRailContext";
+const HIGHLIGHT_THREAD_RAIL_STALE: &str = "PeersDiffThreadRailStale";
+const HIGHLIGHT_THREAD_RAIL_DETACHED: &str = "PeersDiffThreadRailDetached";
+const HIGHLIGHT_THREAD_LOCATION_NOTE: &str = "PeersDiffThreadLocationNote";
 const HIGHLIGHT_EMPTY_TITLE: &str = "PeersDiffEmptyTitle";
 const HIGHLIGHT_EMPTY_TEXT: &str = "PeersDiffEmptyText";
 const HUNK_HEADER_PREFIX: &str = "@@";
@@ -637,7 +643,7 @@ impl RenderedRow {
             can_edit: comment.map(|comment| comment.can_edit),
             invalidates_later_activity: comment.map(|_| invalidates_later_activity),
             resolved: Some(thread.resolved),
-            placement_state: Some("inline"),
+            placement_state: Some(thread_placement_state(thread)),
         }
     }
 
@@ -1062,13 +1068,13 @@ fn push_attachment_highlights(
     line: u32,
     rendered_line: u32,
 ) {
-    if !threads
+    let Some(thread) = threads
         .iter()
         .copied()
-        .any(|thread| thread_covers_line(thread, path, side, line))
-    {
+        .find(|thread| thread_covers_line(thread, path, side, line))
+    else {
         return;
-    }
+    };
 
     let end_col = rendered.lines[rendered_line as usize].len() as u32;
     rendered.push_highlight(
@@ -1081,7 +1087,7 @@ fn push_attachment_highlights(
         rendered_line,
         THREAD_RAIL_START_COL,
         THREAD_RAIL_END_COL,
-        HIGHLIGHT_THREAD_RAIL,
+        thread_line_rail_highlight(thread, line),
     );
 }
 
@@ -1143,7 +1149,7 @@ fn push_thread_block(rendered: &mut RenderedReview, thread: &ReviewThread) {
         thread,
         None,
         false,
-        HIGHLIGHT_THREAD_HEADER,
+        thread_border_highlight(thread),
     );
 
     for (index, comment) in thread.comments.iter().enumerate() {
@@ -1180,14 +1186,7 @@ fn push_thread_block(rendered: &mut RenderedReview, thread: &ReviewThread) {
         }
     }
 
-    push_thread_line(
-        rendered,
-        THREAD_FOOTER.to_string(),
-        thread,
-        None,
-        false,
-        HIGHLIGHT_THREAD_BORDER,
-    );
+    push_thread_footer(rendered, thread);
 }
 
 fn push_thread_line(
@@ -1208,8 +1207,93 @@ fn push_thread_line(
         line,
         THREAD_RAIL_START_COL,
         THREAD_RAIL_END_COL,
-        HIGHLIGHT_THREAD_RAIL,
+        thread_rail_highlight(thread),
     );
+}
+
+fn push_thread_footer(rendered: &mut RenderedReview, thread: &ReviewThread) {
+    let note = thread_location_note(thread);
+    let line_text = format!("{THREAD_FOOTER} {note}");
+    let line = rendered.push_line(
+        truncate_display_line(line_text),
+        RenderedRow::comment(thread, None, false),
+    );
+    let border_end = THREAD_FOOTER.len() as u32;
+    let end_col = rendered.lines[line as usize].len() as u32;
+    rendered.push_highlight(line, 0, border_end, thread_border_highlight(thread));
+    if end_col > border_end {
+        rendered.push_highlight(
+            line,
+            border_end + 1,
+            end_col,
+            HIGHLIGHT_THREAD_LOCATION_NOTE,
+        );
+    }
+    rendered.push_highlight(
+        line,
+        THREAD_RAIL_START_COL,
+        THREAD_RAIL_END_COL,
+        thread_rail_highlight(thread),
+    );
+}
+
+fn thread_border_highlight(thread: &ReviewThread) -> &'static str {
+    match thread_placement_state(thread) {
+        "context" => HIGHLIGHT_THREAD_BORDER_CONTEXT,
+        "stale" => HIGHLIGHT_THREAD_BORDER_STALE,
+        "file" | "detached" => HIGHLIGHT_THREAD_BORDER_DETACHED,
+        _ => HIGHLIGHT_THREAD_BORDER,
+    }
+}
+
+fn thread_rail_highlight(thread: &ReviewThread) -> &'static str {
+    match thread_placement_state(thread) {
+        "context" => HIGHLIGHT_THREAD_RAIL_CONTEXT,
+        "stale" => HIGHLIGHT_THREAD_RAIL_STALE,
+        "file" | "detached" => HIGHLIGHT_THREAD_RAIL_DETACHED,
+        _ => HIGHLIGHT_THREAD_RAIL,
+    }
+}
+
+fn thread_line_rail_highlight(thread: &ReviewThread, current_line: u32) -> &'static str {
+    let placement = thread
+        .anchor
+        .line_placements
+        .iter()
+        .find(|line| line.current_line == Some(current_line))
+        .map(|line| line.placement.as_str());
+    match placement {
+        Some("exact" | "content") => HIGHLIGHT_THREAD_RAIL,
+        Some("context" | "changed") => HIGHLIGHT_THREAD_RAIL_CONTEXT,
+        Some("line_fallback") => HIGHLIGHT_THREAD_RAIL_STALE,
+        Some("missing" | "detached") => HIGHLIGHT_THREAD_RAIL_DETACHED,
+        _ => thread_rail_highlight(thread),
+    }
+}
+
+fn thread_location_note(thread: &ReviewThread) -> &'static str {
+    match thread.anchor.placement.as_deref() {
+        Some("exact") => "exact source match",
+        Some("per_line_hash") => "source lines match",
+        Some("moved_exact") => "moved exact source match",
+        Some("context") => "anchored by surrounding context",
+        Some("window") => "partial source match",
+        Some("line_fallback") => "stale line fallback",
+        Some("file_fallback") => "file-level fallback",
+        Some("detached") => "detached from current source",
+        _ => "source location",
+    }
+}
+
+fn thread_placement_state(thread: &ReviewThread) -> &'static str {
+    match thread.anchor.placement.as_deref() {
+        Some("exact" | "per_line_hash" | "moved_exact") => "inline",
+        Some("context" | "window") => "context",
+        Some("line_fallback") => "stale",
+        Some("file_fallback") => "file",
+        Some("detached") => "detached",
+        _ => "inline",
+    }
 }
 
 fn comment_meta(comment: &ReviewComment) -> String {
@@ -1805,8 +1889,9 @@ fn review_update_param(kind: String, sequence: u64) -> LSPAny {
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::comments::{Author, AuthorKind, Comment, CommentId, PeersTimestamp, ThreadId};
     use crate::diff::{FileDiff, FileStatus, ReviewFile};
-    use crate::review_provider::ReviewThreadAnchor;
+    use crate::review_provider::{ReviewThreadAnchor, ReviewThreadLinePlacement};
 
     use super::*;
 
@@ -1897,6 +1982,8 @@ mod tests {
                     side: Some(SIDE_NEW.to_string()),
                     start_line: Some(1),
                     end_line: Some(1),
+                    placement: Some("exact".to_string()),
+                    line_placements: Vec::new(),
                 },
                 resolved: true,
                 resolved_head_oid: Some("head-1".to_string()),
@@ -1961,6 +2048,8 @@ mod tests {
                     side: Some(SIDE_NEW.to_string()),
                     start_line: Some(1),
                     end_line: Some(1),
+                    placement: Some("exact".to_string()),
+                    line_placements: Vec::new(),
                 },
                 resolved: true,
                 resolved_head_oid: Some("head-1".to_string()),
@@ -1978,5 +2067,230 @@ mod tests {
         );
         assert_eq!(rendered.sidebar_counts.files, 1);
         assert_eq!(rendered.sidebar_counts.comments, 1);
+    }
+
+    #[test]
+    fn renders_stale_thread_with_stale_accent_highlights() {
+        let rendered = render_review_payload(ReviewProjection {
+            review_id: "repo".to_string(),
+            target_label: "working tree".to_string(),
+            current_head_oid: Some("head-1".to_string()),
+            is_branch_review: false,
+            files: vec![ReviewFile {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                is_changed: true,
+                comment_count: 1,
+                added_lines: 1,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                crate::diff::FileContent {
+                    old: None,
+                    new: Some(vec!["fn main() {}".to_string()]),
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                FileDiff {
+                    path: "src/main.rs".to_string(),
+                    hunks: vec![crate::diff::DiffHunk {
+                        old: None,
+                        new: Some(crate::diff::LineRange { start: 1, end: 1 }),
+                        sections: vec![crate::diff::DiffSection::Added {
+                            added: crate::diff::NewRange {
+                                new: crate::diff::LineRange { start: 1, end: 1 },
+                            },
+                        }],
+                    }],
+                },
+            )]),
+            threads: vec![ReviewThread {
+                id: "thread-1".to_string(),
+                scope: THREAD_SCOPE_LINE.to_string(),
+                path: Some("src/main.rs".to_string()),
+                line_label: "src/main.rs:1".to_string(),
+                anchor: ReviewThreadAnchor {
+                    side: Some(SIDE_NEW.to_string()),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    placement: Some("line_fallback".to_string()),
+                    line_placements: vec![ReviewThreadLinePlacement {
+                        original_line: 1,
+                        current_line: Some(1),
+                        placement: "line_fallback".to_string(),
+                    }],
+                },
+                resolved: false,
+                resolved_head_oid: None,
+                comments: vec![ReviewComment {
+                    comment: Comment {
+                        id: CommentId::from_raw("cmt_test"),
+                        thread_id: ThreadId::from_raw("thr_test"),
+                        author: Author {
+                            kind: AuthorKind::Human,
+                            display_name: "jonas".to_string(),
+                            email: None,
+                        },
+                        body: "stale context".to_string(),
+                        created_at: PeersTimestamp::from_rfc3339_unchecked("2026-05-28T12:00:00Z"),
+                        edited_at: None,
+                        deleted_at: None,
+                    },
+                    can_edit: true,
+                }],
+            }],
+            review_threads: Vec::new(),
+            commits: Vec::new(),
+        });
+
+        assert!(rendered.highlights.iter().any(|highlight| {
+            highlight.group == HIGHLIGHT_THREAD_BORDER_STALE
+                || highlight.group == HIGHLIGHT_THREAD_RAIL_STALE
+        }));
+        assert!(
+            rendered.rows.iter().any(|row| {
+                row.kind == ROW_KIND_COMMENT && row.placement_state == Some("stale")
+            })
+        );
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.contains("stale line fallback"))
+        );
+        assert!(
+            rendered
+                .highlights
+                .iter()
+                .any(|highlight| { highlight.group == HIGHLIGHT_THREAD_LOCATION_NOTE })
+        );
+    }
+
+    #[test]
+    fn renders_source_attachment_rails_from_per_line_placement() {
+        let rendered = render_review_payload(ReviewProjection {
+            review_id: "repo".to_string(),
+            target_label: "working tree".to_string(),
+            current_head_oid: Some("head-1".to_string()),
+            is_branch_review: false,
+            files: vec![ReviewFile {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                is_changed: true,
+                comment_count: 1,
+                added_lines: 3,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                crate::diff::FileContent {
+                    old: None,
+                    new: Some(vec![
+                        "let first = load();".to_string(),
+                        "let second = recompute();".to_string(),
+                        "apply(first, second);".to_string(),
+                    ]),
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                FileDiff {
+                    path: "src/main.rs".to_string(),
+                    hunks: vec![crate::diff::DiffHunk {
+                        old: None,
+                        new: Some(crate::diff::LineRange { start: 1, end: 3 }),
+                        sections: vec![crate::diff::DiffSection::Added {
+                            added: crate::diff::NewRange {
+                                new: crate::diff::LineRange { start: 1, end: 3 },
+                            },
+                        }],
+                    }],
+                },
+            )]),
+            threads: vec![ReviewThread {
+                id: "thread-1".to_string(),
+                scope: THREAD_SCOPE_LINE.to_string(),
+                path: Some("src/main.rs".to_string()),
+                line_label: "src/main.rs:1-3".to_string(),
+                anchor: ReviewThreadAnchor {
+                    side: Some(SIDE_NEW.to_string()),
+                    start_line: Some(1),
+                    end_line: Some(3),
+                    placement: Some("window".to_string()),
+                    line_placements: vec![
+                        ReviewThreadLinePlacement {
+                            original_line: 1,
+                            current_line: Some(1),
+                            placement: "content".to_string(),
+                        },
+                        ReviewThreadLinePlacement {
+                            original_line: 2,
+                            current_line: Some(2),
+                            placement: "changed".to_string(),
+                        },
+                        ReviewThreadLinePlacement {
+                            original_line: 3,
+                            current_line: Some(3),
+                            placement: "content".to_string(),
+                        },
+                    ],
+                },
+                resolved: false,
+                resolved_head_oid: None,
+                comments: vec![ReviewComment {
+                    comment: Comment {
+                        id: CommentId::from_raw("cmt_test"),
+                        thread_id: ThreadId::from_raw("thr_test"),
+                        author: Author {
+                            kind: AuthorKind::Human,
+                            display_name: "jonas".to_string(),
+                            email: None,
+                        },
+                        body: "mixed context".to_string(),
+                        created_at: PeersTimestamp::from_rfc3339_unchecked("2026-05-28T12:00:00Z"),
+                        edited_at: None,
+                        deleted_at: None,
+                    },
+                    can_edit: true,
+                }],
+            }],
+            review_threads: Vec::new(),
+            commits: Vec::new(),
+        });
+
+        assert_eq!(
+            source_rail_groups(&rendered),
+            vec![
+                HIGHLIGHT_THREAD_RAIL,
+                HIGHLIGHT_THREAD_RAIL_CONTEXT,
+                HIGHLIGHT_THREAD_RAIL,
+            ]
+        );
+        assert!(
+            rendered
+                .highlights
+                .iter()
+                .any(|highlight| { highlight.group == HIGHLIGHT_THREAD_BORDER_CONTEXT })
+        );
+    }
+
+    fn source_rail_groups(rendered: &RenderedReview) -> Vec<&'static str> {
+        rendered
+            .highlights
+            .iter()
+            .filter(|highlight| {
+                highlight.start_col == THREAD_RAIL_START_COL
+                    && highlight.end_col == THREAD_RAIL_END_COL
+                    && rendered
+                        .rows
+                        .get(highlight.line as usize)
+                        .is_some_and(row_is_source)
+            })
+            .map(|highlight| highlight.group)
+            .collect()
     }
 }

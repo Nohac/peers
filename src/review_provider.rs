@@ -5,6 +5,10 @@ use anyhow::Result;
 use facet::Facet;
 use thiserror::Error;
 
+use crate::anchors::{
+    AnchorIndex, AnchorLinePlacement, AnchorPlacement, RelocatedLineAnchor,
+    capture_line_anchor_evidence, relocate_line_anchor_in_index,
+};
 use crate::comments::{
     Author, Comment, CommentId, CommentThread, CreationProvenance, PeersEvent, PeersState,
     ThreadId, ThreadPayload, ThreadStatus,
@@ -25,6 +29,7 @@ const FILE_SCOPE: &str = "file";
 const REVIEW_SCOPE: &str = "review";
 const OLD_FILE_SIDE: &str = "old";
 const NEW_FILE_SIDE: &str = "new";
+const ANCHOR_CONTEXT_LINES: usize = 3;
 
 #[derive(Debug, Error)]
 enum ReviewProviderError {
@@ -87,7 +92,17 @@ impl ReviewProvider {
         let state = load_peers_state(&self.repo_root).await?;
         let current_head_oid = repo_current_head_oid(&self.repo_root).await?;
         let contexts = open_comment_contexts(&state, current_head_oid.as_deref());
-        let diff = load_review_diff_with_contexts(&self.repo_root, &self.target, &contexts).await?;
+        let initial_diff =
+            load_review_diff_with_contexts(&self.repo_root, &self.target, &contexts).await?;
+        let projected_threads = review_threads(&state, &self.author, &initial_diff);
+        let relocated_contexts =
+            review_thread_contexts(&projected_threads, current_head_oid.as_deref());
+        let diff = if relocated_contexts == contexts {
+            initial_diff
+        } else {
+            load_review_diff_with_contexts(&self.repo_root, &self.target, &relocated_contexts)
+                .await?
+        };
         Ok(review_payload(
             &state,
             diff,
@@ -105,7 +120,9 @@ impl ReviewProvider {
     }
 
     pub async fn create_thread(&self, request: CreateThreadRequest) -> Result<ReviewProjection> {
-        let anchor = request.clone().into_anchor()?;
+        let anchor = self
+            .capture_anchor_evidence(request.clone().into_anchor()?)
+            .await?;
         let body = required_body(request.body)?;
         let thread_id = new_thread_id();
         let comment_id = new_comment_id();
@@ -152,6 +169,23 @@ impl ReviewProvider {
         let review = self.get_review().await?;
         self.updates.notify_review_changed();
         Ok(review)
+    }
+
+    async fn capture_anchor_evidence(&self, anchor: CommentAnchor) -> Result<CommentAnchor> {
+        let CommentAnchor::Line { mut line } = anchor else {
+            return Ok(anchor);
+        };
+        let context = FileContextRequest {
+            path: line.path.clone(),
+            old_path: line.old_path.clone(),
+            side: Some(line.side.clone()),
+            start_line: Some(line.start_line),
+            end_line: Some(line.end_line),
+        };
+        let diff =
+            load_review_diff_with_contexts(&self.repo_root, &self.target, &[context]).await?;
+        capture_line_anchor_for_diff(&mut line, &diff);
+        Ok(CommentAnchor::Line { line })
     }
 
     pub async fn reply_to_thread(&self, request: ThreadBodyRequest) -> Result<ReviewProjection> {
@@ -342,6 +376,15 @@ pub struct ReviewThreadAnchor {
     pub side: Option<String>,
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
+    pub placement: Option<String>,
+    pub line_placements: Vec<ReviewThreadLinePlacement>,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq)]
+pub struct ReviewThreadLinePlacement {
+    pub original_line: u32,
+    pub current_line: Option<u32>,
+    pub placement: String,
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
@@ -416,12 +459,7 @@ fn review_payload(
     current_author: &Author,
     current_head_oid: Option<String>,
 ) -> ReviewProjection {
-    let threads: Vec<_> = state
-        .threads
-        .values()
-        .filter(|thread| thread.pruned_at.is_none() && thread.archived_at.is_none())
-        .map(|thread| review_thread(thread, current_author))
-        .collect();
+    let threads = review_threads(state, current_author, &diff);
     let mut comment_counts = BTreeMap::<String, u32>::new();
     for thread in &threads {
         if thread_visible_in_default_projection(
@@ -492,17 +530,101 @@ fn open_comment_contexts(
         .collect()
 }
 
-fn review_thread(thread: &CommentThread, current_author: &Author) -> ReviewThread {
+fn capture_line_anchor_for_diff(line: &mut LineAnchor, diff: &ReviewDiffPayload) {
+    if let Some(file) = diff.files.iter().find(|file| file.path == line.path)
+        && line.old_path.is_none()
+    {
+        line.old_path = file.old_path.clone();
+    }
+
+    let lines = diff
+        .file_contents_by_path
+        .get(&line.path)
+        .or_else(|| {
+            line.old_path
+                .as_ref()
+                .and_then(|old_path| diff.file_contents_by_path.get(old_path))
+        })
+        .and_then(|content| match line.side {
+            FileSide::Old => content.old.as_ref(),
+            FileSide::New => content.new.as_ref(),
+        });
+    if let Some(lines) = lines {
+        capture_line_anchor_evidence(line, lines, ANCHOR_CONTEXT_LINES);
+    }
+}
+
+fn review_thread_contexts(
+    threads: &[ReviewThread],
+    current_head_oid: Option<&str>,
+) -> Vec<FileContextRequest> {
+    threads
+        .iter()
+        .filter(|thread| {
+            thread_visible_in_default_projection(
+                thread.resolved,
+                thread.resolved_head_oid.as_deref(),
+                current_head_oid,
+            )
+        })
+        .filter_map(|thread| match thread.scope.as_str() {
+            LINE_SCOPE => Some(FileContextRequest {
+                path: thread.path.clone()?,
+                old_path: None,
+                side: thread.anchor.side.as_deref().and_then(file_side_from_name),
+                start_line: thread.anchor.start_line,
+                end_line: thread.anchor.end_line,
+            }),
+            FILE_SCOPE => Some(FileContextRequest {
+                path: thread.path.clone()?,
+                old_path: None,
+                side: None,
+                start_line: None,
+                end_line: None,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn review_threads(
+    state: &PeersState,
+    current_author: &Author,
+    diff: &ReviewDiffPayload,
+) -> Vec<ReviewThread> {
+    let anchor_indexes = ReviewAnchorIndexes::new(diff);
+    state
+        .threads
+        .values()
+        .filter(|thread| thread.pruned_at.is_none() && thread.archived_at.is_none())
+        .map(|thread| review_thread(thread, current_author, &anchor_indexes))
+        .collect()
+}
+
+fn review_thread(
+    thread: &CommentThread,
+    current_author: &Author,
+    anchor_indexes: &ReviewAnchorIndexes,
+) -> ReviewThread {
     let (scope, path, anchor) = match &thread.anchor {
-        CommentAnchor::Line { line } => (
-            LINE_SCOPE.to_string(),
-            Some(line.path.clone()),
-            ReviewThreadAnchor {
-                side: Some(file_side_name(&line.side).to_string()),
-                start_line: Some(line.start_line),
-                end_line: Some(line.end_line),
-            },
-        ),
+        CommentAnchor::Line { line } => {
+            let relocated = relocate_review_line_anchor(line, anchor_indexes);
+            (
+                LINE_SCOPE.to_string(),
+                relocated.path.clone(),
+                ReviewThreadAnchor {
+                    side: Some(file_side_name(&line.side).to_string()),
+                    start_line: relocated.start_line,
+                    end_line: relocated.end_line,
+                    placement: Some(anchor_placement_name(relocated.placement).to_string()),
+                    line_placements: relocated
+                        .line_placements
+                        .iter()
+                        .map(review_thread_line_placement)
+                        .collect(),
+                },
+            )
+        }
         CommentAnchor::File { path } => (
             FILE_SCOPE.to_string(),
             Some(path.clone()),
@@ -510,6 +632,8 @@ fn review_thread(thread: &CommentThread, current_author: &Author) -> ReviewThrea
                 side: None,
                 start_line: None,
                 end_line: None,
+                placement: Some("file".to_string()),
+                line_placements: Vec::new(),
             },
         ),
         CommentAnchor::Review => (
@@ -519,6 +643,8 @@ fn review_thread(thread: &CommentThread, current_author: &Author) -> ReviewThrea
                 side: None,
                 start_line: None,
                 end_line: None,
+                placement: Some("review".to_string()),
+                line_placements: Vec::new(),
             },
         ),
     };
@@ -526,8 +652,8 @@ fn review_thread(thread: &CommentThread, current_author: &Author) -> ReviewThrea
     ReviewThread {
         id: thread.id.to_string(),
         scope,
+        line_label: relocated_thread_label(&thread.anchor, path.as_deref(), &anchor),
         path,
-        line_label: thread.anchor.label(),
         anchor,
         resolved: thread.resolved,
         resolved_head_oid: thread.resolved_head_oid.clone(),
@@ -537,6 +663,102 @@ fn review_thread(thread: &CommentThread, current_author: &Author) -> ReviewThrea
             .filter(|comment| comment.deleted_at.is_none())
             .map(|comment| review_comment(comment, current_author))
             .collect(),
+    }
+}
+
+fn relocate_review_line_anchor(
+    line: &LineAnchor,
+    anchor_indexes: &ReviewAnchorIndexes,
+) -> RelocatedLineAnchor {
+    relocate_line_anchor_in_index(line, anchor_indexes.for_side(&line.side))
+}
+
+struct ReviewAnchorIndexes {
+    old: AnchorIndex,
+    new: AnchorIndex,
+}
+
+impl ReviewAnchorIndexes {
+    fn new(diff: &ReviewDiffPayload) -> Self {
+        let mut old_files = BTreeMap::new();
+        let mut new_files = BTreeMap::new();
+        for file in &diff.files {
+            let Some(content) = diff.file_contents_by_path.get(&file.path) else {
+                continue;
+            };
+            if let Some(lines) = &content.old {
+                old_files.insert(file.path.clone(), lines.clone());
+                if let Some(old_path) = &file.old_path {
+                    old_files.insert(old_path.clone(), lines.clone());
+                }
+            }
+            if let Some(lines) = &content.new {
+                new_files.insert(file.path.clone(), lines.clone());
+            }
+        }
+        Self {
+            old: AnchorIndex::new(old_files),
+            new: AnchorIndex::new(new_files),
+        }
+    }
+
+    fn for_side(&self, side: &FileSide) -> &AnchorIndex {
+        match side {
+            FileSide::Old => &self.old,
+            FileSide::New => &self.new,
+        }
+    }
+}
+
+fn review_thread_line_placement(
+    line: &crate::anchors::RelocatedAnchorLine,
+) -> ReviewThreadLinePlacement {
+    ReviewThreadLinePlacement {
+        original_line: line.original_line,
+        current_line: line.current_line,
+        placement: anchor_line_placement_name(line.placement).to_string(),
+    }
+}
+
+fn relocated_thread_label(
+    original: &CommentAnchor,
+    relocated_path: Option<&str>,
+    anchor: &ReviewThreadAnchor,
+) -> String {
+    let (Some(path), Some(start_line), Some(end_line)) =
+        (relocated_path, anchor.start_line, anchor.end_line)
+    else {
+        return original.label();
+    };
+    if start_line == end_line {
+        format!("{path}:{start_line}")
+    } else {
+        format!("{path}:{start_line}-{end_line}")
+    }
+}
+
+fn anchor_placement_name(placement: AnchorPlacement) -> &'static str {
+    match placement {
+        AnchorPlacement::Exact => "exact",
+        AnchorPlacement::PerLineHash => "per_line_hash",
+        AnchorPlacement::Context => "context",
+        AnchorPlacement::MovedExact => "moved_exact",
+        AnchorPlacement::Window => "window",
+        AnchorPlacement::LineFallback => "line_fallback",
+        AnchorPlacement::FileFallback => "file_fallback",
+        AnchorPlacement::Detached => "detached",
+    }
+}
+
+fn anchor_line_placement_name(placement: AnchorLinePlacement) -> &'static str {
+    match placement {
+        AnchorLinePlacement::Exact => "exact",
+        AnchorLinePlacement::Content => "content",
+        AnchorLinePlacement::Context => "context",
+        AnchorLinePlacement::Changed => "changed",
+        AnchorLinePlacement::LineFallback => "line_fallback",
+        AnchorLinePlacement::Missing => "missing",
+        AnchorLinePlacement::Detached => "detached",
     }
 }
 
@@ -566,6 +788,14 @@ fn file_side_name(side: &FileSide) -> &'static str {
     match side {
         FileSide::Old => OLD_FILE_SIDE,
         FileSide::New => NEW_FILE_SIDE,
+    }
+}
+
+fn file_side_from_name(side: &str) -> Option<FileSide> {
+    match side {
+        OLD_FILE_SIDE => Some(FileSide::Old),
+        NEW_FILE_SIDE => Some(FileSide::New),
+        _ => None,
     }
 }
 
@@ -608,4 +838,175 @@ async fn find_comment_payload(
         comment_id: comment_id.to_string(),
     }
     .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anchors::capture_line_anchor_evidence;
+    use crate::comments::{AuthorKind, PeersTimestamp};
+    use crate::diff::{DiffHunk, FileContent, FileDiff, FileStatus};
+
+    #[test]
+    fn projection_uses_relocated_line_anchor_metadata() {
+        let base_lines = lines(&[
+            "fn configure() {",
+            "    let first = load();",
+            "    let second = prepare();",
+            "    finish();",
+            "}",
+        ]);
+        let mut line_anchor = LineAnchor::new("src/config.rs".to_string(), FileSide::New, 2, 3);
+        capture_line_anchor_evidence(&mut line_anchor, &base_lines, 1);
+
+        let thread_id = ThreadId::from_raw("thr_test");
+        let comment_id = CommentId::from_raw("cmt_test");
+        let timestamp = PeersTimestamp::from_rfc3339_unchecked("2026-05-28T12:00:00Z");
+        let author = Author {
+            kind: AuthorKind::Human,
+            display_name: "jonas".to_string(),
+            email: None,
+        };
+        let state = PeersState {
+            threads: BTreeMap::from([(
+                thread_id.clone(),
+                CommentThread {
+                    id: thread_id.clone(),
+                    anchor: CommentAnchor::Line { line: line_anchor },
+                    comments: vec![Comment {
+                        id: comment_id,
+                        thread_id,
+                        author: author.clone(),
+                        body: "Check this range".to_string(),
+                        created_at: timestamp.clone(),
+                        edited_at: None,
+                        deleted_at: None,
+                    }],
+                    resolved: false,
+                    resolved_head_oid: None,
+                    created_at: timestamp.clone(),
+                    updated_at: timestamp,
+                    archived_at: None,
+                    pruned_at: None,
+                },
+            )]),
+        };
+        let diff = ReviewDiffPayload {
+            files: vec![ReviewFile {
+                path: "src/config.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Unchanged,
+                is_changed: false,
+                comment_count: 0,
+                added_lines: 0,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/config.rs".to_string(),
+                FileContent {
+                    old: None,
+                    new: Some(lines(&[
+                        "fn configure() {",
+                        "    let inserted = true;",
+                        "    let first = load();",
+                        "    let second = prepare();",
+                        "    finish();",
+                        "}",
+                    ])),
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/config.rs".to_string(),
+                FileDiff {
+                    path: "src/config.rs".to_string(),
+                    hunks: Vec::<DiffHunk>::new(),
+                },
+            )]),
+        };
+
+        let threads = review_threads(&state, &author, &diff);
+
+        assert_eq!(threads.len(), 1);
+        let thread = &threads[0];
+        assert_eq!(thread.path.as_deref(), Some("src/config.rs"));
+        assert_eq!(thread.line_label, "src/config.rs:3-4");
+        assert_eq!(thread.anchor.start_line, Some(3));
+        assert_eq!(thread.anchor.end_line, Some(4));
+        assert_eq!(thread.anchor.placement.as_deref(), Some("exact"));
+        let line_placements: Vec<_> = thread
+            .anchor
+            .line_placements
+            .iter()
+            .map(|line| {
+                (
+                    line.original_line,
+                    line.current_line,
+                    line.placement.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            line_placements,
+            vec![(2, Some(3), "exact"), (3, Some(4), "exact")]
+        );
+    }
+
+    #[test]
+    fn captures_line_anchor_evidence_from_current_diff_content() {
+        let mut line_anchor = LineAnchor::new("src/config.rs".to_string(), FileSide::New, 2, 3);
+        let diff = ReviewDiffPayload {
+            files: vec![ReviewFile {
+                path: "src/config.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Unchanged,
+                is_changed: false,
+                comment_count: 0,
+                added_lines: 0,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/config.rs".to_string(),
+                FileContent {
+                    old: None,
+                    new: Some(lines(&[
+                        "fn configure() {",
+                        "    let first = load();",
+                        "    let second = prepare();",
+                        "    finish();",
+                        "}",
+                    ])),
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/config.rs".to_string(),
+                FileDiff {
+                    path: "src/config.rs".to_string(),
+                    hunks: Vec::<DiffHunk>::new(),
+                },
+            )]),
+        };
+
+        capture_line_anchor_for_diff(&mut line_anchor, &diff);
+
+        assert_eq!(
+            line_anchor.selected_text.as_deref(),
+            Some("    let first = load();\n    let second = prepare();")
+        );
+        assert_eq!(line_anchor.per_line_hashes.len(), 2);
+        assert_eq!(
+            line_anchor.context_before,
+            vec!["fn configure() {".to_string()]
+        );
+        assert_eq!(
+            line_anchor.context_after,
+            vec!["    finish();".to_string(), "}".to_string()]
+        );
+        assert!(line_anchor.selected_range_hash.is_some());
+        assert!(line_anchor.context_before_hash.is_some());
+        assert!(line_anchor.context_after_hash.is_some());
+    }
+
+    fn lines(input: &[&str]) -> Vec<String> {
+        input.iter().map(|line| line.to_string()).collect()
+    }
 }

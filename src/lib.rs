@@ -1,3 +1,4 @@
+pub mod anchors;
 pub mod cli;
 pub mod comments;
 pub mod diff;
