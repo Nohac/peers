@@ -117,6 +117,9 @@ local COMMENT_EDIT_CONFIRM_MESSAGE = "Editing this comment will remove later rep
 local COMMENT_DELETE_CONFIRM_TITLE = "Delete comment?"
 local COMMENT_DELETE_CONFIRM_MESSAGE = "Deleting this comment will remove later replies and thread status changes from the visible review state."
 local MIRROR_DEBOUNCE_MS = 30
+local MIRROR_BATCH_BUDGET_MS = 8
+local MIRROR_BATCH_MIN_ROWS = 8
+local SEMANTIC_RETRY_DELAYS_MS = { 80, 240, 600 }
 local AUTOCMD_GROUP_PREFIX = "peers-review-source-"
 local SOURCE_CHANGE_AUGROUP = "peers-review-source-changes"
 local AUTOCMD_EVENTS = {
@@ -141,7 +144,17 @@ local UNKNOWN_FILE_TIME = -1
 local UNKNOWN_FILE_SIZE = -1
 local SOURCE_HELPER_BUFFER_VAR = "peers_source_helper"
 local SOURCE_HELPER_SIGNATURE_VAR = "peers_source_signature"
+local SOURCE_SEMANTIC_TICK_VAR = "peers_source_semantic_tick"
+local SOURCE_SYNTAX_READY_VAR = "peers_source_syntax_ready"
 local RENDER_STATES = {}
+
+local function source_tree_priority()
+  return (vim.hl and vim.hl.priorities and vim.hl.priorities.user or 200) + 10
+end
+
+local function source_semantic_priority()
+  return source_tree_priority() + 20
+end
 
 local function existing_buffer(name)
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
@@ -505,6 +518,39 @@ local function reload_source_helper_if_stale(buf, signature)
   end)
 end
 
+local function ensure_source_runtime(buf, full_path)
+  if vim.bo[buf].filetype == "" then
+    local filetype = vim.filetype.match({ filename = full_path })
+    if filetype then
+      vim.bo[buf].filetype = filetype
+    end
+  end
+
+  if not vim.b[buf][SOURCE_SYNTAX_READY_VAR] then
+    pcall(vim.api.nvim_buf_call, buf, function()
+      pcall(vim.cmd, "silent! syntax enable")
+    end)
+    vim.b[buf][SOURCE_SYNTAX_READY_VAR] = true
+  end
+end
+
+local function ensure_source_signature(root, path, buf)
+  local signature = source_file_signature(file_buffer_name(root, path))
+  reload_source_helper_if_stale(buf, signature)
+  vim.b[buf][SOURCE_HELPER_SIGNATURE_VAR] = signature
+  return table.concat({
+    signature,
+    vim.api.nvim_buf_get_changedtick(buf),
+  }, CACHE_KEY_SEPARATOR)
+end
+
+local function source_semantic_signature(root, path, buf)
+  return table.concat({
+    ensure_source_signature(root, path, buf),
+    vim.b[buf][SOURCE_SEMANTIC_TICK_VAR] or 0,
+  }, CACHE_KEY_SEPARATOR)
+end
+
 local function source_buffer(root, path)
   local full_path = vim.fn.fnamemodify(root .. "/" .. path, ":p")
   if vim.fn.filereadable(full_path) ~= 1 then
@@ -522,12 +568,7 @@ local function source_buffer(root, path)
   reload_source_helper_if_stale(buf, signature)
   vim.b[buf][SOURCE_HELPER_SIGNATURE_VAR] = signature
 
-  if vim.bo[buf].filetype == "" then
-    local filetype = vim.filetype.match({ filename = full_path })
-    if filetype then
-      vim.bo[buf].filetype = filetype
-    end
-  end
+  ensure_source_runtime(buf, full_path)
 
   return buf
 end
@@ -549,20 +590,70 @@ local function ensure_highlighter(buf)
   return ok_parse
 end
 
-local function capture_group_at(buf, row, col)
-  local ok, captures = pcall(vim.treesitter.get_captures_at_pos, buf, row, col)
-  if not ok or not captures or #captures == 0 then
-    return nil
+local function push_group(target, seen, group)
+  if group and group ~= "" and not seen[group] then
+    seen[group] = true
+    table.insert(target, group)
   end
-
-  local capture = captures[#captures]
-  if not capture or not capture.capture then
-    return nil
-  end
-  return "@" .. capture.capture
 end
 
-local function source_line_segments(source_buf, source_line)
+local function push_inspected_group(target, seen, item)
+  push_group(target, seen, item and item.hl_group)
+  push_group(target, seen, item and item.hl_group_link)
+end
+
+local function inspect_source_pos(buf, row, col)
+  if vim.inspect_pos then
+    local ok, inspected = pcall(vim.inspect_pos, buf, row, col, {
+      syntax = true,
+      treesitter = true,
+      semantic_tokens = true,
+      extmarks = false,
+    })
+    if ok then
+      return inspected
+    end
+  end
+
+  return nil
+end
+
+local function inspected_treesitter_syntax_groups_at(buf, row, col)
+  local groups = {}
+  local seen = {}
+  local inspected = inspect_source_pos(buf, row, col)
+  if not inspected then
+    return groups
+  end
+
+  for _, item in ipairs(inspected.syntax or {}) do
+    push_inspected_group(groups, seen, item)
+  end
+  for _, item in ipairs(inspected.treesitter or {}) do
+    push_inspected_group(groups, seen, item)
+  end
+  return groups
+end
+
+local function inspected_semantic_groups_at(buf, row, col)
+  local groups = {}
+  local seen = {}
+  local inspected = inspect_source_pos(buf, row, col)
+  if not inspected then
+    return groups
+  end
+
+  for _, item in ipairs(inspected.semantic_tokens or {}) do
+    push_inspected_group(groups, seen, item.opts or item)
+  end
+  return groups
+end
+
+local function highlight_groups_key(groups)
+  return table.concat(groups, "\0")
+end
+
+local function source_line_segments(source_buf, source_line, groups_at)
   local source_row = source_line - 1
   local source_text = vim.api.nvim_buf_get_lines(source_buf, source_row, source_row + 1, false)[1]
   if not source_text or source_text == "" then
@@ -570,21 +661,24 @@ local function source_line_segments(source_buf, source_line)
   end
 
   local segments = {}
-  local active_group = nil
+  local active_groups = {}
+  local active_key = ""
   local active_start = nil
   local byte_len = #source_text
 
   for col = 0, byte_len do
-    local group = col < byte_len and capture_group_at(source_buf, source_row, col) or nil
-    if group ~= active_group then
-      if active_group and active_start and active_start < col then
+    local groups = col < byte_len and groups_at(source_buf, source_row, col) or {}
+    local key = highlight_groups_key(groups)
+    if key ~= active_key then
+      if #active_groups > 0 and active_start and active_start < col then
         table.insert(segments, {
           start_col = active_start,
           end_col = col,
-          group = active_group,
+          groups = active_groups,
         })
       end
-      active_group = group
+      active_groups = groups
+      active_key = key
       active_start = col
     end
   end
@@ -631,9 +725,15 @@ end
 
 local function source_for_proxy_row(state, row)
   local source = state.source_lsp_buffers[row.path]
+  if source ~= nil and source ~= false and not vim.api.nvim_buf_is_valid(source) then
+    state.source_lsp_buffers[row.path] = nil
+    source = nil
+  end
   if source == nil then
     source = source_buffer(state.root, row.path)
     state.source_lsp_buffers[row.path] = source or false
+  elseif source ~= false then
+    ensure_source_signature(state.root, row.path, source)
   end
 
   if source == false then
@@ -644,30 +744,41 @@ end
 
 local function source_for_row(state, row)
   local source = state.source_buffers[row.path]
+  local signature = nil
+  if source ~= nil and source ~= false and not vim.api.nvim_buf_is_valid(source) then
+    state.source_buffers[row.path] = nil
+    source = nil
+  end
   if source == nil then
     source = source_buffer(state.root, row.path)
     if source and not ensure_highlighter(source) then
       source = false
     end
     state.source_buffers[row.path] = source or false
+    if source then
+      signature = ensure_source_signature(state.root, row.path, source)
+    end
+  elseif source ~= false then
+    signature = ensure_source_signature(state.root, row.path, source)
   end
 
   if source == false then
     return nil
   end
-  return source
+  return source, signature
 end
 
 local function cache_for_file(state, row)
-  local source = source_for_row(state, row)
+  local source, signature = source_for_row(state, row)
   if not source then
     return nil, nil
   end
 
-  local full_path = file_buffer_name(state.root, row.path)
-  local signature = source_file_signature(full_path)
   local file_cache = state.source_segments[row.path]
   if not file_cache or file_cache.signature ~= signature then
+    if not ensure_highlighter(source) then
+      return nil, nil
+    end
     file_cache = {
       signature = signature,
       lines = {},
@@ -688,25 +799,103 @@ local function segments_for_row(state, row)
     return cached
   end
 
-  lines[row.source_line] = source_line_segments(source, row.source_line)
+  lines[row.source_line] = source_line_segments(source, row.source_line, inspected_treesitter_syntax_groups_at)
   return lines[row.source_line]
 end
 
-local function apply_line_segments(buf, review_row, code_start_col, segments)
+local schedule_visible_mirror
+
+local function schedule_semantic_mirror_retry(buf, state)
+  if state.semantic_retry_scheduled then
+    return
+  end
+
+  state.semantic_retry_scheduled = true
+  local pending = #SEMANTIC_RETRY_DELAYS_MS
+  for _, delay in ipairs(SEMANTIC_RETRY_DELAYS_MS) do
+    vim.defer_fn(function()
+      local current = RENDER_STATES[buf]
+      if not current then
+        return
+      end
+      schedule_visible_mirror(buf)
+      pending = pending - 1
+      if pending <= 0 then
+        current.semantic_retry_scheduled = false
+      end
+    end, delay)
+  end
+end
+
+local function request_source_semantic_refresh(buf, state, row, source, signature)
+  if not vim.lsp or not vim.lsp.semantic_tokens or not vim.lsp.semantic_tokens.force_refresh then
+    return
+  end
+
+  state.source_semantic_refreshes = state.source_semantic_refreshes or {}
+  if state.source_semantic_refreshes[row.path] == signature then
+    return
+  end
+
+  state.source_semantic_refreshes[row.path] = signature
+  local ok = pcall(vim.lsp.semantic_tokens.force_refresh, source)
+  if ok then
+    timing.log(state.root, "buffer", "source semantic refresh requested path=" .. tostring(row.path))
+    schedule_semantic_mirror_retry(buf, state)
+  end
+end
+
+local function semantic_segments_for_row(buf, state, row)
+  local source = source_for_row(state, row)
+  if not source then
+    return {}
+  end
+
+  local signature = source_semantic_signature(state.root, row.path, source)
+  state.source_semantic_segments = state.source_semantic_segments or {}
+  local file_cache = state.source_semantic_segments[row.path]
+  if not file_cache or file_cache.signature ~= signature then
+    file_cache = {
+      signature = signature,
+      lines = {},
+    }
+    state.source_semantic_segments[row.path] = file_cache
+  end
+
+  local cached = file_cache.lines[row.source_line]
+  if cached then
+    return cached
+  end
+
+  local segments = source_line_segments(source, row.source_line, inspected_semantic_groups_at)
+  if #segments == 0 then
+    request_source_semantic_refresh(buf, state, row, source, signature)
+    return segments
+  end
+
+  file_cache.lines[row.source_line] = segments
+  return file_cache.lines[row.source_line]
+end
+
+local function apply_line_segments(buf, review_row, code_start_col, segments, base_priority)
   local line = vim.api.nvim_buf_get_lines(buf, review_row, review_row + 1, false)[1]
   if not line then
     return
   end
 
   local line_len = #line
+  base_priority = base_priority or (vim.hl and vim.hl.priorities and vim.hl.priorities.treesitter or 100)
   for _, segment in ipairs(segments) do
     local start_col = math.min(line_len, code_start_col + segment.start_col)
     local end_col = math.min(line_len, code_start_col + segment.end_col)
     if start_col < end_col then
-      vim.api.nvim_buf_set_extmark(buf, SOURCE_NAMESPACE, review_row, start_col, {
-        end_col = end_col,
-        hl_group = segment.group,
-      })
+      for priority_offset, group in ipairs(segment.groups or {}) do
+        vim.api.nvim_buf_set_extmark(buf, SOURCE_NAMESPACE, review_row, start_col, {
+          end_col = end_col,
+          hl_group = group,
+          priority = base_priority + priority_offset,
+        })
+      end
     end
   end
 end
@@ -956,46 +1145,104 @@ local function path_is_under(root, path)
   return normalized_path:sub(1, #normalized_root) == normalized_root
 end
 
-local function mirror_visible_treesitter(buf)
-  local start = timing.now()
+local function visible_mirror_rows(buf, state)
+  local rows = {}
+  for _, range in ipairs(visible_row_ranges(buf)) do
+    for review_row = range.first, range.last do
+      local row = state.rows[review_row + 1]
+      if row_is_mirrorable(row) then
+        table.insert(rows, review_row)
+      end
+    end
+  end
+  return rows
+end
+
+local function mirror_row(buf, state, review_row)
+  local row = state.rows[review_row + 1]
+  if not row_is_mirrorable(row) then
+    return false
+  end
+  vim.api.nvim_buf_clear_namespace(buf, SOURCE_NAMESPACE, review_row, review_row + 1)
+  apply_line_segments(buf, review_row, row.code_start_col or 0, segments_for_row(state, row), source_tree_priority())
+  apply_line_segments(buf, review_row, row.code_start_col or 0, semantic_segments_for_row(buf, state, row), source_semantic_priority())
+  return true
+end
+
+local function run_mirror_batch(buf)
   local state = RENDER_STATES[buf]
   if not state or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
 
-  vim.api.nvim_buf_clear_namespace(buf, SOURCE_NAMESPACE, 0, -1)
-
-  local mirrored = 0
-  for _, range in ipairs(visible_row_ranges(buf)) do
-    for review_row = range.first, range.last do
-      local row = state.rows[review_row + 1]
-      if row_is_mirrorable(row) then
-        apply_line_segments(buf, review_row, row.code_start_col or 0, segments_for_row(state, row))
-        mirrored = mirrored + 1
-      end
-    end
-  end
-  timing.log(state.root, "buffer", string.format("mirror_visible_treesitter %.1fms rows=%d buf=%s", timing.ms(start), mirrored, tostring(buf)))
-end
-
-local function schedule_visible_mirror(buf)
-  local state = RENDER_STATES[buf]
-  if not state or state.scheduled then
+  local batch = state.mirror_batch
+  if not batch then
+    state.mirror_scheduled = false
     return
   end
 
-  state.scheduled = true
+  local start = timing.now()
+  local mirrored = 0
+  while batch.index <= #batch.rows do
+    if mirror_row(buf, state, batch.rows[batch.index]) then
+      mirrored = mirrored + 1
+    end
+    batch.index = batch.index + 1
+    if mirrored >= MIRROR_BATCH_MIN_ROWS and timing.ms(start) >= MIRROR_BATCH_BUDGET_MS then
+      break
+    end
+  end
+
+  if batch.index <= #batch.rows then
+    vim.schedule(function()
+      run_mirror_batch(buf)
+    end)
+    return
+  end
+
+  state.mirror_batch = nil
+  state.mirror_scheduled = false
+  if state.mirror_again then
+    state.mirror_again = false
+    schedule_visible_mirror(buf)
+  end
+  timing.log(state.root, "buffer", string.format(
+    "mirror_visible_highlights_async %.1fms rows=%d buf=%s",
+    timing.ms(batch.start),
+    batch.total,
+    tostring(buf)
+  ))
+end
+
+schedule_visible_mirror = function(buf)
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  if state.mirror_scheduled then
+    state.mirror_again = true
+    return
+  end
+
+  state.mirror_scheduled = true
   vim.defer_fn(function()
     local current = RENDER_STATES[buf]
     if not current then
       return
     end
-    current.scheduled = false
-    mirror_visible_treesitter(buf)
+    current.mirror_batch = {
+      rows = visible_mirror_rows(buf, current),
+      index = 1,
+      total = 0,
+      start = timing.now(),
+    }
+    current.mirror_batch.total = #current.mirror_batch.rows
+    run_mirror_batch(buf)
   end, MIRROR_DEBOUNCE_MS)
 end
 
 local apply_render
+local schedule_pending_refresh_check
 
 local function review_buffer_is_visible(buf)
   return #vim.fn.win_findbuf(buf) > 0
@@ -1028,16 +1275,43 @@ local function render_review_now(buf, state)
     return
   end
 
+  if state.render_in_flight then
+    state.pending_refresh = true
+    state.render_again = true
+    timing.log(state.root, "buffer", "render_review_now coalesced buf=" .. tostring(buf))
+    return
+  end
+
   local start = timing.now()
   timing.log(state.root, "buffer", "render_review_now start buf=" .. tostring(buf))
   state.pending_refresh = false
-  lsp.render_now(state.client_id, buf, function(render)
+  state.render_in_flight = true
+  if not lsp.render_now(state.client_id, buf, function(render)
+    local current = RENDER_STATES[buf]
+    if current then
+      current.render_in_flight = false
+    end
     timing.log(state.root, "buffer", string.format("render_review_now rpc %.1fms buf=%s", timing.ms(start), tostring(buf)))
     apply_render(state.root, buf, render, state.client_id)
-  end)
+    current = RENDER_STATES[buf]
+    if current and current.render_again then
+      current.render_again = false
+      if review_buffer_is_visible(buf) and not review_refresh_is_paused(current) then
+        timing.log(current.root, "buffer", "render_review_now rerender buf=" .. tostring(buf))
+        render_review_now(buf, current)
+      else
+        current.pending_refresh = true
+        schedule_pending_refresh_check(buf, current)
+      end
+    end
+  end) then
+    state.render_in_flight = false
+    state.pending_refresh = true
+    schedule_pending_refresh_check(buf, state)
+  end
 end
 
-local function schedule_pending_refresh_check(buf, state)
+schedule_pending_refresh_check = function(buf, state)
   if not state or state.refresh_retry_scheduled then
     return
   end
@@ -1103,6 +1377,22 @@ local function mark_repo_reviews_pending(path)
       request_review_refresh(buf, state)
     end
   end
+end
+
+local function mark_repo_mirrors_pending(path)
+  if path == "" then
+    return
+  end
+
+  for buf, state in pairs(RENDER_STATES) do
+    if path_is_under(state.root, path) then
+      schedule_visible_mirror(buf)
+    end
+  end
+end
+
+local function mark_source_semantics_changed(buf)
+  vim.b[buf][SOURCE_SEMANTIC_TICK_VAR] = (vim.b[buf][SOURCE_SEMANTIC_TICK_VAR] or 0) + 1
 end
 
 local function flush_pending_refresh(buf)
@@ -1206,6 +1496,16 @@ local function setup_source_change_autocmds()
         return
       end
       mark_repo_reviews_pending(vim.api.nvim_buf_get_name(event.buf))
+    end,
+  })
+  vim.api.nvim_create_autocmd("LspTokenUpdate", {
+    group = source_change_augroup,
+    callback = function(event)
+      if RENDER_STATES[event.buf] then
+        return
+      end
+      mark_source_semantics_changed(event.buf)
+      mark_repo_mirrors_pending(vim.api.nvim_buf_get_name(event.buf))
     end,
   })
 end
@@ -1380,10 +1680,17 @@ function apply_render(root, buf, render, client_id)
     lines = render.lines or {},
     rows = render.rows or {},
     sidebar_counts = render.sidebar_counts or {},
-    source_buffers = {},
-    source_lsp_buffers = {},
-    source_segments = {},
-    scheduled = false,
+    source_buffers = existing and existing.source_buffers or {},
+    source_lsp_buffers = existing and existing.source_lsp_buffers or {},
+    source_segments = existing and existing.source_segments or {},
+    source_semantic_segments = existing and existing.source_semantic_segments or {},
+    source_semantic_refreshes = existing and existing.source_semantic_refreshes or {},
+    mirror_scheduled = false,
+    mirror_batch = nil,
+    mirror_again = existing and existing.mirror_again or false,
+    semantic_retry_scheduled = existing and existing.semantic_retry_scheduled or false,
+    render_in_flight = existing and existing.render_in_flight or false,
+    render_again = existing and existing.render_again or false,
     pending_refresh = existing and existing.pending_refresh or false,
     refresh_retry_scheduled = existing and existing.refresh_retry_scheduled or false,
     view = remembered_view,
@@ -1412,11 +1719,12 @@ function apply_render(root, buf, render, client_id)
   local autocmd_ms = timing.ms(stage_start)
 
   stage_start = timing.now()
-  mirror_visible_treesitter(buf)
+  vim.api.nvim_buf_clear_namespace(buf, SOURCE_NAMESPACE, 0, -1)
+  schedule_visible_mirror(buf)
   local mirror_ms = timing.ms(stage_start)
 
   timing.log(root, "buffer", string.format(
-    "apply_render prepare=%.1fms mask=%.1fms lines=%.1fms highlights=%.1fms diagnostics=%.1fms restore=%.1fms sidebar=%.1fms autocmd=%.1fms mirror=%.1fms total=%.1fms rows=%d lines=%d buf=%s",
+    "apply_render prepare=%.1fms mask=%.1fms lines=%.1fms highlights=%.1fms diagnostics=%.1fms restore=%.1fms sidebar=%.1fms autocmd=%.1fms mirror_schedule=%.1fms total=%.1fms rows=%d lines=%d buf=%s",
     prepare_ms,
     mask_ms,
     set_lines_ms,

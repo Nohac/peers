@@ -169,6 +169,7 @@ local function request_render(client, buf, on_render)
     timing.log(client_root(client), "lsp", string.format("render rpc callback %.1fms buf=%s", timing.ms(start), tostring(buf)))
     if error then
       vim.notify(error.message or tostring(error), vim.log.levels.ERROR)
+      on_render(nil)
       return
     end
     on_render(result)
@@ -207,10 +208,11 @@ end
 function M.render_now(client_id, buf, on_render)
   local client = vim.lsp.get_client_by_id(client_id)
   if not client then
-    return
+    return false
   end
 
   request_render(client, buf, on_render)
+  return true
 end
 
 local function mutate(client_id, buf, method, request, on_render)
