@@ -147,6 +147,26 @@ local SOURCE_HELPER_SIGNATURE_VAR = "peers_source_signature"
 local SOURCE_SEMANTIC_TICK_VAR = "peers_source_semantic_tick"
 local SOURCE_SYNTAX_READY_VAR = "peers_source_syntax_ready"
 local RENDER_STATES = {}
+local lsp_clients_for_buffer
+local MIRROR = {
+  prefix = "PeersSourceMirror",
+  highlight_cache = {},
+  stack_cache = {},
+  semantic_token_cache = {},
+  semantic_token_pending = {},
+  count = 0,
+  style_keys = {
+    "bold",
+    "italic",
+    "underline",
+    "undercurl",
+    "underdouble",
+    "underdotted",
+    "underdashed",
+    "strikethrough",
+    "nocombine",
+  },
+}
 
 local function source_tree_priority()
   return (vim.hl and vim.hl.priorities and vim.hl.priorities.user or 200) + 10
@@ -551,6 +571,65 @@ local function source_semantic_signature(root, path, buf)
   }, CACHE_KEY_SEPARATOR)
 end
 
+lsp_clients_for_buffer = function(buf)
+  if not vim.lsp then
+    return {}
+  end
+  if vim.lsp.get_clients then
+    return vim.lsp.get_clients({ bufnr = buf })
+  end
+  if vim.lsp.get_active_clients then
+    return vim.lsp.get_active_clients({ bufnr = buf })
+  end
+  return {}
+end
+
+local function client_supports_semantic_tokens(client, buf)
+  if not client or not client.supports_method then
+    return false
+  end
+  return client:supports_method("textDocument/semanticTokens/full", buf)
+    or client:supports_method("textDocument/semanticTokens/range", buf)
+end
+
+local function semantic_highlighter_has_client(buf, client_id)
+  local semantic_tokens = vim.lsp and vim.lsp.semantic_tokens or nil
+  local highlighters = semantic_tokens
+    and semantic_tokens.__STHighlighter
+    and semantic_tokens.__STHighlighter.active
+  local highlighter = highlighters and highlighters[buf] or nil
+  return highlighter
+    and highlighter.client_state
+    and highlighter.client_state[client_id] ~= nil
+end
+
+local function start_source_semantic_tokens(buf)
+  local semantic_tokens = vim.lsp and vim.lsp.semantic_tokens or nil
+  if not semantic_tokens then
+    return false
+  end
+
+  local started_or_active = false
+  for _, client in ipairs(lsp_clients_for_buffer(buf)) do
+    if client_supports_semantic_tokens(client, buf) then
+      if semantic_highlighter_has_client(buf, client.id) then
+        started_or_active = true
+      elseif semantic_tokens._start then
+        local ok = pcall(semantic_tokens._start, buf, client.id, 0)
+        started_or_active = started_or_active or ok
+      elseif semantic_tokens.start then
+        local ok = pcall(semantic_tokens.start, buf, client.id, { debounce = 0 })
+        started_or_active = started_or_active or ok
+      end
+    end
+  end
+
+  if started_or_active and semantic_tokens.force_refresh then
+    pcall(semantic_tokens.force_refresh, buf)
+  end
+  return started_or_active
+end
+
 local function source_buffer(root, path)
   local full_path = vim.fn.fnamemodify(root .. "/" .. path, ":p")
   if vim.fn.filereadable(full_path) ~= 1 then
@@ -635,22 +714,363 @@ local function inspected_treesitter_syntax_groups_at(buf, row, col)
   return groups
 end
 
-local function inspected_semantic_groups_at(buf, row, col)
+function MIRROR.push_semantic_token_groups(target, seen, token, filetype)
+  if not token or not token.type or filetype == "" then
+    return
+  end
+
+  push_group(target, seen, string.format("@lsp.type.%s.%s", token.type, filetype))
+
+  local modifiers = {}
+  for modifier, enabled in pairs(token.modifiers or {}) do
+    if enabled then
+      table.insert(modifiers, modifier)
+    end
+  end
+  table.sort(modifiers)
+
+  for _, modifier in ipairs(modifiers) do
+    push_group(target, seen, string.format("@lsp.mod.%s.%s", modifier, filetype))
+  end
+  for _, modifier in ipairs(modifiers) do
+    push_group(target, seen, string.format("@lsp.typemod.%s.%s.%s", token.type, modifier, filetype))
+  end
+end
+
+function MIRROR.semantic_token_modifiers(mask, token_modifiers)
+  local bit = require("bit")
+  local modifiers = {}
+  local index = 1
+  while mask and mask > 0 do
+    if bit.band(mask, 1) == 1 and token_modifiers[index] then
+      modifiers[token_modifiers[index]] = true
+    end
+    mask = bit.rshift(mask, 1)
+    index = index + 1
+  end
+  return modifiers
+end
+
+function MIRROR.byteindex(line, encoding, index)
+  local ok, byteindex = pcall(vim.str_byteindex, line, encoding or "utf-16", index, false)
+  if ok then
+    return byteindex
+  end
+  return math.min(#line, index)
+end
+
+function MIRROR.utfindex(line, encoding)
+  local ok, utfindex = pcall(vim.str_utfindex, line, encoding or "utf-16")
+  if ok then
+    return utfindex
+  end
+  return #line
+end
+
+function MIRROR.semantic_ranges_from_response(buf, client, response)
+  local provider = client and client.server_capabilities and client.server_capabilities.semanticTokensProvider
+  local legend = provider and provider.legend or nil
+  local token_types = legend and legend.tokenTypes or nil
+  local token_modifiers = legend and legend.tokenModifiers or nil
+  local data = response and response.data or nil
+  if not token_types or not token_modifiers or not data then
+    return {}
+  end
+
+  local ranges = {}
+  local encoding = client.offset_encoding or "utf-16"
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local eol_offset = vim.bo[buf].fileformat == "dos" and 2 or 1
+  local line = nil
+  local start_char = 0
+
+  for index = 1, #data, 5 do
+    local delta_line = data[index]
+    line = line and line + delta_line or delta_line
+    start_char = delta_line == 0 and start_char + data[index + 1] or data[index + 1]
+
+    local token_type = token_types[data[index + 3] + 1]
+    if token_type then
+      local end_char = start_char + data[index + 2]
+      local end_line = line
+      local buf_line = lines[line + 1] or ""
+      local start_col = MIRROR.byteindex(buf_line, encoding, start_char)
+      local next_end_char = end_char - MIRROR.utfindex(buf_line, encoding) - eol_offset
+
+      while next_end_char > 0 do
+        end_char = next_end_char
+        end_line = end_line + 1
+        buf_line = lines[end_line + 1] or ""
+        next_end_char = next_end_char - MIRROR.utfindex(buf_line, encoding) - eol_offset
+      end
+
+      table.insert(ranges, {
+        line = line,
+        start_col = start_col,
+        end_line = end_line,
+        end_col = MIRROR.byteindex(buf_line, encoding, end_char),
+        type = token_type,
+        modifiers = MIRROR.semantic_token_modifiers(data[index + 4], token_modifiers),
+        client_id = client.id,
+      })
+    end
+  end
+
+  return ranges
+end
+
+function MIRROR.semantic_ranges_by_line(ranges)
+  local by_line = {}
+  for _, token in ipairs(ranges or {}) do
+    for line = token.line, token.end_line do
+      by_line[line] = by_line[line] or {}
+      table.insert(by_line[line], token)
+    end
+  end
+  return by_line
+end
+
+function MIRROR.token_contains(token, row, col)
+  if not token then
+    return false
+  end
+  if row < token.line or row > token.end_line then
+    return false
+  end
+  if row == token.line and col < token.start_col then
+    return false
+  end
+  if row == token.end_line and col >= token.end_col then
+    return false
+  end
+  return true
+end
+
+function MIRROR.cached_semantic_groups_at(buf, row, col)
+  local cache = MIRROR.semantic_token_cache[buf]
+  if not cache or cache.changedtick ~= vim.api.nvim_buf_get_changedtick(buf) then
+    return nil
+  end
+
   local groups = {}
   local seen = {}
+  local filetype = vim.bo[buf].filetype
+  local client_ids = vim.tbl_keys(cache.clients or {})
+  table.sort(client_ids)
+  for _, client_id in ipairs(client_ids) do
+    local client_cache = cache.clients[client_id] or {}
+    local tokens = client_cache.by_line and client_cache.by_line[row] or client_cache
+    for _, token in ipairs(tokens or {}) do
+      if MIRROR.token_contains(token, row, col) then
+        MIRROR.push_semantic_token_groups(groups, seen, token, filetype)
+      end
+    end
+  end
+  return groups
+end
+
+function MIRROR.semantic_groups_at(buf, row, col)
+  local cached_groups = MIRROR.cached_semantic_groups_at(buf, row, col)
+  if cached_groups then
+    return cached_groups
+  end
+
+  local groups = {}
+  local seen = {}
+
+  if vim.lsp and vim.lsp.semantic_tokens and vim.lsp.semantic_tokens.get_at_pos then
+    local ok, tokens = pcall(vim.lsp.semantic_tokens.get_at_pos, buf, row, col)
+    if ok and tokens and #tokens > 0 then
+      local filetype = vim.bo[buf].filetype
+      table.sort(tokens, function(left, right)
+        if (left.client_id or 0) ~= (right.client_id or 0) then
+          return (left.client_id or 0) < (right.client_id or 0)
+        end
+        if (left.start_col or 0) ~= (right.start_col or 0) then
+          return (left.start_col or 0) < (right.start_col or 0)
+        end
+        return tostring(left.type or "") < tostring(right.type or "")
+      end)
+      for _, token in ipairs(tokens) do
+        MIRROR.push_semantic_token_groups(groups, seen, token, filetype)
+      end
+      return groups
+    end
+  end
+
   local inspected = inspect_source_pos(buf, row, col)
   if not inspected then
     return groups
   end
 
-  for _, item in ipairs(inspected.semantic_tokens or {}) do
+  local tokens = vim.deepcopy(inspected.semantic_tokens or {})
+  table.sort(tokens, function(left, right)
+    local left_opts = left.opts or left
+    local right_opts = right.opts or right
+    local left_priority = left_opts.priority or 0
+    local right_priority = right_opts.priority or 0
+    if left_priority ~= right_priority then
+      return left_priority < right_priority
+    end
+    return tostring(left_opts.hl_group or "") < tostring(right_opts.hl_group or "")
+  end)
+
+  for _, item in ipairs(tokens) do
     push_inspected_group(groups, seen, item.opts or item)
   end
   return groups
 end
 
+function MIRROR.request_semantic_tokens(buf, on_done)
+  if not vim.lsp then
+    return false
+  end
+
+  local requested = false
+  local changedtick = vim.api.nvim_buf_get_changedtick(buf)
+  local pending = MIRROR.semantic_token_pending[buf] or {}
+  MIRROR.semantic_token_pending[buf] = pending
+
+  for _, client in ipairs(lsp_clients_for_buffer(buf)) do
+    local supports_full = client:supports_method("textDocument/semanticTokens/full", buf)
+    local supports_range = client:supports_method("textDocument/semanticTokens/range", buf)
+    if supports_full or supports_range then
+      local key = tostring(client.id) .. ":" .. tostring(changedtick)
+      if not pending[key] then
+        local method = supports_full and "textDocument/semanticTokens/full" or "textDocument/semanticTokens/range"
+        local params = { textDocument = vim.lsp.util.make_text_document_params(buf) }
+        if not supports_full then
+          params.range = {
+            ["start"] = { line = 0, character = 0 },
+            ["end"] = { line = vim.api.nvim_buf_line_count(buf), character = 0 },
+          }
+        end
+
+        pending[key] = true
+        local ok = client:request(method, params, function(err, response)
+          pending[key] = nil
+          if err or not response or not vim.api.nvim_buf_is_valid(buf) then
+            return
+          end
+          if vim.api.nvim_buf_get_changedtick(buf) ~= changedtick then
+            return
+          end
+
+          local cache = MIRROR.semantic_token_cache[buf] or {}
+          if cache.changedtick ~= changedtick then
+            cache = {
+              changedtick = changedtick,
+              clients = {},
+            }
+          end
+          local ranges = MIRROR.semantic_ranges_from_response(buf, client, response)
+          cache.clients[client.id] = {
+            ranges = ranges,
+            by_line = MIRROR.semantic_ranges_by_line(ranges),
+          }
+          MIRROR.semantic_token_cache[buf] = cache
+          vim.b[buf][SOURCE_SEMANTIC_TICK_VAR] = (vim.b[buf][SOURCE_SEMANTIC_TICK_VAR] or 0) + 1
+          if on_done then
+            vim.schedule(on_done)
+          end
+        end, buf)
+        requested = requested or ok
+        if not ok then
+          pending[key] = nil
+        end
+      end
+    end
+  end
+
+  return requested
+end
+
 local function highlight_groups_key(groups)
   return table.concat(groups, "\0")
+end
+
+function MIRROR.resolved_highlight_spec(groups)
+  local spec = {}
+  local has_style = false
+
+  for _, group in ipairs(groups or {}) do
+    local ok, highlight = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+    if ok and highlight then
+      if highlight.fg then
+        spec.fg = highlight.fg
+        has_style = true
+      end
+      if highlight.sp then
+        spec.sp = highlight.sp
+        has_style = true
+      end
+      for _, key in ipairs(MIRROR.style_keys) do
+        if highlight[key] ~= nil then
+          spec[key] = highlight[key]
+          if highlight[key] then
+            has_style = true
+          end
+        end
+      end
+    end
+  end
+
+  if not has_style then
+    return nil
+  end
+  return spec
+end
+
+function MIRROR.highlight_spec_key(spec)
+  if not spec then
+    return ""
+  end
+
+  local parts = {}
+  if spec.fg then
+    table.insert(parts, "fg=" .. tostring(spec.fg))
+  end
+  if spec.sp then
+    table.insert(parts, "sp=" .. tostring(spec.sp))
+  end
+  for _, key in ipairs(MIRROR.style_keys) do
+    if spec[key] ~= nil then
+      table.insert(parts, key .. "=" .. tostring(spec[key]))
+    end
+  end
+  return table.concat(parts, ";")
+end
+
+function MIRROR.highlight_group(groups)
+  local stack_key = highlight_groups_key(groups)
+  if stack_key == "" then
+    return nil
+  end
+
+  local stack_cached = MIRROR.stack_cache[stack_key]
+  if stack_cached ~= nil then
+    return stack_cached or nil
+  end
+
+  local spec = MIRROR.resolved_highlight_spec(groups)
+  if not spec then
+    MIRROR.stack_cache[stack_key] = false
+    return nil
+  end
+
+  local key = MIRROR.highlight_spec_key(spec)
+  local cached = MIRROR.highlight_cache[key]
+  if cached then
+    MIRROR.stack_cache[stack_key] = cached
+    return cached
+  end
+
+  MIRROR.count = MIRROR.count + 1
+  local group = MIRROR.prefix .. MIRROR.count
+  vim.api.nvim_set_hl(0, group, spec)
+  MIRROR.highlight_cache[key] = group
+  MIRROR.stack_cache[stack_key] = group
+  return group
 end
 
 local function source_line_segments(source_buf, source_line, groups_at)
@@ -661,23 +1081,24 @@ local function source_line_segments(source_buf, source_line, groups_at)
   end
 
   local segments = {}
-  local active_groups = {}
+  local active_group = nil
   local active_key = ""
   local active_start = nil
   local byte_len = #source_text
 
   for col = 0, byte_len do
     local groups = col < byte_len and groups_at(source_buf, source_row, col) or {}
-    local key = highlight_groups_key(groups)
+    local group = col < byte_len and MIRROR.highlight_group(groups) or nil
+    local key = group or ""
     if key ~= active_key then
-      if #active_groups > 0 and active_start and active_start < col then
+      if active_group and active_start and active_start < col then
         table.insert(segments, {
           start_col = active_start,
           end_col = col,
-          groups = active_groups,
+          group = active_group,
         })
       end
-      active_groups = groups
+      active_group = group
       active_key = key
       active_start = col
     end
@@ -838,8 +1259,18 @@ local function request_source_semantic_refresh(buf, state, row, source, signatur
   end
 
   state.source_semantic_refreshes[row.path] = signature
-  local ok = pcall(vim.lsp.semantic_tokens.force_refresh, source)
-  if ok then
+  local function on_done()
+    local current = RENDER_STATES[buf]
+    if not current then
+      return
+    end
+    current.source_semantic_segments = current.source_semantic_segments or {}
+    current.source_semantic_segments[row.path] = nil
+    schedule_visible_mirror(buf)
+  end
+  local started = start_source_semantic_tokens(source)
+  local requested = MIRROR.request_semantic_tokens(source, on_done)
+  if started or requested then
     timing.log(state.root, "buffer", "source semantic refresh requested path=" .. tostring(row.path))
     schedule_semantic_mirror_retry(buf, state)
   end
@@ -867,7 +1298,7 @@ local function semantic_segments_for_row(buf, state, row)
     return cached
   end
 
-  local segments = source_line_segments(source, row.source_line, inspected_semantic_groups_at)
+  local segments = source_line_segments(source, row.source_line, MIRROR.semantic_groups_at)
   if #segments == 0 then
     request_source_semantic_refresh(buf, state, row, source, signature)
     return segments
@@ -889,12 +1320,20 @@ local function apply_line_segments(buf, review_row, code_start_col, segments, ba
     local start_col = math.min(line_len, code_start_col + segment.start_col)
     local end_col = math.min(line_len, code_start_col + segment.end_col)
     if start_col < end_col then
-      for priority_offset, group in ipairs(segment.groups or {}) do
+      if segment.group then
         vim.api.nvim_buf_set_extmark(buf, SOURCE_NAMESPACE, review_row, start_col, {
           end_col = end_col,
-          hl_group = group,
-          priority = base_priority + priority_offset,
+          hl_group = segment.group,
+          priority = base_priority,
         })
+      else
+        for priority_offset, group in ipairs(segment.groups or {}) do
+          vim.api.nvim_buf_set_extmark(buf, SOURCE_NAMESPACE, review_row, start_col, {
+            end_col = end_col,
+            hl_group = group,
+            priority = base_priority + priority_offset,
+          })
+        end
       end
     end
   end
@@ -1395,6 +1834,24 @@ local function mark_source_semantics_changed(buf)
   vim.b[buf][SOURCE_SEMANTIC_TICK_VAR] = (vim.b[buf][SOURCE_SEMANTIC_TICK_VAR] or 0) + 1
 end
 
+function MIRROR.reset()
+  MIRROR.highlight_cache = {}
+  MIRROR.stack_cache = {}
+  MIRROR.semantic_token_cache = {}
+  MIRROR.semantic_token_pending = {}
+  MIRROR.count = 0
+  define_highlights()
+  define_diff_gutter_highlights()
+  for buf, state in pairs(RENDER_STATES) do
+    state.source_segments = {}
+    state.source_semantic_segments = {}
+    if vim.api.nvim_buf_is_valid(buf) then
+      schedule_visible_mirror(buf)
+      sidebar.update(buf, RENDER_STATES, false, "ColorScheme")
+    end
+  end
+end
+
 local function flush_pending_refresh(buf)
   local state = RENDER_STATES[buf]
   if state and state.pending_refresh then
@@ -1506,6 +1963,33 @@ local function setup_source_change_autocmds()
       end
       mark_source_semantics_changed(event.buf)
       mark_repo_mirrors_pending(vim.api.nvim_buf_get_name(event.buf))
+    end,
+  })
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = source_change_augroup,
+    callback = function(event)
+      if RENDER_STATES[event.buf] then
+        return
+      end
+      if not vim.b[event.buf][SOURCE_HELPER_BUFFER_VAR] then
+        return
+      end
+      local function on_done()
+        mark_source_semantics_changed(event.buf)
+        mark_repo_mirrors_pending(vim.api.nvim_buf_get_name(event.buf))
+      end
+      local started = start_source_semantic_tokens(event.buf)
+      local requested = MIRROR.request_semantic_tokens(event.buf, on_done)
+      if started or requested then
+        mark_source_semantics_changed(event.buf)
+        mark_repo_mirrors_pending(vim.api.nvim_buf_get_name(event.buf))
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    group = source_change_augroup,
+    callback = function()
+      MIRROR.reset()
     end,
   })
 end
