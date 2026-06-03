@@ -1278,7 +1278,7 @@ fn thread_line_rail_highlight(thread: &ReviewThread, current_line: u32) -> &'sta
         Some("exact" | "content") => HIGHLIGHT_THREAD_RAIL,
         Some("context" | "changed") => HIGHLIGHT_THREAD_RAIL_CONTEXT,
         Some("line_fallback") => HIGHLIGHT_THREAD_RAIL_STALE,
-        Some("missing" | "detached") => HIGHLIGHT_THREAD_RAIL_DETACHED,
+        Some("gap" | "missing" | "detached") => HIGHLIGHT_THREAD_RAIL_DETACHED,
         _ => thread_rail_highlight(thread),
     }
 }
@@ -1289,7 +1289,7 @@ fn thread_location_note(thread: &ReviewThread) -> &'static str {
         Some("per_line_hash") => "source lines match",
         Some("moved_exact") => "moved exact source match",
         Some("context") => "anchored by surrounding context",
-        Some("window") => "partial source match",
+        Some("window") => "expanded source window",
         Some("line_fallback") => "stale line fallback",
         Some("file_fallback") => "file-level fallback",
         Some("detached") => "detached from current source",
@@ -2130,7 +2130,7 @@ mod tests {
                     end_line: Some(1),
                     placement: Some("line_fallback".to_string()),
                     line_placements: vec![ReviewThreadLinePlacement {
-                        original_line: 1,
+                        original_line: Some(1),
                         current_line: Some(1),
                         placement: "line_fallback".to_string(),
                     }],
@@ -2194,7 +2194,7 @@ mod tests {
                 status: FileStatus::Modified,
                 is_changed: true,
                 comment_count: 1,
-                added_lines: 3,
+                added_lines: 4,
                 removed_lines: 0,
             }],
             file_contents_by_path: BTreeMap::from([(
@@ -2203,6 +2203,7 @@ mod tests {
                     old: None,
                     new: Some(vec![
                         "let first = load();".to_string(),
+                        "let inserted = true;".to_string(),
                         "let second = recompute();".to_string(),
                         "apply(first, second);".to_string(),
                     ]),
@@ -2214,10 +2215,10 @@ mod tests {
                     path: "src/main.rs".to_string(),
                     hunks: vec![crate::diff::DiffHunk {
                         old: None,
-                        new: Some(crate::diff::LineRange { start: 1, end: 3 }),
+                        new: Some(crate::diff::LineRange { start: 1, end: 4 }),
                         sections: vec![crate::diff::DiffSection::Added {
                             added: crate::diff::NewRange {
-                                new: crate::diff::LineRange { start: 1, end: 3 },
+                                new: crate::diff::LineRange { start: 1, end: 4 },
                             },
                         }],
                     }],
@@ -2227,26 +2228,31 @@ mod tests {
                 id: "thread-1".to_string(),
                 scope: THREAD_SCOPE_LINE.to_string(),
                 path: Some("src/main.rs".to_string()),
-                line_label: "src/main.rs:1-3".to_string(),
+                line_label: "src/main.rs:1-4".to_string(),
                 anchor: ReviewThreadAnchor {
                     side: Some(SIDE_NEW.to_string()),
                     start_line: Some(1),
-                    end_line: Some(3),
+                    end_line: Some(4),
                     placement: Some("window".to_string()),
                     line_placements: vec![
                         ReviewThreadLinePlacement {
-                            original_line: 1,
+                            original_line: Some(1),
                             current_line: Some(1),
                             placement: "content".to_string(),
                         },
                         ReviewThreadLinePlacement {
-                            original_line: 2,
+                            original_line: None,
                             current_line: Some(2),
+                            placement: "gap".to_string(),
+                        },
+                        ReviewThreadLinePlacement {
+                            original_line: Some(2),
+                            current_line: Some(3),
                             placement: "changed".to_string(),
                         },
                         ReviewThreadLinePlacement {
-                            original_line: 3,
-                            current_line: Some(3),
+                            original_line: Some(3),
+                            current_line: Some(4),
                             placement: "content".to_string(),
                         },
                     ],
@@ -2278,6 +2284,7 @@ mod tests {
             source_rail_groups(&rendered),
             vec![
                 HIGHLIGHT_THREAD_RAIL,
+                HIGHLIGHT_THREAD_RAIL_DETACHED,
                 HIGHLIGHT_THREAD_RAIL_CONTEXT,
                 HIGHLIGHT_THREAD_RAIL,
             ]

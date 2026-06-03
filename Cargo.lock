@@ -2770,6 +2770,7 @@ dependencies = [
  "clap",
  "facet",
  "facet-json",
+ "futures",
  "gix",
  "gix-diff",
  "humantime",

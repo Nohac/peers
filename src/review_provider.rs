@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use facet::Facet;
+use futures::future::join_all;
 use thiserror::Error;
 use tracing::instrument;
 
@@ -95,7 +97,7 @@ impl ReviewProvider {
         let current_head_oid = repo_current_head_oid(&self.repo_root).await?;
         let contexts = open_comment_contexts(&state, current_head_oid.as_deref());
         let initial_diff = load_initial_diff(&self.repo_root, &self.target, &contexts).await?;
-        let projected_threads = review_threads(&state, &self.author, &initial_diff);
+        let projected_threads = review_threads(&state, &self.author, &initial_diff).await?;
         let relocated_contexts =
             review_thread_contexts(&projected_threads, current_head_oid.as_deref());
         let diff = if relocated_contexts == contexts {
@@ -103,13 +105,7 @@ impl ReviewProvider {
         } else {
             load_relocated_diff(&self.repo_root, &self.target, &relocated_contexts).await?
         };
-        Ok(review_payload(
-            &state,
-            diff,
-            &self.target,
-            &self.author,
-            current_head_oid,
-        ))
+        review_payload(&state, diff, &self.target, &self.author, current_head_oid).await
     }
 
     pub async fn refresh_diff(&self) -> Result<ReviewProjection> {
@@ -400,7 +396,7 @@ pub struct ReviewThreadAnchor {
 
 #[derive(Clone, Debug, Facet, PartialEq)]
 pub struct ReviewThreadLinePlacement {
-    pub original_line: u32,
+    pub original_line: Option<u32>,
     pub current_line: Option<u32>,
     pub placement: String,
 }
@@ -470,14 +466,14 @@ pub struct ThreadRequest {
     pub thread_id: String,
 }
 
-fn review_payload(
+async fn review_payload(
     state: &PeersState,
     mut diff: ReviewDiffPayload,
     target: &ReviewTarget,
     current_author: &Author,
     current_head_oid: Option<String>,
-) -> ReviewProjection {
-    let threads = review_threads(state, current_author, &diff);
+) -> Result<ReviewProjection> {
+    let threads = review_threads(state, current_author, &diff).await?;
     let mut comment_counts = BTreeMap::<String, u32>::new();
     for thread in &threads {
         if thread_visible_in_default_projection(
@@ -499,7 +495,7 @@ fn review_payload(
         .cloned()
         .collect();
 
-    ReviewProjection {
+    Ok(ReviewProjection {
         review_id: "repo".to_string(),
         target_label: target.label(),
         current_head_oid,
@@ -510,7 +506,7 @@ fn review_payload(
         threads,
         review_threads,
         commits: Vec::new(),
-    }
+    })
 }
 
 fn open_comment_contexts(
@@ -610,13 +606,13 @@ fn review_thread_contexts(
     skip_all,
     fields(threads = state.threads.len(), files = diff.files.len())
 )]
-fn review_threads(
+async fn review_threads(
     state: &PeersState,
     current_author: &Author,
     diff: &ReviewDiffPayload,
-) -> Vec<ReviewThread> {
+) -> Result<Vec<ReviewThread>> {
     let anchor_indexes = build_anchor_indexes(diff);
-    relocate_threads(state, current_author, &anchor_indexes)
+    relocate_threads(state, current_author, anchor_indexes).await
 }
 
 #[instrument(name = "anchor_indexes", skip_all)]
@@ -625,17 +621,31 @@ fn build_anchor_indexes(diff: &ReviewDiffPayload) -> ReviewAnchorIndexes {
 }
 
 #[instrument(name = "relocate_threads", skip_all)]
-fn relocate_threads(
+async fn relocate_threads(
     state: &PeersState,
     current_author: &Author,
-    anchor_indexes: &ReviewAnchorIndexes,
-) -> Vec<ReviewThread> {
-    state
+    anchor_indexes: ReviewAnchorIndexes,
+) -> Result<Vec<ReviewThread>> {
+    let current_author = Arc::new(current_author.clone());
+    let anchor_indexes = Arc::new(anchor_indexes);
+    let handles = state
         .threads
         .values()
         .filter(|thread| thread.pruned_at.is_none() && thread.archived_at.is_none())
-        .map(|thread| review_thread(thread, current_author, anchor_indexes))
-        .collect()
+        .cloned()
+        .map(|thread| {
+            let current_author = Arc::clone(&current_author);
+            let anchor_indexes = Arc::clone(&anchor_indexes);
+            tokio::spawn(async move { review_thread(&thread, &current_author, &anchor_indexes) })
+        })
+        .collect::<Vec<_>>();
+
+    let joined = join_all(handles).await;
+    let mut threads = Vec::with_capacity(joined.len());
+    for thread in joined {
+        threads.push(thread?);
+    }
+    Ok(threads)
 }
 
 fn review_thread(
@@ -710,6 +720,7 @@ fn relocate_review_line_anchor(
     relocate_line_anchor_in_index(line, anchor_indexes.for_side(&line.side))
 }
 
+#[derive(Clone)]
 struct ReviewAnchorIndexes {
     old: AnchorIndex,
     new: AnchorIndex,
@@ -793,6 +804,7 @@ fn anchor_line_placement_name(placement: AnchorLinePlacement) -> &'static str {
         AnchorLinePlacement::Content => "content",
         AnchorLinePlacement::Context => "context",
         AnchorLinePlacement::Changed => "changed",
+        AnchorLinePlacement::Gap => "gap",
         AnchorLinePlacement::LineFallback => "line_fallback",
         AnchorLinePlacement::Missing => "missing",
         AnchorLinePlacement::Detached => "detached",
@@ -884,8 +896,8 @@ mod tests {
     use crate::comments::{AuthorKind, PeersTimestamp};
     use crate::diff::{DiffHunk, FileContent, FileDiff, FileStatus};
 
-    #[test]
-    fn projection_uses_relocated_line_anchor_metadata() {
+    #[tokio::test]
+    async fn projection_uses_relocated_line_anchor_metadata() {
         let base_lines = lines(&[
             "fn configure() {",
             "    let first = load();",
@@ -961,7 +973,7 @@ mod tests {
             )]),
         };
 
-        let threads = review_threads(&state, &author, &diff);
+        let threads = review_threads(&state, &author, &diff).await.unwrap();
 
         assert_eq!(threads.len(), 1);
         let thread = &threads[0];
@@ -984,7 +996,7 @@ mod tests {
             .collect();
         assert_eq!(
             line_placements,
-            vec![(2, Some(3), "exact"), (3, Some(4), "exact")]
+            vec![(Some(2), Some(3), "exact"), (Some(3), Some(4), "exact")]
         );
     }
 
