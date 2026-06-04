@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use facet::Facet;
@@ -22,6 +22,7 @@ const DIFF_CHANGED: &str = "diff_changed";
 const BROADCAST_CAPACITY: usize = 256;
 const WATCH_CHANNEL_CAPACITY: usize = 256;
 const WATCH_DEBOUNCE_MS: u64 = 120;
+const LOCAL_REVIEW_WATCH_SUPPRESSION_MS: u64 = 750;
 const WATCHER_CREATE_ERROR: &str = "failed to create Peers realtime watcher";
 const WATCH_REPO_ERROR: &str = "failed to watch repository for Peers realtime updates";
 const WATCH_EVENTS_ERROR: &str = "failed to watch Peers review event log";
@@ -46,6 +47,7 @@ pub struct ReviewUpdate {
 pub struct ReviewUpdateBroadcaster {
     sender: broadcast::Sender<ReviewUpdate>,
     sequence: Arc<AtomicU64>,
+    last_local_review_changed_ms: Arc<AtomicU64>,
 }
 
 impl ReviewUpdateBroadcaster {
@@ -54,6 +56,7 @@ impl ReviewUpdateBroadcaster {
         Self {
             sender,
             sequence: Arc::new(AtomicU64::new(0)),
+            last_local_review_changed_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -65,8 +68,18 @@ impl ReviewUpdateBroadcaster {
         self.notify(REVIEW_CHANGED);
     }
 
+    pub fn mark_local_review_changed(&self) {
+        self.last_local_review_changed_ms
+            .store(now_millis(), Ordering::Relaxed);
+    }
+
     pub fn notify_diff_changed(&self) {
         self.notify(DIFF_CHANGED);
+    }
+
+    fn should_suppress_watched_review_changed(&self) -> bool {
+        let last = self.last_local_review_changed_ms.load(Ordering::Relaxed);
+        last != 0 && now_millis().saturating_sub(last) <= LOCAL_REVIEW_WATCH_SUPPRESSION_MS
     }
 
     fn notify(&self, kind: &str) {
@@ -77,6 +90,15 @@ impl ReviewUpdateBroadcaster {
             sequence,
         });
     }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 impl Default for ReviewUpdateBroadcaster {
@@ -159,7 +181,11 @@ async fn publish_pending(
         regenerate_outputs(repo_root, None)
             .await
             .context(REGENERATE_OUTPUTS_ERROR)?;
-        updates.notify_review_changed();
+        if updates.should_suppress_watched_review_changed() {
+            debug!("suppressing watched review update after local provider update");
+        } else {
+            updates.notify_review_changed();
+        }
     }
     if pending.diff_changed {
         updates.notify_diff_changed();
@@ -485,6 +511,16 @@ mod tests {
     const TEST_FILE: &str = "src/rpc.rs";
     const TEST_EVENTS: &str = ".peers/events.jsonl";
     const TEST_WATCHER_STARTUP_MS: u64 = 1000;
+
+    #[test]
+    fn local_review_updates_suppress_immediate_watched_review_update() {
+        let updates = ReviewUpdateBroadcaster::new();
+
+        assert!(!updates.should_suppress_watched_review_changed());
+        updates.mark_local_review_changed();
+
+        assert!(updates.should_suppress_watched_review_changed());
+    }
 
     #[tokio::test]
     async fn realtime_watcher_broadcasts_diff_change_after_snapshot() {

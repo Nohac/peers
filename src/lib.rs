@@ -4,7 +4,6 @@ pub mod comments;
 pub mod diff;
 pub mod logging;
 pub mod nvim;
-pub mod nvim_rpc;
 pub mod realtime;
 pub mod review;
 pub mod review_provider;

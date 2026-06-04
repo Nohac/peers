@@ -164,7 +164,7 @@ impl ReviewProvider {
         )
         .await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
+        self.updates.mark_local_review_changed();
         Ok(review)
     }
 
@@ -216,7 +216,7 @@ impl ReviewProvider {
         )
         .await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
+        self.updates.mark_local_review_changed();
         Ok(review)
     }
 
@@ -240,7 +240,7 @@ impl ReviewProvider {
         )
         .await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
+        self.updates.mark_local_review_changed();
         Ok(review)
     }
 
@@ -262,7 +262,7 @@ impl ReviewProvider {
         )
         .await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
+        self.updates.mark_local_review_changed();
         Ok(review)
     }
 
@@ -285,7 +285,7 @@ impl ReviewProvider {
         )
         .await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
+        self.updates.mark_local_review_changed();
         Ok(review)
     }
 
@@ -308,7 +308,7 @@ impl ReviewProvider {
         )
         .await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
+        self.updates.mark_local_review_changed();
         Ok(review)
     }
 
@@ -331,7 +331,7 @@ impl ReviewProvider {
         )
         .await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
+        self.updates.mark_local_review_changed();
         Ok(review)
     }
 
@@ -353,7 +353,7 @@ impl ReviewProvider {
         };
         append_peers_event(&self.repo_root, &event, Some(&self.target)).await?;
         let review = self.get_review().await?;
-        self.updates.notify_review_changed();
+        self.updates.mark_local_review_changed();
         Ok(review)
     }
 }
@@ -414,7 +414,7 @@ pub struct ReviewThreadAnchor {
     pub side: Option<String>,
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
-    pub placement: Option<String>,
+    pub placement: Option<AnchorPlacement>,
     pub line_placements: Vec<ReviewThreadLinePlacement>,
 }
 
@@ -422,7 +422,7 @@ pub struct ReviewThreadAnchor {
 pub struct ReviewThreadLinePlacement {
     pub original_line: Option<u32>,
     pub current_line: Option<u32>,
-    pub placement: String,
+    pub placement: AnchorLinePlacement,
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
@@ -687,7 +687,7 @@ fn review_thread(
                     side: Some(file_side_name(&line.side).to_string()),
                     start_line: relocated.start_line,
                     end_line: relocated.end_line,
-                    placement: Some(anchor_placement_name(relocated.placement).to_string()),
+                    placement: Some(relocated.placement),
                     line_placements: relocated
                         .line_placements
                         .iter()
@@ -703,7 +703,7 @@ fn review_thread(
                 side: None,
                 start_line: None,
                 end_line: None,
-                placement: Some("file".to_string()),
+                placement: Some(AnchorPlacement::FileFallback),
                 line_placements: Vec::new(),
             },
         ),
@@ -714,7 +714,7 @@ fn review_thread(
                 side: None,
                 start_line: None,
                 end_line: None,
-                placement: Some("review".to_string()),
+                placement: None,
                 line_placements: Vec::new(),
             },
         ),
@@ -789,7 +789,7 @@ fn review_thread_line_placement(
     ReviewThreadLinePlacement {
         original_line: line.original_line,
         current_line: line.current_line,
-        placement: anchor_line_placement_name(line.placement).to_string(),
+        placement: line.placement,
     }
 }
 
@@ -807,32 +807,6 @@ fn relocated_thread_label(
         format!("{path}:{start_line}")
     } else {
         format!("{path}:{start_line}-{end_line}")
-    }
-}
-
-fn anchor_placement_name(placement: AnchorPlacement) -> &'static str {
-    match placement {
-        AnchorPlacement::Exact => "exact",
-        AnchorPlacement::PerLineHash => "per_line_hash",
-        AnchorPlacement::Context => "context",
-        AnchorPlacement::MovedExact => "moved_exact",
-        AnchorPlacement::Window => "window",
-        AnchorPlacement::LineFallback => "line_fallback",
-        AnchorPlacement::FileFallback => "file_fallback",
-        AnchorPlacement::Detached => "detached",
-    }
-}
-
-fn anchor_line_placement_name(placement: AnchorLinePlacement) -> &'static str {
-    match placement {
-        AnchorLinePlacement::Exact => "exact",
-        AnchorLinePlacement::Content => "content",
-        AnchorLinePlacement::Context => "context",
-        AnchorLinePlacement::Changed => "changed",
-        AnchorLinePlacement::Gap => "gap",
-        AnchorLinePlacement::LineFallback => "line_fallback",
-        AnchorLinePlacement::Missing => "missing",
-        AnchorLinePlacement::Detached => "detached",
     }
 }
 
@@ -1007,7 +981,7 @@ mod tests {
         assert_eq!(thread.line_label, "src/config.rs:3-4");
         assert_eq!(thread.anchor.start_line, Some(3));
         assert_eq!(thread.anchor.end_line, Some(4));
-        assert_eq!(thread.anchor.placement.as_deref(), Some("exact"));
+        assert_eq!(thread.anchor.placement, Some(AnchorPlacement::Exact));
         let line_placements: Vec<_> = thread
             .anchor
             .line_placements

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::diff::LineAnchor;
+use facet::Facet;
 
 const HASH_KIND: gix::hash::Kind = gix::hash::Kind::Sha1;
 const MAX_WINDOW_GAP_LINES: usize = 100;
@@ -9,7 +10,8 @@ const MIN_CANDIDATE_LINE_SIGNAL: usize = 8;
 
 type LineHash = gix::ObjectId;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Facet, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AnchorPlacement {
     Exact,
     PerLineHash,
@@ -21,7 +23,23 @@ pub enum AnchorPlacement {
     Detached,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl AnchorPlacement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnchorPlacement::Exact => "exact",
+            AnchorPlacement::PerLineHash => "per_line_hash",
+            AnchorPlacement::Context => "context",
+            AnchorPlacement::MovedExact => "moved_exact",
+            AnchorPlacement::Window => "window",
+            AnchorPlacement::LineFallback => "line_fallback",
+            AnchorPlacement::FileFallback => "file_fallback",
+            AnchorPlacement::Detached => "detached",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Facet, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AnchorLinePlacement {
     Exact,
     Content,
@@ -32,6 +50,21 @@ pub enum AnchorLinePlacement {
     LineFallback,
     // test com
     Detached,
+}
+
+impl AnchorLinePlacement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnchorLinePlacement::Exact => "exact",
+            AnchorLinePlacement::Content => "content",
+            AnchorLinePlacement::Context => "context",
+            AnchorLinePlacement::Changed => "changed",
+            AnchorLinePlacement::Gap => "gap",
+            AnchorLinePlacement::Missing => "missing",
+            AnchorLinePlacement::LineFallback => "line_fallback",
+            AnchorLinePlacement::Detached => "detached",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -2,14 +2,16 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::net::{TcpListener, TcpStream};
 use tower_lsp_server::jsonrpc::{Error as LspError, Result as LspResult};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::instrument;
 
+use crate::anchors::{AnchorLinePlacement, AnchorPlacement};
 use crate::comments::AuthorKind;
-use crate::diff::{DiffSection, FileSide, LineRange};
+use crate::diff::{DiffSection, FileSide, FileStatus, LineRange};
 use crate::review_provider::ReviewProvider;
 use crate::review_provider::{
     CommentRequest, CreateThreadRequest, EditCommentRequest, ReviewComment, ReviewProjection,
@@ -144,6 +146,25 @@ const THREAD_STATUS_RESOLVED_ICON: &str = "✓";
 const THREAD_EMPTY_PREVIEW: &str = "No comment body";
 const THREAD_COMMENT_ELISION_SUFFIX: &str = "comments hidden";
 const TRUNCATION_SUFFIX: &str = "…";
+const SIDEBAR_WIDTH: usize = 36;
+const SIDEBAR_FOLDER_ICON: &str = "󰉋";
+const SIDEBAR_FILE_PREFIX: &str = "  ";
+const SIDEBAR_THREAD_MAX_VISIBLE_COMMENTS: usize = 3;
+const HIGHLIGHT_SIDEBAR_STATUS_ADDED: &str = "PeersSidebarStatusAdded";
+const HIGHLIGHT_SIDEBAR_STATUS_DELETED: &str = "PeersSidebarStatusDeleted";
+const HIGHLIGHT_SIDEBAR_STATUS_MODIFIED: &str = "PeersSidebarStatusModified";
+const HIGHLIGHT_SIDEBAR_STATUS_RENAMED: &str = "PeersSidebarStatusRenamed";
+const HIGHLIGHT_SIDEBAR_STATUS_UNCHANGED: &str = "PeersSidebarStatusUnchanged";
+const HIGHLIGHT_SIDEBAR_STATUS_BINARY: &str = "PeersSidebarStatusBinary";
+const HIGHLIGHT_SIDEBAR_DELTA_ADDED: &str = "PeersSidebarDeltaAdded";
+const HIGHLIGHT_SIDEBAR_DELTA_REMOVED: &str = "PeersSidebarDeltaRemoved";
+const HIGHLIGHT_SIDEBAR_DELTA_POSITIVE: &str = "PeersSidebarDeltaPositive";
+const HIGHLIGHT_SIDEBAR_DELTA_NEGATIVE: &str = "PeersSidebarDeltaNegative";
+const HIGHLIGHT_SIDEBAR_DELTA_NEUTRAL: &str = "PeersSidebarDeltaNeutral";
+const HIGHLIGHT_SIDEBAR_THREAD_META: &str = "PeersSidebarThreadMeta";
+const HIGHLIGHT_SIDEBAR_COMMENT_ELISION: &str = "PeersSidebarCommentElision";
+const HIGHLIGHT_SIDEBAR_THREAD_LOCATION_NOTE: &str = "PeersSidebarThreadLocationNote";
+const HIGHLIGHT_SIDEBAR_THREAD_RESOLVED: &str = "PeersSidebarThreadResolved";
 
 struct ReviewUpdatedNotification;
 
@@ -475,6 +496,7 @@ struct RenderedReview {
     rows: Vec<RenderedRow>,
     highlights: Vec<RenderedHighlight>,
     symbols: Vec<RenderedSymbol>,
+    sidebar: RenderedSidebar,
     sidebar_counts: RenderedSidebarCounts,
 }
 
@@ -514,6 +536,7 @@ impl RenderedReview {
                     .collect(),
             ),
         );
+        object.insert("sidebar".to_string(), self.sidebar.into_lsp());
         object.insert("sidebar_counts".to_string(), self.sidebar_counts.into_lsp());
         LSPAny::Object(object)
     }
@@ -544,11 +567,111 @@ impl RenderedSidebarCounts {
     }
 }
 
+#[derive(Debug, Default)]
+struct RenderedSidebar {
+    files: RenderedSidebarPanel,
+    comments: RenderedSidebarPanel,
+}
+
+impl RenderedSidebar {
+    fn into_lsp(self) -> LSPAny {
+        let mut object = LSPObject::new();
+        object.insert("files".to_string(), self.files.into_lsp());
+        object.insert("comments".to_string(), self.comments.into_lsp());
+        LSPAny::Object(object)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RenderedSidebarPanel {
+    lines: Vec<String>,
+    rows: Vec<RenderedSidebarRow>,
+    highlights: Vec<RenderedHighlight>,
+}
+
+impl RenderedSidebarPanel {
+    fn push_line(&mut self, line: String, row: RenderedSidebarRow) -> u32 {
+        let index = self.lines.len() as u32;
+        self.lines.push(line);
+        self.rows.push(row);
+        index
+    }
+
+    fn push_highlight(&mut self, line: u32, start_col: u32, end_col: u32, group: &'static str) {
+        self.highlights.push(RenderedHighlight {
+            line,
+            start_col,
+            end_col,
+            group,
+        });
+    }
+
+    fn into_lsp(self) -> LSPAny {
+        let mut object = LSPObject::new();
+        object.insert(
+            "lines".to_string(),
+            LSPAny::Array(self.lines.into_iter().map(LSPAny::String).collect()),
+        );
+        object.insert(
+            "rows".to_string(),
+            LSPAny::Array(
+                self.rows
+                    .into_iter()
+                    .map(RenderedSidebarRow::into_lsp)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "highlights".to_string(),
+            LSPAny::Array(
+                self.highlights
+                    .into_iter()
+                    .map(RenderedHighlight::into_lsp)
+                    .collect(),
+            ),
+        );
+        LSPAny::Object(object)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RenderedSidebarRow {
+    target_line: Option<u32>,
+    path: Option<String>,
+}
+
+impl RenderedSidebarRow {
+    fn target(target_line: usize) -> Self {
+        Self {
+            target_line: Some(target_line as u32),
+            path: None,
+        }
+    }
+
+    fn path(target_line: usize, path: String) -> Self {
+        Self {
+            target_line: Some(target_line as u32),
+            path: Some(path),
+        }
+    }
+
+    fn into_lsp(self) -> LSPAny {
+        let mut object = LSPObject::new();
+        if let Some(target_line) = self.target_line {
+            object.insert("target_line".to_string(), lsp_number(target_line));
+        }
+        if let Some(path) = self.path {
+            object.insert("path".to_string(), LSPAny::String(path));
+        }
+        LSPAny::Object(object)
+    }
+}
+
 #[derive(Debug)]
 struct RenderedRow {
     kind: &'static str,
     path: Option<String>,
-    file_status: Option<String>,
+    file_status: Option<FileStatus>,
     added_lines: Option<u32>,
     removed_lines: Option<u32>,
     side: Option<&'static str>,
@@ -563,8 +686,9 @@ struct RenderedRow {
     invalidates_later_activity: Option<bool>,
     resolved: Option<bool>,
     collapsed: Option<bool>,
+    thread_comment_count: Option<u32>,
     thread_summary: Option<String>,
-    anchor_placement: Option<String>,
+    anchor_placement: Option<AnchorPlacement>,
     placement_state: Option<&'static str>,
 }
 
@@ -588,6 +712,7 @@ impl RenderedRow {
             invalidates_later_activity: None,
             resolved: None,
             collapsed: None,
+            thread_comment_count: None,
             thread_summary: None,
             anchor_placement: None,
             placement_state: None,
@@ -613,6 +738,7 @@ impl RenderedRow {
             invalidates_later_activity: None,
             resolved: None,
             collapsed: None,
+            thread_comment_count: None,
             thread_summary: None,
             anchor_placement: None,
             placement_state: Some("file"),
@@ -623,7 +749,7 @@ impl RenderedRow {
         Self {
             kind: ROW_KIND_FILE_HEADER,
             path: Some(file.path.clone()),
-            file_status: Some(format!("{:?}", file.status)),
+            file_status: Some(file.status),
             added_lines: Some(file.added_lines),
             removed_lines: Some(file.removed_lines),
             side: None,
@@ -638,6 +764,7 @@ impl RenderedRow {
             invalidates_later_activity: None,
             resolved: None,
             collapsed: None,
+            thread_comment_count: None,
             thread_summary: None,
             anchor_placement: None,
             placement_state: Some("file"),
@@ -663,6 +790,7 @@ impl RenderedRow {
             invalidates_later_activity: None,
             resolved: None,
             collapsed: None,
+            thread_comment_count: None,
             thread_summary: None,
             anchor_placement: None,
             placement_state: Some("inline"),
@@ -692,8 +820,9 @@ impl RenderedRow {
             invalidates_later_activity: comment.map(|_| invalidates_later_activity),
             resolved: Some(thread.resolved),
             collapsed: Some(thread.collapsed),
+            thread_comment_count: Some(thread.comments.len() as u32),
             thread_summary: thread.collapsed.then(|| collapsed_thread_meta(thread)),
-            anchor_placement: thread.anchor.placement.clone(),
+            anchor_placement: thread.anchor.placement,
             placement_state: Some(thread_placement_state(thread)),
         }
     }
@@ -705,7 +834,10 @@ impl RenderedRow {
             object.insert("path".to_string(), LSPAny::String(path));
         }
         if let Some(file_status) = self.file_status {
-            object.insert("file_status".to_string(), LSPAny::String(file_status));
+            object.insert(
+                "file_status".to_string(),
+                LSPAny::String(file_status_name(file_status).to_string()),
+            );
         }
         if let Some(added_lines) = self.added_lines {
             object.insert("added_lines".to_string(), lsp_number(added_lines));
@@ -755,13 +887,19 @@ impl RenderedRow {
         if let Some(collapsed) = self.collapsed {
             object.insert("collapsed".to_string(), LSPAny::Bool(collapsed));
         }
+        if let Some(thread_comment_count) = self.thread_comment_count {
+            object.insert(
+                "thread_comment_count".to_string(),
+                lsp_number(thread_comment_count),
+            );
+        }
         if let Some(thread_summary) = self.thread_summary {
             object.insert("thread_summary".to_string(), LSPAny::String(thread_summary));
         }
         if let Some(anchor_placement) = self.anchor_placement {
             object.insert(
                 "anchor_placement".to_string(),
-                LSPAny::String(anchor_placement),
+                LSPAny::String(anchor_placement.as_str().to_string()),
             );
         }
         if let Some(placement_state) = self.placement_state {
@@ -809,11 +947,13 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         rows: Vec::new(),
         highlights: Vec::new(),
         symbols: Vec::new(),
+        sidebar: RenderedSidebar::default(),
         sidebar_counts: RenderedSidebarCounts::default(),
     };
 
     if !review.files.iter().any(review_file_is_visible) {
         render_empty_review(&mut rendered);
+        rendered.sidebar = render_sidebar(&rendered.rows);
         return rendered;
     }
 
@@ -1003,11 +1143,562 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         }
     }
 
+    rendered.sidebar = render_sidebar(&rendered.rows);
     rendered
 }
 
 fn review_file_is_visible(file: &crate::diff::ReviewFile) -> bool {
     file.is_changed || file.comment_count > 0
+}
+
+#[derive(Debug)]
+struct SidebarFile {
+    target_line: usize,
+    path: String,
+    name: String,
+    status: Option<FileStatus>,
+    added_lines: u32,
+    removed_lines: u32,
+    comment_count: u32,
+}
+
+#[derive(Debug)]
+struct SidebarThread {
+    target_line: usize,
+    label: String,
+    resolved: bool,
+    collapsed: bool,
+    comment_count: u32,
+    anchor_placement: Option<AnchorPlacement>,
+    summary: Option<String>,
+    comments: Vec<SidebarComment>,
+    seen_comments: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct SidebarComment {
+    target_line: usize,
+    body: String,
+    meta: String,
+}
+
+fn render_sidebar(rows: &[RenderedRow]) -> RenderedSidebar {
+    RenderedSidebar {
+        files: render_sidebar_files(rows),
+        comments: render_sidebar_comments(rows),
+    }
+}
+
+fn render_sidebar_files(rows: &[RenderedRow]) -> RenderedSidebarPanel {
+    let counts = sidebar_comment_counts(rows);
+    let mut groups: Vec<(String, Vec<SidebarFile>)> = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        if row.kind != ROW_KIND_FILE_HEADER {
+            continue;
+        }
+        let Some(path) = &row.path else {
+            continue;
+        };
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let dir = dirname(path);
+        let file = SidebarFile {
+            target_line: index + 1,
+            path: path.clone(),
+            name: basename(path),
+            status: row.file_status.clone(),
+            added_lines: row.added_lines.unwrap_or(0),
+            removed_lines: row.removed_lines.unwrap_or(0),
+            comment_count: counts.get(path).copied().unwrap_or(0),
+        };
+        push_sidebar_group_item(&mut groups, dir, file);
+    }
+
+    let mut panel = RenderedSidebarPanel::default();
+    for (dir, files) in groups {
+        let folder_prefix = format!("{SIDEBAR_FOLDER_ICON} ");
+        panel.push_line(
+            format!(
+                "{folder_prefix}{}",
+                truncate_start(
+                    &dir,
+                    SIDEBAR_WIDTH.saturating_sub(display_width(&folder_prefix))
+                )
+            ),
+            RenderedSidebarRow::path(
+                files.first().map(|file| file.target_line).unwrap_or(1),
+                files
+                    .first()
+                    .map(|file| file.path.clone())
+                    .unwrap_or_default(),
+            ),
+        );
+        for file in files {
+            push_sidebar_file(&mut panel, file);
+        }
+    }
+
+    if panel.lines.is_empty() {
+        panel.push_line("No files".to_string(), RenderedSidebarRow::default());
+    }
+    panel
+}
+
+fn push_sidebar_file(panel: &mut RenderedSidebarPanel, file: SidebarFile) {
+    let prefix = format!(
+        "{SIDEBAR_FILE_PREFIX}{} ",
+        sidebar_file_status_sign(file.status)
+    );
+    let delta_parts = sidebar_file_delta_parts(&file);
+    let suffix = sidebar_file_delta_suffix(&delta_parts);
+    let name_width = SIDEBAR_WIDTH
+        .saturating_sub(display_width(&prefix))
+        .saturating_sub(display_width(&suffix));
+    let name = truncate_start(&file.name, name_width);
+    let line_text = format!("{prefix}{name}{suffix}");
+    let line = panel.push_line(
+        line_text,
+        RenderedSidebarRow::path(file.target_line, file.path),
+    );
+    panel.push_highlight(
+        line,
+        SIDEBAR_FILE_PREFIX.len() as u32,
+        (SIDEBAR_FILE_PREFIX.len() + 1) as u32,
+        sidebar_file_status_highlight(file.status),
+    );
+
+    let mut col = prefix.len() + name.len();
+    for part in delta_parts {
+        col += 1;
+        if let Some(group) = part.highlight {
+            panel.push_highlight(line, col as u32, (col + part.text.len()) as u32, group);
+        }
+        col += part.text.len();
+    }
+}
+
+fn render_sidebar_comments(rows: &[RenderedRow]) -> RenderedSidebarPanel {
+    let mut groups: Vec<(String, Vec<SidebarThread>)> = Vec::new();
+    let mut by_id: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        if row.kind != ROW_KIND_COMMENT {
+            continue;
+        }
+        let Some(thread_id) = &row.thread_id else {
+            continue;
+        };
+        let (group_index, thread_index) =
+            if let Some(&(group_index, thread_index)) = by_id.get(thread_id) {
+                (group_index, thread_index)
+            } else {
+                let dir = dirname(row.path.as_deref().unwrap_or("review"));
+                let group_index = sidebar_group_index(&mut groups, dir);
+                let thread_index = groups[group_index].1.len();
+                groups[group_index].1.push(SidebarThread {
+                    target_line: index + 1,
+                    label: sidebar_thread_label(row),
+                    resolved: row.resolved.unwrap_or(false),
+                    collapsed: row.collapsed.unwrap_or(false),
+                    comment_count: row.thread_comment_count.unwrap_or(0),
+                    anchor_placement: row.anchor_placement.clone(),
+                    summary: row.thread_summary.clone(),
+                    comments: Vec::new(),
+                    seen_comments: BTreeSet::new(),
+                });
+                by_id.insert(thread_id.clone(), (group_index, thread_index));
+                (group_index, thread_index)
+            };
+
+        let thread = &mut groups[group_index].1[thread_index];
+        if thread.summary.is_none() {
+            thread.summary = row.thread_summary.clone();
+        }
+        let Some(comment_id) = &row.comment_id else {
+            continue;
+        };
+        if !thread.seen_comments.insert(comment_id.clone()) {
+            continue;
+        }
+        if let (Some(body), Some(meta)) = (&row.comment_body, &row.comment_meta) {
+            thread.comments.push(SidebarComment {
+                target_line: index + 1,
+                body: body.clone(),
+                meta: meta.clone(),
+            });
+        }
+    }
+
+    let mut panel = RenderedSidebarPanel::default();
+    for (dir, threads) in groups {
+        let folder_prefix = format!("{SIDEBAR_FOLDER_ICON} ");
+        panel.push_line(
+            format!(
+                "{folder_prefix}{}",
+                truncate_start(
+                    &dir,
+                    SIDEBAR_WIDTH.saturating_sub(display_width(&folder_prefix))
+                )
+            ),
+            RenderedSidebarRow::target(
+                threads
+                    .first()
+                    .map(|thread| thread.target_line)
+                    .unwrap_or(1),
+            ),
+        );
+        for thread in threads {
+            push_sidebar_thread(&mut panel, thread);
+        }
+    }
+
+    if panel.lines.is_empty() {
+        panel.push_line("No comments".to_string(), RenderedSidebarRow::default());
+    }
+    panel
+}
+
+fn push_sidebar_thread(panel: &mut RenderedSidebarPanel, thread: SidebarThread) {
+    let status = if thread.resolved {
+        THREAD_STATUS_RESOLVED_ICON
+    } else {
+        THREAD_STATUS_OPEN_ICON
+    };
+    let header_prefix = format!("{THREAD_HEADER_PREFIX}{status} ");
+    let header_suffix = if thread.collapsed {
+        format!(" [{}]", thread.comment_count)
+    } else {
+        String::new()
+    };
+    let label_width = SIDEBAR_WIDTH
+        .saturating_sub(display_width(&header_prefix))
+        .saturating_sub(display_width(&header_suffix));
+    let header = format!(
+        "{header_prefix}{}{header_suffix}",
+        truncate_start(&thread.label, label_width)
+    );
+    let line = panel.push_line(header, RenderedSidebarRow::target(thread.target_line));
+    if let Some(group) = sidebar_thread_border_highlight(thread.resolved) {
+        panel.push_highlight(line, 0, header_prefix.len() as u32, group);
+    }
+
+    if !thread.collapsed {
+        let visible_comments =
+            visible_comment_indexes(thread.comments.len(), SIDEBAR_THREAD_MAX_VISIBLE_COMMENTS);
+        for (visible_index, comment_index) in visible_comments.iter().copied().enumerate() {
+            if let Some(hidden_count) =
+                hidden_comment_count_before(&visible_comments, visible_index)
+            {
+                push_sidebar_comment_elision(
+                    panel,
+                    thread.target_line,
+                    hidden_count,
+                    thread.resolved,
+                );
+            }
+            push_sidebar_comment(panel, &thread.comments[comment_index], thread.resolved);
+        }
+    }
+
+    let footer_prefix = format!("{THREAD_FOOTER} ");
+    let footer_text = if thread.collapsed {
+        thread
+            .summary
+            .as_deref()
+            .unwrap_or(THREAD_EMPTY_PREVIEW)
+            .to_string()
+    } else {
+        placement_location_note(thread.anchor_placement).to_string()
+    };
+    let footer = format!(
+        "{footer_prefix}{}",
+        truncate_start(
+            &footer_text,
+            SIDEBAR_WIDTH.saturating_sub(display_width(&footer_prefix))
+        )
+    );
+    let line = panel.push_line(footer, RenderedSidebarRow::target(thread.target_line));
+    if let Some(group) = sidebar_thread_border_highlight(thread.resolved) {
+        panel.push_highlight(line, 0, THREAD_FOOTER.len() as u32, group);
+    }
+    panel.push_highlight(
+        line,
+        footer_prefix.len() as u32,
+        panel.lines[line as usize].len() as u32,
+        HIGHLIGHT_SIDEBAR_THREAD_LOCATION_NOTE,
+    );
+}
+
+fn push_sidebar_comment(
+    panel: &mut RenderedSidebarPanel,
+    comment: &SidebarComment,
+    resolved: bool,
+) {
+    let meta_prefix = THREAD_BODY_PREFIX;
+    let meta = format!(
+        "{meta_prefix}{}",
+        truncate_start(
+            &comment.meta,
+            SIDEBAR_WIDTH.saturating_sub(display_width(meta_prefix))
+        )
+    );
+    let line = panel.push_line(meta, RenderedSidebarRow::target(comment.target_line));
+    if let Some(group) = sidebar_thread_border_highlight(resolved) {
+        panel.push_highlight(line, 0, meta_prefix.len() as u32, group);
+    }
+    panel.push_highlight(
+        line,
+        meta_prefix.len() as u32,
+        panel.lines[line as usize].len() as u32,
+        HIGHLIGHT_SIDEBAR_THREAD_META,
+    );
+
+    let body = first_line(&comment.body);
+    let body_line = format!(
+        "{meta_prefix}{}",
+        truncate_end(
+            &body,
+            SIDEBAR_WIDTH.saturating_sub(display_width(meta_prefix))
+        )
+    );
+    let line = panel.push_line(body_line, RenderedSidebarRow::target(comment.target_line));
+    if let Some(group) = sidebar_thread_border_highlight(resolved) {
+        panel.push_highlight(line, 0, meta_prefix.len() as u32, group);
+    }
+}
+
+fn push_sidebar_comment_elision(
+    panel: &mut RenderedSidebarPanel,
+    target_line: usize,
+    hidden_count: usize,
+    resolved: bool,
+) {
+    let prefix = THREAD_COMMENT_ELISION_PREFIX;
+    let label = format!("… {hidden_count} {THREAD_COMMENT_ELISION_SUFFIX} …");
+    let line_text = format!(
+        "{prefix}{}",
+        truncate_end(&label, SIDEBAR_WIDTH.saturating_sub(display_width(prefix)))
+    );
+    let line = panel.push_line(line_text, RenderedSidebarRow::target(target_line));
+    if let Some(group) = sidebar_thread_border_highlight(resolved) {
+        panel.push_highlight(line, 0, prefix.len() as u32, group);
+    }
+    panel.push_highlight(
+        line,
+        prefix.len() as u32,
+        panel.lines[line as usize].len() as u32,
+        HIGHLIGHT_SIDEBAR_COMMENT_ELISION,
+    );
+}
+
+#[derive(Debug)]
+struct SidebarDeltaPart {
+    text: String,
+    highlight: Option<&'static str>,
+}
+
+fn sidebar_comment_counts(rows: &[RenderedRow]) -> BTreeMap<String, u32> {
+    let mut counts = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for row in rows {
+        if row.kind != ROW_KIND_COMMENT {
+            continue;
+        }
+        let (Some(path), Some(thread_id)) = (&row.path, &row.thread_id) else {
+            continue;
+        };
+        if seen.insert(thread_id.clone()) {
+            *counts.entry(path.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn push_sidebar_group_item<T>(groups: &mut Vec<(String, Vec<T>)>, key: String, item: T) {
+    let index = sidebar_group_index(groups, key);
+    groups[index].1.push(item);
+}
+
+fn sidebar_group_index<T>(groups: &mut Vec<(String, Vec<T>)>, key: String) -> usize {
+    if let Some(index) = groups.iter().position(|(existing, _)| existing == &key) {
+        return index;
+    }
+    groups.push((key, Vec::new()));
+    groups.len() - 1
+}
+
+fn dirname(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(dir, _)| format!("{dir}/"))
+        .unwrap_or_else(|| "./".to_string())
+}
+
+fn basename(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn sidebar_thread_label(row: &RenderedRow) -> String {
+    let name = row
+        .path
+        .as_deref()
+        .map(basename)
+        .unwrap_or_else(|| "review".to_string());
+    let start_line = row.source_start_line.or(row.source_line);
+    let end_line = row.source_line.or(row.source_start_line);
+    match (start_line, end_line) {
+        (Some(start), Some(end)) if start != end => format!("{name}:{start}-{end}"),
+        (_, Some(end)) => format!("{name}:{end}"),
+        (Some(start), _) => format!("{name}:{start}"),
+        _ => name,
+    }
+}
+
+fn sidebar_file_status_sign(status: Option<FileStatus>) -> &'static str {
+    match status {
+        Some(FileStatus::Added) => "A",
+        Some(FileStatus::Deleted) => "D",
+        Some(FileStatus::Modified) => "M",
+        Some(FileStatus::Renamed) => "R",
+        Some(FileStatus::Unchanged) => "U",
+        Some(FileStatus::Binary) => "B",
+        _ => "?",
+    }
+}
+
+fn sidebar_file_status_highlight(status: Option<FileStatus>) -> &'static str {
+    match status {
+        Some(FileStatus::Added) => HIGHLIGHT_SIDEBAR_STATUS_ADDED,
+        Some(FileStatus::Deleted) => HIGHLIGHT_SIDEBAR_STATUS_DELETED,
+        Some(FileStatus::Modified) => HIGHLIGHT_SIDEBAR_STATUS_MODIFIED,
+        Some(FileStatus::Renamed) => HIGHLIGHT_SIDEBAR_STATUS_RENAMED,
+        Some(FileStatus::Unchanged) => HIGHLIGHT_SIDEBAR_STATUS_UNCHANGED,
+        Some(FileStatus::Binary) => HIGHLIGHT_SIDEBAR_STATUS_BINARY,
+        _ => HIGHLIGHT_SIDEBAR_STATUS_UNCHANGED,
+    }
+}
+
+fn file_status_name(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Added => "Added",
+        FileStatus::Deleted => "Deleted",
+        FileStatus::Modified => "Modified",
+        FileStatus::Renamed => "Renamed",
+        FileStatus::Unchanged => "Unchanged",
+        FileStatus::Binary => "Binary",
+    }
+}
+
+fn sidebar_file_delta_parts(file: &SidebarFile) -> Vec<SidebarDeltaPart> {
+    let mut parts = Vec::new();
+    if file.added_lines > 0 {
+        parts.push(SidebarDeltaPart {
+            text: format!("+{}", file.added_lines),
+            highlight: Some(HIGHLIGHT_SIDEBAR_DELTA_ADDED),
+        });
+    }
+    if file.removed_lines > 0 {
+        parts.push(SidebarDeltaPart {
+            text: format!("−{}", file.removed_lines),
+            highlight: Some(HIGHLIGHT_SIDEBAR_DELTA_REMOVED),
+        });
+    }
+    if file.added_lines > 0 || file.removed_lines > 0 {
+        let delta = file.added_lines as i64 - file.removed_lines as i64;
+        let sign = if delta > 0 { "+" } else { "" };
+        let highlight = if delta > 0 {
+            HIGHLIGHT_SIDEBAR_DELTA_POSITIVE
+        } else if delta < 0 {
+            HIGHLIGHT_SIDEBAR_DELTA_NEGATIVE
+        } else {
+            HIGHLIGHT_SIDEBAR_DELTA_NEUTRAL
+        };
+        parts.push(SidebarDeltaPart {
+            text: format!("Δ{sign}{delta}"),
+            highlight: Some(highlight),
+        });
+    }
+    if file.comment_count > 0 {
+        parts.push(SidebarDeltaPart {
+            text: format!("{THREAD_STATUS_OPEN_ICON}{}", file.comment_count),
+            highlight: None,
+        });
+    }
+    parts
+}
+
+fn sidebar_file_delta_suffix(parts: &[SidebarDeltaPart]) -> String {
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut suffix = String::new();
+    for part in parts {
+        suffix.push(' ');
+        suffix.push_str(&part.text);
+    }
+    suffix
+}
+
+fn sidebar_thread_border_highlight(resolved: bool) -> Option<&'static str> {
+    resolved.then_some(HIGHLIGHT_SIDEBAR_THREAD_RESOLVED)
+}
+
+fn placement_location_note(placement: Option<AnchorPlacement>) -> &'static str {
+    match placement {
+        Some(AnchorPlacement::Exact) => "exact source match",
+        Some(AnchorPlacement::PerLineHash) => "source lines match",
+        Some(AnchorPlacement::MovedExact) => "moved exact source match",
+        Some(AnchorPlacement::Context) => "anchored by surrounding context",
+        Some(AnchorPlacement::Window) => "expanded source window",
+        Some(AnchorPlacement::LineFallback) => "stale line fallback",
+        Some(AnchorPlacement::FileFallback) => "file-level fallback",
+        Some(AnchorPlacement::Detached) => "detached from current source",
+        _ => "source location",
+    }
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().to_string()
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn truncate_start(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    let marker = TRUNCATION_SUFFIX;
+    let marker_width = display_width(marker);
+    if width <= marker_width {
+        return text.chars().take(width).collect();
+    }
+    let keep = width - marker_width;
+    let mut chars = text.chars().rev().take(keep).collect::<Vec<_>>();
+    chars.reverse();
+    format!("{marker}{}", chars.into_iter().collect::<String>())
+}
+
+fn truncate_end(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    let marker = TRUNCATION_SUFFIX;
+    let marker_width = display_width(marker);
+    if width <= marker_width {
+        return text.chars().take(width).collect();
+    }
+    format!(
+        "{}{marker}",
+        text.chars().take(width - marker_width).collect::<String>()
+    )
 }
 
 fn review_thread_visible_in_default_projection(
@@ -1491,37 +2182,33 @@ fn thread_line_rail_highlight(thread: &ReviewThread, current_line: u32) -> &'sta
         .line_placements
         .iter()
         .find(|line| line.current_line == Some(current_line))
-        .map(|line| line.placement.as_str());
+        .map(|line| line.placement);
     match placement {
-        Some("exact" | "content") => HIGHLIGHT_THREAD_RAIL,
-        Some("context" | "changed") => HIGHLIGHT_THREAD_RAIL_CONTEXT,
-        Some("line_fallback") => HIGHLIGHT_THREAD_RAIL_STALE,
-        Some("gap" | "missing" | "detached") => HIGHLIGHT_THREAD_RAIL_DETACHED,
+        Some(AnchorLinePlacement::Exact | AnchorLinePlacement::Content) => HIGHLIGHT_THREAD_RAIL,
+        Some(AnchorLinePlacement::Context | AnchorLinePlacement::Changed) => {
+            HIGHLIGHT_THREAD_RAIL_CONTEXT
+        }
+        Some(AnchorLinePlacement::LineFallback) => HIGHLIGHT_THREAD_RAIL_STALE,
+        Some(
+            AnchorLinePlacement::Gap | AnchorLinePlacement::Missing | AnchorLinePlacement::Detached,
+        ) => HIGHLIGHT_THREAD_RAIL_DETACHED,
         _ => thread_rail_highlight(thread),
     }
 }
 
 fn thread_location_note(thread: &ReviewThread) -> &'static str {
-    match thread.anchor.placement.as_deref() {
-        Some("exact") => "exact source match",
-        Some("per_line_hash") => "source lines match",
-        Some("moved_exact") => "moved exact source match",
-        Some("context") => "anchored by surrounding context",
-        Some("window") => "expanded source window",
-        Some("line_fallback") => "stale line fallback",
-        Some("file_fallback") => "file-level fallback",
-        Some("detached") => "detached from current source",
-        _ => "source location",
-    }
+    placement_location_note(thread.anchor.placement)
 }
 
 fn thread_placement_state(thread: &ReviewThread) -> &'static str {
-    match thread.anchor.placement.as_deref() {
-        Some("exact" | "per_line_hash" | "moved_exact") => "inline",
-        Some("context" | "window") => "context",
-        Some("line_fallback") => "stale",
-        Some("file_fallback") => "file",
-        Some("detached") => "detached",
+    match thread.anchor.placement {
+        Some(
+            AnchorPlacement::Exact | AnchorPlacement::PerLineHash | AnchorPlacement::MovedExact,
+        ) => "inline",
+        Some(AnchorPlacement::Context | AnchorPlacement::Window) => "context",
+        Some(AnchorPlacement::LineFallback) => "stale",
+        Some(AnchorPlacement::FileFallback) => "file",
+        Some(AnchorPlacement::Detached) => "detached",
         _ => "inline",
     }
 }
@@ -2170,6 +2857,7 @@ fn review_update_param(kind: String, sequence: u64) -> LSPAny {
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::anchors::{AnchorLinePlacement, AnchorPlacement};
     use crate::comments::{Author, AuthorKind, Comment, CommentId, PeersTimestamp, ThreadId};
     use crate::diff::{FileDiff, FileStatus, ReviewFile};
     use crate::review_provider::{ReviewThreadAnchor, ReviewThreadLinePlacement};
@@ -2263,7 +2951,7 @@ mod tests {
                     side: Some(SIDE_NEW.to_string()),
                     start_line: Some(1),
                     end_line: Some(1),
-                    placement: Some("exact".to_string()),
+                    placement: Some(AnchorPlacement::Exact),
                     line_placements: Vec::new(),
                 },
                 resolved: true,
@@ -2330,7 +3018,7 @@ mod tests {
                     side: Some(SIDE_NEW.to_string()),
                     start_line: Some(1),
                     end_line: Some(1),
-                    placement: Some("exact".to_string()),
+                    placement: Some(AnchorPlacement::Exact),
                     line_placements: Vec::new(),
                 },
                 resolved: true,
@@ -2399,11 +3087,11 @@ mod tests {
                     side: Some(SIDE_NEW.to_string()),
                     start_line: Some(1),
                     end_line: Some(1),
-                    placement: Some("line_fallback".to_string()),
+                    placement: Some(AnchorPlacement::LineFallback),
                     line_placements: vec![ReviewThreadLinePlacement {
                         original_line: Some(1),
                         current_line: Some(1),
-                        placement: "line_fallback".to_string(),
+                        placement: AnchorLinePlacement::LineFallback,
                     }],
                 },
                 resolved: false,
@@ -2505,27 +3193,27 @@ mod tests {
                     side: Some(SIDE_NEW.to_string()),
                     start_line: Some(1),
                     end_line: Some(4),
-                    placement: Some("window".to_string()),
+                    placement: Some(AnchorPlacement::Window),
                     line_placements: vec![
                         ReviewThreadLinePlacement {
                             original_line: Some(1),
                             current_line: Some(1),
-                            placement: "content".to_string(),
+                            placement: AnchorLinePlacement::Content,
                         },
                         ReviewThreadLinePlacement {
                             original_line: None,
                             current_line: Some(2),
-                            placement: "gap".to_string(),
+                            placement: AnchorLinePlacement::Gap,
                         },
                         ReviewThreadLinePlacement {
                             original_line: Some(2),
                             current_line: Some(3),
-                            placement: "changed".to_string(),
+                            placement: AnchorLinePlacement::Changed,
                         },
                         ReviewThreadLinePlacement {
                             original_line: Some(3),
                             current_line: Some(4),
-                            placement: "content".to_string(),
+                            placement: AnchorLinePlacement::Content,
                         },
                     ],
                 },
@@ -2617,7 +3305,7 @@ mod tests {
                     side: Some(SIDE_NEW.to_string()),
                     start_line: Some(1),
                     end_line: Some(1),
-                    placement: Some("exact".to_string()),
+                    placement: Some(AnchorPlacement::Exact),
                     line_placements: Vec::new(),
                 },
                 resolved: false,
@@ -2661,6 +3349,30 @@ mod tests {
                 .lines
                 .iter()
                 .any(|line| line.contains(" · hidden while collapsed"))
+        );
+        assert!(
+            rendered
+                .sidebar
+                .comments
+                .lines
+                .iter()
+                .any(|line| line == "╭─ ● main.rs:1 [1]")
+        );
+        assert!(
+            rendered
+                .sidebar
+                .comments
+                .lines
+                .iter()
+                .any(|line| line.contains(" · hidden while"))
+        );
+        assert!(
+            !rendered
+                .sidebar
+                .comments
+                .lines
+                .iter()
+                .any(|line| line.starts_with("│ hidden"))
         );
     }
 

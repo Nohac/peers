@@ -9,7 +9,6 @@ use tokio::net::TcpListener;
 use crate::comments::Author;
 use crate::diff::ReviewTarget;
 use crate::nvim::NvimLspServer;
-use crate::nvim_rpc::spawn_nvim_refresh_notifier;
 use crate::realtime::{ReviewUpdateBroadcaster, run_realtime_watcher};
 use crate::review::{ensure_storage, now_rfc3339, peers_paths};
 use crate::review_provider::ReviewProvider;
@@ -100,7 +99,6 @@ impl LocalServer {
         let server = vox::serve_listener(ws_listener, PeersReviewDispatcher::new(api));
         let lsp_server = nvim_lsp.run();
         spawn_realtime_watcher(provider.repo_root().to_path_buf(), provider.updates());
-        spawn_nvim_refresh_notifier(provider.updates(), nvim_listen);
 
         let result = tokio::select! {
             result = server => {
