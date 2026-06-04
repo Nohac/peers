@@ -10,12 +10,13 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::instrument;
 
 use crate::anchors::{AnchorLinePlacement, AnchorPlacement};
-use crate::comments::AuthorKind;
+use crate::comments::{Author, AuthorKind, CommentThread};
 use crate::diff::{DiffSection, FileSide, FileStatus, LineRange};
 use crate::review_provider::ReviewProvider;
 use crate::review_provider::{
     CommentRequest, CreateThreadRequest, EditCommentRequest, ReviewComment, ReviewProjection,
-    ReviewThread, ThreadBodyRequest, ThreadRequest, thread_visible_in_default_projection,
+    ReviewThread, ReviewThreadAnchor, ThreadBodyRequest, ThreadRequest,
+    thread_visible_in_default_projection,
 };
 
 const LOOPBACK_BIND_HOST: &str = "127.0.0.1";
@@ -83,6 +84,9 @@ const PARAM_END_LINE: &str = "end_line";
 const PARAM_BODY: &str = "body";
 const PARAM_THREAD_ID: &str = "thread_id";
 const PARAM_COMMENT_ID: &str = "comment_id";
+const PARAM_CONTEXT: &str = "context";
+const PARAM_LINE_LABEL: &str = "line_label";
+const PARAM_ANCHOR_PLACEMENT: &str = "anchor_placement";
 const PARAM_INVALIDATES_LATER_ACTIVITY: &str = "invalidates_later_activity";
 const LSP_INVALID_PARAMS: &str = "invalid Peers request params";
 const LSP_MISSING_FIELD: &str = "missing field";
@@ -318,12 +322,25 @@ impl PeersDiffLanguageServer {
 
     async fn toggle_thread_collapsed(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = thread_request(&params)?;
-        let review = self
+        let context = thread_render_context(&params)?;
+        let thread = self
             .provider
-            .toggle_thread_collapsed(request)
+            .toggle_thread_collapsed_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(render_review_payload(review).into_lsp())
+        let review = self
+            .provider
+            .get_review()
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        let rendered_review = render_review_payload(review);
+        Ok(render_thread_patch(
+            thread,
+            self.provider.author(),
+            context,
+            rendered_review.sidebar,
+            rendered_review.sidebar_counts,
+        ))
     }
 }
 
@@ -550,6 +567,106 @@ fn render_payload(review: ReviewProjection) -> RenderedReview {
 #[instrument(name = "into_lsp", skip_all)]
 fn rendered_review_into_lsp(rendered: RenderedReview) -> LSPAny {
     rendered.into_lsp()
+}
+
+#[derive(Clone, Debug)]
+struct ThreadRenderContext {
+    scope: String,
+    path: Option<String>,
+    line_label: String,
+    side: Option<String>,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    anchor_placement: Option<AnchorPlacement>,
+}
+
+fn render_thread_patch(
+    thread: CommentThread,
+    current_author: &Author,
+    context: ThreadRenderContext,
+    sidebar: RenderedSidebar,
+    sidebar_counts: RenderedSidebarCounts,
+) -> LSPAny {
+    let thread = review_thread_from_context(thread, current_author, context);
+    let thread_id = thread.id.clone();
+    let collapsed = thread.collapsed;
+    let mut rendered = RenderedReview {
+        lines: Vec::new(),
+        rows: Vec::new(),
+        highlights: Vec::new(),
+        symbols: Vec::new(),
+        sidebar: RenderedSidebar::default(),
+        sidebar_counts: RenderedSidebarCounts::default(),
+    };
+    push_thread_block(&mut rendered, &thread);
+
+    let mut object = LSPObject::new();
+    object.insert(
+        "kind".to_string(),
+        LSPAny::String("thread_patch".to_string()),
+    );
+    object.insert("thread_id".to_string(), LSPAny::String(thread_id));
+    object.insert("collapsed".to_string(), LSPAny::Bool(collapsed));
+    object.insert(
+        "lines".to_string(),
+        LSPAny::Array(rendered.lines.into_iter().map(LSPAny::String).collect()),
+    );
+    object.insert(
+        "rows".to_string(),
+        LSPAny::Array(
+            rendered
+                .rows
+                .into_iter()
+                .map(RenderedRow::into_lsp)
+                .collect(),
+        ),
+    );
+    object.insert(
+        "highlights".to_string(),
+        LSPAny::Array(
+            rendered
+                .highlights
+                .into_iter()
+                .map(RenderedHighlight::into_lsp)
+                .collect(),
+        ),
+    );
+    object.insert("sidebar".to_string(), sidebar.into_lsp());
+    object.insert("sidebar_counts".to_string(), sidebar_counts.into_lsp());
+    LSPAny::Object(object)
+}
+
+fn review_thread_from_context(
+    thread: CommentThread,
+    current_author: &Author,
+    context: ThreadRenderContext,
+) -> ReviewThread {
+    ReviewThread {
+        id: thread.id.to_string(),
+        scope: context.scope,
+        path: context.path,
+        line_label: context.line_label,
+        anchor: ReviewThreadAnchor {
+            side: context.side,
+            start_line: context.start_line,
+            end_line: context.end_line,
+            placement: context.anchor_placement,
+            line_placements: Vec::new(),
+        },
+        resolved: thread.resolved,
+        resolved_head_oid: thread.resolved_head_oid,
+        collapsed: thread.collapsed,
+        comments: thread
+            .comments
+            .into_iter()
+            .filter(|comment| comment.deleted_at.is_none())
+            .map(|comment| ReviewComment {
+                can_edit: comment.author.kind == current_author.kind
+                    && comment.author.display_name == current_author.display_name,
+                comment,
+            })
+            .collect(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2789,6 +2906,26 @@ fn thread_request(params: &LSPAny) -> LspResult<ThreadRequest> {
     })
 }
 
+fn thread_render_context(params: &LSPAny) -> LspResult<ThreadRenderContext> {
+    let Some(LSPAny::Object(context)) = object_param(params)?.get(PARAM_CONTEXT) else {
+        return Err(LspError::invalid_params(format!(
+            "{LSP_MISSING_FIELD} `{PARAM_CONTEXT}`"
+        )));
+    };
+    Ok(ThreadRenderContext {
+        scope: required_string_object_param(context, PARAM_SCOPE)?,
+        path: optional_string_object_param(context, PARAM_PATH)?,
+        line_label: required_string_object_param(context, PARAM_LINE_LABEL)?,
+        side: optional_string_object_param(context, PARAM_SIDE)?,
+        start_line: optional_u32_object_param(context, PARAM_START_LINE)?,
+        end_line: optional_u32_object_param(context, PARAM_END_LINE)?,
+        anchor_placement: optional_string_object_param(context, PARAM_ANCHOR_PLACEMENT)?
+            .as_deref()
+            .map(anchor_placement_from_name)
+            .transpose()?,
+    })
+}
+
 fn required_string_param(params: &LSPAny, field: &str) -> LspResult<String> {
     optional_string_param(params, field)?
         .ok_or_else(|| LspError::invalid_params(format!("{LSP_MISSING_FIELD} `{field}`")))
@@ -2803,7 +2940,24 @@ fn optional_string_param(params: &LSPAny, field: &str) -> LspResult<Option<Strin
 }
 
 fn optional_u32_param(params: &LSPAny, field: &str) -> LspResult<Option<u32>> {
-    match object_param(params)?.get(field) {
+    optional_u32_object_param(object_param(params)?, field)
+}
+
+fn required_string_object_param(object: &LSPObject, field: &str) -> LspResult<String> {
+    optional_string_object_param(object, field)?
+        .ok_or_else(|| LspError::invalid_params(format!("{LSP_MISSING_FIELD} `{field}`")))
+}
+
+fn optional_string_object_param(object: &LSPObject, field: &str) -> LspResult<Option<String>> {
+    match object.get(field) {
+        Some(LSPAny::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(invalid_field(field)),
+        None => Ok(None),
+    }
+}
+
+fn optional_u32_object_param(object: &LSPObject, field: &str) -> LspResult<Option<u32>> {
+    match object.get(field) {
         Some(LSPAny::Number(value)) => value
             .as_u64()
             .and_then(|value| u32::try_from(value).ok())
@@ -2811,6 +2965,20 @@ fn optional_u32_param(params: &LSPAny, field: &str) -> LspResult<Option<u32>> {
             .ok_or_else(|| invalid_field(field)),
         Some(_) => Err(invalid_field(field)),
         None => Ok(None),
+    }
+}
+
+fn anchor_placement_from_name(name: &str) -> LspResult<AnchorPlacement> {
+    match name {
+        "exact" => Ok(AnchorPlacement::Exact),
+        "per_line_hash" => Ok(AnchorPlacement::PerLineHash),
+        "context" => Ok(AnchorPlacement::Context),
+        "moved_exact" => Ok(AnchorPlacement::MovedExact),
+        "window" => Ok(AnchorPlacement::Window),
+        "line_fallback" => Ok(AnchorPlacement::LineFallback),
+        "file_fallback" => Ok(AnchorPlacement::FileFallback),
+        "detached" => Ok(AnchorPlacement::Detached),
+        _ => Err(invalid_field(PARAM_ANCHOR_PLACEMENT)),
     }
 }
 

@@ -339,6 +339,14 @@ impl ReviewProvider {
         &self,
         request: ThreadRequest,
     ) -> Result<ReviewProjection> {
+        self.toggle_thread_collapsed_state(request).await?;
+        self.get_review().await
+    }
+
+    pub async fn toggle_thread_collapsed_state(
+        &self,
+        request: ThreadRequest,
+    ) -> Result<CommentThread> {
         let thread_id = ThreadId::new(request.thread_id)?;
         let mut thread = load_thread_payload(&self.repo_root, &thread_id).await?;
         let now = now_rfc3339()?;
@@ -346,15 +354,20 @@ impl ReviewProvider {
         thread.updated_at = now.clone();
         write_thread_payload(&self.repo_root, &thread).await?;
         let event = PeersEvent::ThreadCollapseUpdated {
-            thread_id,
+            thread_id: thread_id.clone(),
             updated_at: now,
             author: self.author.clone(),
             collapsed: thread.collapsed,
         };
         append_peers_event(&self.repo_root, &event, Some(&self.target)).await?;
-        let review = self.get_review().await?;
         self.updates.mark_local_review_changed();
-        Ok(review)
+        let state = load_peers_state(&self.repo_root).await?;
+        state.threads.get(&thread_id).cloned().ok_or_else(|| {
+            ReviewProviderError::UnknownThread {
+                thread_id: thread_id.to_string(),
+            }
+            .into()
+        })
     }
 }
 

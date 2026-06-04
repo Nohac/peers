@@ -338,6 +338,14 @@ local function set_lines(buf, lines)
   vim.bo[buf].readonly = true
 end
 
+local function set_line_range(buf, first, last, lines)
+  vim.bo[buf].readonly = false
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, first, last, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].readonly = true
+end
+
 local function file_buffer_name(root, path)
   return vim.fn.fnamemodify(root .. "/" .. path, ":p")
 end
@@ -709,6 +717,44 @@ end
 
 local function row_jump_line(row)
   return math.max(1, row.source_line or 1)
+end
+
+local function thread_line_label(row)
+  local path = row.path or "review"
+  local start_line = row.source_start_line or row.source_line
+  local end_line = row.source_line or row.source_start_line
+  if start_line and end_line and start_line ~= end_line then
+    return string.format("%s:%d-%d", path, start_line, end_line)
+  end
+  if end_line then
+    return string.format("%s:%d", path, end_line)
+  end
+  if start_line then
+    return string.format("%s:%d", path, start_line)
+  end
+  return path
+end
+
+local function thread_scope_for_row(row)
+  if row.source_line then
+    return ROW_SCOPE_LINE
+  end
+  if row.path then
+    return ROW_SCOPE_FILE
+  end
+  return "review"
+end
+
+local function thread_render_context(row)
+  return {
+    scope = thread_scope_for_row(row),
+    path = row.path,
+    line_label = thread_line_label(row),
+    side = row.side,
+    start_line = row.source_start_line or row.source_line,
+    end_line = row.source_line or row.source_start_line,
+    anchor_placement = row.anchor_placement,
+  }
 end
 
 local function source_for_proxy_row(state, row)
@@ -1188,6 +1234,7 @@ schedule_visible_mirror = function(buf)
 end
 
 local apply_render
+local apply_thread_patch
 local schedule_pending_refresh_check
 
 local function review_buffer_is_visible(buf)
@@ -1502,7 +1549,80 @@ local function composer_body(buf)
   return vim.trim(table.concat(lines, "\n"))
 end
 
+local function thread_block_range(state, thread_id)
+  local first = nil
+  local last = nil
+  for index, row in ipairs(state.rows or {}) do
+    if row.thread_id == thread_id then
+      first = first or index
+      last = index
+    elseif first then
+      break
+    end
+  end
+  return first, last
+end
+
+local function splice_list(list, first, last, replacement)
+  local next_list = {}
+  for index = 1, first - 1 do
+    table.insert(next_list, list[index])
+  end
+  for _, item in ipairs(replacement or {}) do
+    table.insert(next_list, item)
+  end
+  for index = last + 1, #list do
+    table.insert(next_list, list[index])
+  end
+  return next_list
+end
+
+apply_thread_patch = function(state, review_buf, patch)
+  if not state or not patch or not patch.thread_id or not patch.lines or not patch.rows then
+    return
+  end
+  local first, last = thread_block_range(state, patch.thread_id)
+  if not first or not last then
+    return
+  end
+
+  local cursor_anchors = save_buffer_cursor_anchors(review_buf)
+  local first_row = first - 1
+  local last_row_exclusive = last
+  vim.api.nvim_buf_clear_namespace(review_buf, NAMESPACE, first_row, last_row_exclusive)
+  vim.api.nvim_buf_clear_namespace(review_buf, SOURCE_NAMESPACE, first_row, last_row_exclusive)
+  set_line_range(review_buf, first_row, last_row_exclusive, patch.lines)
+  for _, highlight in ipairs(patch.highlights or {}) do
+    vim.api.nvim_buf_set_extmark(review_buf, NAMESPACE, first_row + highlight.line, highlight.start_col, {
+      end_col = highlight.end_col,
+      hl_group = highlight.group,
+    })
+  end
+
+  state.lines = splice_list(state.lines or {}, first, last, patch.lines)
+  state.rows = splice_list(state.rows or {}, first, last, patch.rows)
+  for _, row in ipairs(state.rows) do
+    if row.thread_id == patch.thread_id then
+      row.collapsed = patch.collapsed
+    end
+  end
+  state.sidebar = patch.sidebar or state.sidebar
+  state.sidebar_counts = patch.sidebar_counts or state.sidebar_counts
+  restore_buffer_cursor_anchors(review_buf, cursor_anchors, state.rows or {})
+  sidebar.update_preserving_focus(review_buf, RENDER_STATES)
+  timing.log(state.root, "buffer", string.format(
+    "apply_thread_patch rows=%d replace=%d buf=%s",
+    #(patch.rows or {}),
+    last - first + 1,
+    tostring(review_buf)
+  ))
+end
+
 local function apply_mutation_render(state, review_buf, render)
+  if render and render.kind == "thread_patch" then
+    apply_thread_patch(state, review_buf, render)
+    return
+  end
   state.pending_refresh = false
   local review_view = state.composer_review_view
   local review_win, return_win = close_composer(state)
@@ -1938,8 +2058,14 @@ function M.toggle_thread_collapsed(buf, input)
     vim.notify(COMMENT_COLLAPSE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
     return
   end
+  local row = input.row or current_review_row(buf)
+  if not row or row.thread_id ~= input.thread_id then
+    vim.notify(COMMENT_COLLAPSE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
   lsp.toggle_thread_collapsed(state.client_id, buf, {
     thread_id = input.thread_id,
+    context = thread_render_context(row),
   }, function(render)
     apply_mutation_render(state, buf, render)
   end)
@@ -2025,7 +2151,7 @@ function M.toggle_selected_thread_collapsed(buf, row, line, opts)
     vim.notify(COMMENT_COLLAPSE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
     return
   end
-  M.toggle_thread_collapsed(buf, { thread_id = row.thread_id })
+  M.toggle_thread_collapsed(buf, { thread_id = row.thread_id, row = row })
 end
 
 function M.is_review_buffer(buf)

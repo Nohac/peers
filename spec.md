@@ -649,6 +649,8 @@ Expected behavior:
 
 Peers should expose a `peersdiff` language server for this synthetic buffer. Use the `tower-lsp-server` crate from `tower-lsp-community/tower-lsp-server`, the maintained community fork of `tower-lsp`, unless a better maintained LSP server crate is chosen before implementation.
 
+The LSP custom request boundary currently uses `ls_types::LSPAny`, which is effectively a `serde_json::Value`-shaped payload. Peers should still avoid `serde`, `Serialize`, and `Deserialize` on project data types; Rust render/mutation DTOs should be `Facet` types and converted at the LSP boundary through `facet-json` or a small direct `Facet` to `LSPAny` bridge. Hand-built `LSPAny` objects are acceptable as a temporary boundary detail, but they should not become the long-term render model.
+
 The `peersdiff` LSP should let users keep their existing LSP mappings instead of defining Peers-specific replacements:
 
 - `textDocument/hover`: show Peers metadata for review rows and proxy source hover for mapped current-side code rows.
