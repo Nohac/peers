@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use facet::Facet;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::net::{TcpListener, TcpStream};
 use tower_lsp_server::jsonrpc::{Error as LspError, Result as LspResult};
@@ -87,10 +88,11 @@ const PARAM_COMMENT_ID: &str = "comment_id";
 const PARAM_CONTEXT: &str = "context";
 const PARAM_LINE_LABEL: &str = "line_label";
 const PARAM_ANCHOR_PLACEMENT: &str = "anchor_placement";
-const PARAM_INVALIDATES_LATER_ACTIVITY: &str = "invalidates_later_activity";
 const LSP_INVALID_PARAMS: &str = "invalid Peers request params";
 const LSP_MISSING_FIELD: &str = "missing field";
 const LSP_INVALID_FIELD: &str = "invalid field";
+const LSP_PAYLOAD_ENCODE_ERROR: &str = "failed to encode Peers LSP payload";
+const LSP_PAYLOAD_DECODE_ERROR: &str = "failed to decode Peers LSP payload";
 
 const ROW_KIND_FILE_HEADER: &str = "file_header";
 const ROW_KIND_HUNK_HEADER: &str = "hunk_header";
@@ -535,27 +537,28 @@ impl RenderedReview {
     }
 
     fn into_lsp(self) -> LSPAny {
-        let mut object = LSPObject::new();
-        object.insert(
-            "lines".to_string(),
-            LSPAny::Array(self.lines.into_iter().map(LSPAny::String).collect()),
-        );
-        object.insert(
-            "rows".to_string(),
-            LSPAny::Array(self.rows.into_iter().map(RenderedRow::into_lsp).collect()),
-        );
-        object.insert(
-            "highlights".to_string(),
-            LSPAny::Array(
-                self.highlights
-                    .into_iter()
-                    .map(RenderedHighlight::into_lsp)
-                    .collect(),
-            ),
-        );
-        object.insert("sidebar".to_string(), self.sidebar.into_lsp());
-        object.insert("sidebar_counts".to_string(), self.sidebar_counts.into_lsp());
-        LSPAny::Object(object)
+        lsp_payload(RenderedReviewPayload::from(self))
+    }
+}
+
+#[derive(Debug, Facet)]
+struct RenderedReviewPayload {
+    lines: Vec<String>,
+    rows: Vec<RenderedRow>,
+    highlights: Vec<RenderedHighlight>,
+    sidebar: RenderedSidebar,
+    sidebar_counts: RenderedSidebarCounts,
+}
+
+impl From<RenderedReview> for RenderedReviewPayload {
+    fn from(rendered: RenderedReview) -> Self {
+        Self {
+            lines: rendered.lines,
+            rows: rendered.rows,
+            highlights: rendered.highlights,
+            sidebar: rendered.sidebar,
+            sidebar_counts: rendered.sidebar_counts,
+        }
     }
 }
 
@@ -567,6 +570,33 @@ fn render_payload(review: ReviewProjection) -> RenderedReview {
 #[instrument(name = "into_lsp", skip_all)]
 fn rendered_review_into_lsp(rendered: RenderedReview) -> LSPAny {
     rendered.into_lsp()
+}
+
+fn lsp_payload<T>(payload: T) -> LSPAny
+where
+    T: Facet<'static>,
+{
+    let json = facet_json::to_string(&payload).expect(LSP_PAYLOAD_ENCODE_ERROR);
+    let mut payload = json.parse::<LSPAny>().expect(LSP_PAYLOAD_DECODE_ERROR);
+    prune_null_object_fields(&mut payload);
+    payload
+}
+
+fn prune_null_object_fields(payload: &mut LSPAny) {
+    match payload {
+        LSPAny::Object(object) => {
+            object.retain(|_, value| {
+                prune_null_object_fields(value);
+                !value.is_null()
+            });
+        }
+        LSPAny::Array(items) => {
+            for item in items {
+                prune_null_object_fields(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -600,40 +630,28 @@ fn render_thread_patch(
     };
     push_thread_block(&mut rendered, &thread);
 
-    let mut object = LSPObject::new();
-    object.insert(
-        "kind".to_string(),
-        LSPAny::String("thread_patch".to_string()),
-    );
-    object.insert("thread_id".to_string(), LSPAny::String(thread_id));
-    object.insert("collapsed".to_string(), LSPAny::Bool(collapsed));
-    object.insert(
-        "lines".to_string(),
-        LSPAny::Array(rendered.lines.into_iter().map(LSPAny::String).collect()),
-    );
-    object.insert(
-        "rows".to_string(),
-        LSPAny::Array(
-            rendered
-                .rows
-                .into_iter()
-                .map(RenderedRow::into_lsp)
-                .collect(),
-        ),
-    );
-    object.insert(
-        "highlights".to_string(),
-        LSPAny::Array(
-            rendered
-                .highlights
-                .into_iter()
-                .map(RenderedHighlight::into_lsp)
-                .collect(),
-        ),
-    );
-    object.insert("sidebar".to_string(), sidebar.into_lsp());
-    object.insert("sidebar_counts".to_string(), sidebar_counts.into_lsp());
-    LSPAny::Object(object)
+    lsp_payload(ThreadPatchPayload {
+        kind: "thread_patch",
+        thread_id,
+        collapsed,
+        lines: rendered.lines,
+        rows: rendered.rows,
+        highlights: rendered.highlights,
+        sidebar,
+        sidebar_counts,
+    })
+}
+
+#[derive(Debug, Facet)]
+struct ThreadPatchPayload {
+    kind: &'static str,
+    thread_id: String,
+    collapsed: bool,
+    lines: Vec<String>,
+    rows: Vec<RenderedRow>,
+    highlights: Vec<RenderedHighlight>,
+    sidebar: RenderedSidebar,
+    sidebar_counts: RenderedSidebarCounts,
 }
 
 fn review_thread_from_context(
@@ -669,37 +687,19 @@ fn review_thread_from_context(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Facet)]
 struct RenderedSidebarCounts {
     files: u32,
     comments: u32,
 }
 
-impl RenderedSidebarCounts {
-    fn into_lsp(self) -> LSPAny {
-        let mut object = LSPObject::new();
-        object.insert("files".to_string(), lsp_number(self.files));
-        object.insert("comments".to_string(), lsp_number(self.comments));
-        LSPAny::Object(object)
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Facet)]
 struct RenderedSidebar {
     files: RenderedSidebarPanel,
     comments: RenderedSidebarPanel,
 }
 
-impl RenderedSidebar {
-    fn into_lsp(self) -> LSPAny {
-        let mut object = LSPObject::new();
-        object.insert("files".to_string(), self.files.into_lsp());
-        object.insert("comments".to_string(), self.comments.into_lsp());
-        LSPAny::Object(object)
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Facet)]
 struct RenderedSidebarPanel {
     lines: Vec<String>,
     rows: Vec<RenderedSidebarRow>,
@@ -722,36 +722,9 @@ impl RenderedSidebarPanel {
             group,
         });
     }
-
-    fn into_lsp(self) -> LSPAny {
-        let mut object = LSPObject::new();
-        object.insert(
-            "lines".to_string(),
-            LSPAny::Array(self.lines.into_iter().map(LSPAny::String).collect()),
-        );
-        object.insert(
-            "rows".to_string(),
-            LSPAny::Array(
-                self.rows
-                    .into_iter()
-                    .map(RenderedSidebarRow::into_lsp)
-                    .collect(),
-            ),
-        );
-        object.insert(
-            "highlights".to_string(),
-            LSPAny::Array(
-                self.highlights
-                    .into_iter()
-                    .map(RenderedHighlight::into_lsp)
-                    .collect(),
-            ),
-        );
-        LSPAny::Object(object)
-    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Facet)]
 struct RenderedSidebarRow {
     target_line: Option<u32>,
     path: Option<String>,
@@ -771,24 +744,15 @@ impl RenderedSidebarRow {
             path: Some(path),
         }
     }
-
-    fn into_lsp(self) -> LSPAny {
-        let mut object = LSPObject::new();
-        if let Some(target_line) = self.target_line {
-            object.insert("target_line".to_string(), lsp_number(target_line));
-        }
-        if let Some(path) = self.path {
-            object.insert("path".to_string(), LSPAny::String(path));
-        }
-        LSPAny::Object(object)
-    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Facet)]
 struct RenderedRow {
     kind: &'static str,
     path: Option<String>,
-    file_status: Option<FileStatus>,
+    file_status: Option<&'static str>,
+    #[facet(skip_serializing)]
+    sidebar_file_status: Option<FileStatus>,
     added_lines: Option<u32>,
     removed_lines: Option<u32>,
     side: Option<&'static str>,
@@ -815,6 +779,7 @@ impl RenderedRow {
             kind,
             path: None,
             file_status: None,
+            sidebar_file_status: None,
             added_lines: None,
             removed_lines: None,
             side: None,
@@ -841,6 +806,7 @@ impl RenderedRow {
             kind,
             path: Some(path.to_string()),
             file_status: None,
+            sidebar_file_status: None,
             added_lines: None,
             removed_lines: None,
             side: None,
@@ -866,7 +832,8 @@ impl RenderedRow {
         Self {
             kind: ROW_KIND_FILE_HEADER,
             path: Some(file.path.clone()),
-            file_status: Some(file.status),
+            file_status: Some(file_status_name(file.status)),
+            sidebar_file_status: Some(file.status),
             added_lines: Some(file.added_lines),
             removed_lines: Some(file.removed_lines),
             side: None,
@@ -893,6 +860,7 @@ impl RenderedRow {
             kind,
             path: Some(path.to_string()),
             file_status: None,
+            sidebar_file_status: None,
             added_lines: None,
             removed_lines: None,
             side: Some(side),
@@ -923,6 +891,7 @@ impl RenderedRow {
             kind: ROW_KIND_COMMENT,
             path: thread.path.clone(),
             file_status: None,
+            sidebar_file_status: None,
             added_lines: None,
             removed_lines: None,
             side: thread.anchor.side.as_deref().and_then(rendered_side_name),
@@ -943,109 +912,14 @@ impl RenderedRow {
             placement_state: Some(thread_placement_state(thread)),
         }
     }
-
-    fn into_lsp(self) -> LSPAny {
-        let mut object = LSPObject::new();
-        object.insert("kind".to_string(), LSPAny::String(self.kind.to_string()));
-        if let Some(path) = self.path {
-            object.insert("path".to_string(), LSPAny::String(path));
-        }
-        if let Some(file_status) = self.file_status {
-            object.insert(
-                "file_status".to_string(),
-                LSPAny::String(file_status_name(file_status).to_string()),
-            );
-        }
-        if let Some(added_lines) = self.added_lines {
-            object.insert("added_lines".to_string(), lsp_number(added_lines));
-        }
-        if let Some(removed_lines) = self.removed_lines {
-            object.insert("removed_lines".to_string(), lsp_number(removed_lines));
-        }
-        if let Some(side) = self.side {
-            object.insert("side".to_string(), LSPAny::String(side.to_string()));
-        }
-        if let Some(source_start_line) = self.source_start_line {
-            object.insert(
-                "source_start_line".to_string(),
-                lsp_number(source_start_line),
-            );
-        }
-        if let Some(source_line) = self.source_line {
-            object.insert("source_line".to_string(), lsp_number(source_line));
-        }
-        if let Some(code_start_col) = self.code_start_col {
-            object.insert("code_start_col".to_string(), lsp_number(code_start_col));
-        }
-        if let Some(thread_id) = self.thread_id {
-            object.insert("thread_id".to_string(), LSPAny::String(thread_id));
-        }
-        if let Some(comment_id) = self.comment_id {
-            object.insert("comment_id".to_string(), LSPAny::String(comment_id));
-        }
-        if let Some(comment_body) = self.comment_body {
-            object.insert("comment_body".to_string(), LSPAny::String(comment_body));
-        }
-        if let Some(comment_meta) = self.comment_meta {
-            object.insert("comment_meta".to_string(), LSPAny::String(comment_meta));
-        }
-        if let Some(can_edit) = self.can_edit {
-            object.insert("can_edit".to_string(), LSPAny::Bool(can_edit));
-        }
-        if let Some(invalidates_later_activity) = self.invalidates_later_activity {
-            object.insert(
-                "invalidates_later_activity".to_string(),
-                LSPAny::Bool(invalidates_later_activity),
-            );
-        }
-        if let Some(resolved) = self.resolved {
-            object.insert("resolved".to_string(), LSPAny::Bool(resolved));
-        }
-        if let Some(collapsed) = self.collapsed {
-            object.insert("collapsed".to_string(), LSPAny::Bool(collapsed));
-        }
-        if let Some(thread_comment_count) = self.thread_comment_count {
-            object.insert(
-                "thread_comment_count".to_string(),
-                lsp_number(thread_comment_count),
-            );
-        }
-        if let Some(thread_summary) = self.thread_summary {
-            object.insert("thread_summary".to_string(), LSPAny::String(thread_summary));
-        }
-        if let Some(anchor_placement) = self.anchor_placement {
-            object.insert(
-                "anchor_placement".to_string(),
-                LSPAny::String(anchor_placement.as_str().to_string()),
-            );
-        }
-        if let Some(placement_state) = self.placement_state {
-            object.insert(
-                "placement_state".to_string(),
-                LSPAny::String(placement_state.to_string()),
-            );
-        }
-        LSPAny::Object(object)
-    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Facet)]
 struct RenderedHighlight {
     line: u32,
     start_col: u32,
     end_col: u32,
     group: &'static str,
-}
-
-impl RenderedHighlight {
-    fn into_lsp(self) -> LSPAny {
-        let mut object = LSPObject::new();
-        object.insert("line".to_string(), lsp_number(self.line));
-        object.insert("start_col".to_string(), lsp_number(self.start_col));
-        object.insert("end_col".to_string(), lsp_number(self.end_col));
-        object.insert("group".to_string(), LSPAny::String(self.group.to_string()));
-        LSPAny::Object(object)
-    }
 }
 
 #[derive(Debug)]
@@ -1326,7 +1200,7 @@ fn render_sidebar_files(rows: &[RenderedRow]) -> RenderedSidebarPanel {
             target_line: index + 1,
             path: path.clone(),
             name: basename(path),
-            status: row.file_status.clone(),
+            status: row.sidebar_file_status,
             added_lines: row.added_lines.unwrap_or(0),
             removed_lines: row.removed_lines.unwrap_or(0),
             comment_count: counts.get(path).copied().unwrap_or(0),
@@ -1421,7 +1295,7 @@ fn render_sidebar_comments(rows: &[RenderedRow]) -> RenderedSidebarPanel {
                     resolved: row.resolved.unwrap_or(false),
                     collapsed: row.collapsed.unwrap_or(false),
                     comment_count: row.thread_comment_count.unwrap_or(0),
-                    anchor_placement: row.anchor_placement.clone(),
+                    anchor_placement: row.anchor_placement,
                     summary: row.thread_summary.clone(),
                     comments: Vec::new(),
                     seen_comments: BTreeSet::new(),
@@ -2628,61 +2502,61 @@ fn command_action(
 }
 
 fn line_anchor_arg(anchor: &LineCommentAnchor<'_>) -> LSPAny {
-    let mut object = LSPObject::new();
-    object.insert(
-        PARAM_SCOPE.to_string(),
-        LSPAny::String(THREAD_SCOPE_LINE.to_string()),
-    );
-    object.insert(
-        PARAM_PATH.to_string(),
-        LSPAny::String(anchor.path.to_string()),
-    );
-    object.insert(
-        PARAM_SIDE.to_string(),
-        LSPAny::String(anchor.side.to_string()),
-    );
-    object.insert(PARAM_START_LINE.to_string(), lsp_number(anchor.start_line));
-    object.insert(PARAM_END_LINE.to_string(), lsp_number(anchor.end_line));
-    LSPAny::Object(object)
+    lsp_payload(LineAnchorArg {
+        scope: THREAD_SCOPE_LINE,
+        path: anchor.path.to_string(),
+        side: anchor.side,
+        start_line: anchor.start_line,
+        end_line: anchor.end_line,
+    })
 }
 
 fn file_anchor_arg(path: &str) -> LSPAny {
-    let mut object = LSPObject::new();
-    object.insert(
-        PARAM_SCOPE.to_string(),
-        LSPAny::String(THREAD_SCOPE_FILE.to_string()),
-    );
-    object.insert(PARAM_PATH.to_string(), LSPAny::String(path.to_string()));
-    LSPAny::Object(object)
+    lsp_payload(FileAnchorArg {
+        scope: THREAD_SCOPE_FILE,
+        path: path.to_string(),
+    })
 }
 
 fn thread_arg(thread_id: &str) -> LSPAny {
-    let mut object = LSPObject::new();
-    object.insert(
-        PARAM_THREAD_ID.to_string(),
-        LSPAny::String(thread_id.to_string()),
-    );
-    LSPAny::Object(object)
+    lsp_payload(ThreadArg {
+        thread_id: thread_id.to_string(),
+    })
 }
 
 fn comment_arg(row: &RenderedRow) -> LSPAny {
-    let mut object = LSPObject::new();
-    if let Some(comment_id) = &row.comment_id {
-        object.insert(
-            PARAM_COMMENT_ID.to_string(),
-            LSPAny::String(comment_id.to_string()),
-        );
-    }
-    if let Some(body) = &row.comment_body {
-        object.insert(PARAM_BODY.to_string(), LSPAny::String(body.to_string()));
-    }
-    if let Some(invalidates_later_activity) = row.invalidates_later_activity {
-        object.insert(
-            PARAM_INVALIDATES_LATER_ACTIVITY.to_string(),
-            LSPAny::Bool(invalidates_later_activity),
-        );
-    }
-    LSPAny::Object(object)
+    lsp_payload(CommentArg {
+        comment_id: row.comment_id.clone(),
+        body: row.comment_body.clone(),
+        invalidates_later_activity: row.invalidates_later_activity,
+    })
+}
+
+#[derive(Debug, Facet)]
+struct LineAnchorArg {
+    scope: &'static str,
+    path: String,
+    side: &'static str,
+    start_line: u32,
+    end_line: u32,
+}
+
+#[derive(Debug, Facet)]
+struct FileAnchorArg {
+    scope: &'static str,
+    path: String,
+}
+
+#[derive(Debug, Facet)]
+struct ThreadArg {
+    thread_id: String,
+}
+
+#[derive(Debug, Facet)]
+struct CommentArg {
+    comment_id: Option<String>,
+    body: Option<String>,
+    invalidates_later_activity: Option<bool>,
 }
 
 fn gutter_background_group(kind: &str) -> Option<&'static str> {
@@ -3010,15 +2884,14 @@ fn invalid_field(field: &str) -> LspError {
     LspError::invalid_params(format!("{LSP_INVALID_FIELD} `{field}`"))
 }
 
-fn lsp_number(value: u32) -> LSPAny {
-    LSPAny::Number(value.into())
+fn review_update_param(kind: String, sequence: u64) -> LSPAny {
+    lsp_payload(ReviewUpdateParam { kind, sequence })
 }
 
-fn review_update_param(kind: String, sequence: u64) -> LSPAny {
-    let mut object = LSPObject::new();
-    object.insert("kind".to_string(), LSPAny::String(kind));
-    object.insert("sequence".to_string(), LSPAny::Number(sequence.into()));
-    LSPAny::Object(object)
+#[derive(Debug, Facet)]
+struct ReviewUpdateParam {
+    kind: String,
+    sequence: u64,
 }
 
 #[cfg(test)]

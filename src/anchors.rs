@@ -12,6 +12,7 @@ type LineHash = gix::ObjectId;
 
 #[derive(Clone, Copy, Debug, Facet, PartialEq, Eq)]
 #[repr(u8)]
+#[facet(rename_all = "snake_case")]
 pub enum AnchorPlacement {
     Exact,
     PerLineHash,
@@ -40,6 +41,7 @@ impl AnchorPlacement {
 
 #[derive(Clone, Copy, Debug, Facet, PartialEq, Eq)]
 #[repr(u8)]
+#[facet(rename_all = "snake_case")]
 pub enum AnchorLinePlacement {
     Exact,
     Content,
