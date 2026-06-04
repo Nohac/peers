@@ -11,6 +11,7 @@ local EDIT_COMMENT_METHOD = "peers/editComment"
 local DELETE_COMMENT_METHOD = "peers/deleteComment"
 local RESOLVE_THREAD_METHOD = "peers/resolveThread"
 local REOPEN_THREAD_METHOD = "peers/reopenThread"
+local TOGGLE_THREAD_COLLAPSED_METHOD = "peers/toggleThreadCollapsed"
 local REVIEW_UPDATED_NOTIFICATION = "peers/reviewUpdated"
 local COMMAND_ADD_COMMENT = "peers.addComment"
 local COMMAND_REPLY = "peers.reply"
@@ -18,6 +19,7 @@ local COMMAND_EDIT_COMMENT = "peers.editComment"
 local COMMAND_DELETE_COMMENT = "peers.deleteComment"
 local COMMAND_RESOLVE_THREAD = "peers.resolveThread"
 local COMMAND_REOPEN_THREAD = "peers.reopenThread"
+local COMMAND_TOGGLE_THREAD_COLLAPSED = "peers.toggleThreadCollapsed"
 local INVALID_LSP_URL_ERROR = "Invalid nvim_lsp_url: "
 local RENDER_READY_TIMEOUT = 5000
 local RENDER_READY_INTERVAL = 50
@@ -46,6 +48,7 @@ local COMMAND_HANDLERS = {
   [COMMAND_DELETE_COMMENT] = "delete_comment",
   [COMMAND_RESOLVE_THREAD] = "resolve_thread",
   [COMMAND_REOPEN_THREAD] = "reopen_thread",
+  [COMMAND_TOGGLE_THREAD_COLLAPSED] = "toggle_thread_collapsed",
 }
 
 local MUTATION_METHODS = {
@@ -55,6 +58,7 @@ local MUTATION_METHODS = {
   delete_comment = DELETE_COMMENT_METHOD,
   resolve_thread = RESOLVE_THREAD_METHOD,
   reopen_thread = REOPEN_THREAD_METHOD,
+  toggle_thread_collapsed = TOGGLE_THREAD_COLLAPSED_METHOD,
 }
 
 local function command_input(command)

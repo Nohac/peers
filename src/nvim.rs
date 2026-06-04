@@ -33,13 +33,9 @@ const TOTAL_THREADS_LABEL: &str = "total";
 const UNRESOLVED_THREADS_LABEL: &str = "unresolved";
 const THREAD_SCOPE_LINE: &str = "line";
 const THREAD_SCOPE_FILE: &str = "file";
-const COMMENT_STATUS_OPEN: &str = "Open";
-const COMMENT_STATUS_RESOLVED: &str = "Resolved";
 const COMMENT_AGENT_MARKER: &str = " [agent]";
 const COMMENT_EDITED_LABEL: &str = "edited";
 const COMMENT_META_SEPARATOR: &str = " · ";
-const COMMENT_COMMENT_LABEL: &str = "comment";
-const COMMENT_COMMENTS_LABEL: &str = "comments";
 const CURSOR_LABEL: &str = "Cursor";
 const LINE_LABEL: &str = "line";
 const COLUMN_LABEL: &str = "column";
@@ -56,6 +52,7 @@ const COMMAND_EDIT_COMMENT: &str = "peers.editComment";
 const COMMAND_DELETE_COMMENT: &str = "peers.deleteComment";
 const COMMAND_RESOLVE_THREAD: &str = "peers.resolveThread";
 const COMMAND_REOPEN_THREAD: &str = "peers.reopenThread";
+const COMMAND_TOGGLE_THREAD_COLLAPSED: &str = "peers.toggleThreadCollapsed";
 const COMMAND_ASK_AGENT: &str = "peers.askAgent";
 
 const ACTION_ADD_LINE_COMMENT: &str = "Peers: Add line comment";
@@ -66,6 +63,7 @@ const ACTION_EDIT_COMMENT: &str = "Peers: Edit comment";
 const ACTION_DELETE_COMMENT: &str = "Peers: Delete comment";
 const ACTION_RESOLVE_THREAD: &str = "Peers: Resolve thread";
 const ACTION_REOPEN_THREAD: &str = "Peers: Reopen thread";
+const ACTION_TOGGLE_THREAD_COLLAPSED: &str = "Peers: Toggle collapse";
 const NOTIFICATION_REVIEW_UPDATED: &str = "peers/reviewUpdated";
 const METHOD_RENDER_REVIEW: &str = "peers/renderReview";
 const METHOD_CREATE_THREAD: &str = "peers/createThread";
@@ -74,6 +72,7 @@ const METHOD_EDIT_COMMENT: &str = "peers/editComment";
 const METHOD_DELETE_COMMENT: &str = "peers/deleteComment";
 const METHOD_RESOLVE_THREAD: &str = "peers/resolveThread";
 const METHOD_REOPEN_THREAD: &str = "peers/reopenThread";
+const METHOD_TOGGLE_THREAD_COLLAPSED: &str = "peers/toggleThreadCollapsed";
 const PARAM_SCOPE: &str = "scope";
 const PARAM_PATH: &str = "path";
 const PARAM_SIDE: &str = "side";
@@ -111,6 +110,8 @@ const HIGHLIGHT_THREAD_BORDER: &str = "PeersDiffThreadBorder";
 const HIGHLIGHT_THREAD_BORDER_CONTEXT: &str = "PeersDiffThreadBorderContext";
 const HIGHLIGHT_THREAD_BORDER_STALE: &str = "PeersDiffThreadBorderStale";
 const HIGHLIGHT_THREAD_BORDER_DETACHED: &str = "PeersDiffThreadBorderDetached";
+const HIGHLIGHT_THREAD_RESOLVED: &str = "PeersDiffThreadResolved";
+const HIGHLIGHT_THREAD_HEADER: &str = "PeersDiffThreadHeader";
 const HIGHLIGHT_THREAD_META: &str = "PeersDiffThreadMeta";
 const HIGHLIGHT_THREAD_RAIL: &str = "PeersDiffThreadRail";
 const HIGHLIGHT_THREAD_RAIL_CONTEXT: &str = "PeersDiffThreadRailContext";
@@ -133,11 +134,16 @@ const EMPTY_SYMBOL_DETAIL: &str = "empty review";
 const THREAD_RAIL_START_COL: u32 = 0;
 const THREAD_RAIL_END_COL: u32 = 1;
 const THREAD_CARD_WIDTH: usize = 86;
-const THREAD_HEADER_PREFIX: &str = "│ ╭─ ";
-const THREAD_BODY_PREFIX: &str = "│ │ ";
-const THREAD_FOOTER: &str = "│ ╰─";
-const THREAD_COUNT_SEPARATOR: &str = " ";
-const THREAD_BLANK: &str = "│ │";
+const THREAD_CARD_MARGIN: &str = "  ";
+const THREAD_HEADER_PREFIX: &str = "╭─ ";
+const THREAD_BODY_PREFIX: &str = "│ ";
+const THREAD_FOOTER: &str = "╰─";
+const THREAD_COMMENT_ELISION_PREFIX: &str = "│ ";
+const THREAD_STATUS_OPEN_ICON: &str = "●";
+const THREAD_STATUS_RESOLVED_ICON: &str = "✓";
+const THREAD_EMPTY_PREVIEW: &str = "No comment body";
+const THREAD_COMMENT_ELISION_SUFFIX: &str = "comments hidden";
+const TRUNCATION_SUFFIX: &str = "…";
 
 struct ReviewUpdatedNotification;
 
@@ -288,6 +294,16 @@ impl PeersDiffLanguageServer {
             .map_err(|_| LspError::internal_error())?;
         Ok(render_review_payload(review).into_lsp())
     }
+
+    async fn toggle_thread_collapsed(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = thread_request(&params)?;
+        let review = self
+            .provider
+            .toggle_thread_collapsed(request)
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        Ok(render_review_payload(review).into_lsp())
+    }
 }
 
 impl LanguageServer for PeersDiffLanguageServer {
@@ -314,6 +330,7 @@ impl LanguageServer for PeersDiffLanguageServer {
                         COMMAND_DELETE_COMMENT.to_string(),
                         COMMAND_RESOLVE_THREAD.to_string(),
                         COMMAND_REOPEN_THREAD.to_string(),
+                        COMMAND_TOGGLE_THREAD_COLLAPSED.to_string(),
                         COMMAND_ASK_AGENT.to_string(),
                     ],
                     ..Default::default()
@@ -443,6 +460,10 @@ async fn serve_lsp_connection(stream: TcpStream, provider: ReviewProvider) -> Re
                 PeersDiffLanguageServer::resolve_thread,
             )
             .custom_method(METHOD_REOPEN_THREAD, PeersDiffLanguageServer::reopen_thread)
+            .custom_method(
+                METHOD_TOGGLE_THREAD_COLLAPSED,
+                PeersDiffLanguageServer::toggle_thread_collapsed,
+            )
             .finish();
     Server::new(read, write, socket).serve(service).await;
     Ok(())
@@ -541,6 +562,9 @@ struct RenderedRow {
     can_edit: Option<bool>,
     invalidates_later_activity: Option<bool>,
     resolved: Option<bool>,
+    collapsed: Option<bool>,
+    thread_summary: Option<String>,
+    anchor_placement: Option<String>,
     placement_state: Option<&'static str>,
 }
 
@@ -563,6 +587,9 @@ impl RenderedRow {
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
+            collapsed: None,
+            thread_summary: None,
+            anchor_placement: None,
             placement_state: None,
         }
     }
@@ -585,6 +612,9 @@ impl RenderedRow {
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
+            collapsed: None,
+            thread_summary: None,
+            anchor_placement: None,
             placement_state: Some("file"),
         }
     }
@@ -607,6 +637,9 @@ impl RenderedRow {
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
+            collapsed: None,
+            thread_summary: None,
+            anchor_placement: None,
             placement_state: Some("file"),
         }
     }
@@ -629,6 +662,9 @@ impl RenderedRow {
             can_edit: None,
             invalidates_later_activity: None,
             resolved: None,
+            collapsed: None,
+            thread_summary: None,
+            anchor_placement: None,
             placement_state: Some("inline"),
         }
     }
@@ -655,6 +691,9 @@ impl RenderedRow {
             can_edit: comment.map(|comment| comment.can_edit),
             invalidates_later_activity: comment.map(|_| invalidates_later_activity),
             resolved: Some(thread.resolved),
+            collapsed: Some(thread.collapsed),
+            thread_summary: thread.collapsed.then(|| collapsed_thread_meta(thread)),
+            anchor_placement: thread.anchor.placement.clone(),
             placement_state: Some(thread_placement_state(thread)),
         }
     }
@@ -712,6 +751,18 @@ impl RenderedRow {
         }
         if let Some(resolved) = self.resolved {
             object.insert("resolved".to_string(), LSPAny::Bool(resolved));
+        }
+        if let Some(collapsed) = self.collapsed {
+            object.insert("collapsed".to_string(), LSPAny::Bool(collapsed));
+        }
+        if let Some(thread_summary) = self.thread_summary {
+            object.insert("thread_summary".to_string(), LSPAny::String(thread_summary));
+        }
+        if let Some(anchor_placement) = self.anchor_placement {
+            object.insert(
+                "anchor_placement".to_string(),
+                LSPAny::String(anchor_placement),
+            );
         }
         if let Some(placement_state) = self.placement_state {
             object.insert(
@@ -1140,20 +1191,34 @@ fn thread_covers_line(thread: &ReviewThread, path: &str, side: &str, line: u32) 
 }
 
 fn push_thread_block(rendered: &mut RenderedReview, thread: &ReviewThread) {
-    let status = if thread.resolved {
-        COMMENT_STATUS_RESOLVED
-    } else {
-        COMMENT_STATUS_OPEN
-    };
-    let count = thread.comments.len();
-    let count_label = if count == 1 {
-        COMMENT_COMMENT_LABEL
-    } else {
-        COMMENT_COMMENTS_LABEL
-    };
+    render_comment_thread(
+        rendered,
+        thread,
+        RenderCommentOptions {
+            show_path: true,
+            max_visible_comments: 6,
+            collapsed: thread.collapsed,
+        },
+    );
+}
+
+#[derive(Clone, Copy)]
+struct RenderCommentOptions {
+    show_path: bool,
+    max_visible_comments: usize,
+    collapsed: bool,
+}
+
+fn render_comment_thread(
+    rendered: &mut RenderedReview,
+    thread: &ReviewThread,
+    options: RenderCommentOptions,
+) {
     let header = format!(
-        "{THREAD_HEADER_PREFIX}{} [{status}] {count}{THREAD_COUNT_SEPARATOR}{count_label}",
-        thread.line_label
+        "{THREAD_HEADER_PREFIX}{} {}{}",
+        thread_status_icon(thread),
+        thread_label_for_options(thread, options),
+        collapsed_count_suffix(thread, options)
     );
     push_thread_line(
         rendered,
@@ -1161,44 +1226,152 @@ fn push_thread_block(rendered: &mut RenderedReview, thread: &ReviewThread) {
         thread,
         None,
         false,
-        thread_border_highlight(thread),
+        HIGHLIGHT_THREAD_HEADER,
     );
 
-    for (index, comment) in thread.comments.iter().enumerate() {
-        let invalidates_later_activity = index + 1 < thread.comments.len() || thread.resolved;
-        let meta = format!("{THREAD_BODY_PREFIX}{}", comment_meta(comment));
-        push_thread_line(
-            rendered,
-            meta,
-            thread,
-            Some(comment),
-            invalidates_later_activity,
-            HIGHLIGHT_THREAD_META,
-        );
+    if options.collapsed {
+        push_collapsed_thread_footer(rendered, thread);
+        return;
+    }
 
-        for line in wrap_comment_body(&comment.comment.body) {
-            push_thread_line(
-                rendered,
-                format!("{THREAD_BODY_PREFIX}{line}"),
-                thread,
-                Some(comment),
-                invalidates_later_activity,
-                HIGHLIGHT_THREAD_BODY,
-            );
+    let visible_comments =
+        visible_comment_indexes(thread.comments.len(), options.max_visible_comments);
+    for (visible_index, comment_index) in visible_comments.iter().copied().enumerate() {
+        if let Some(hidden_count) = hidden_comment_count_before(&visible_comments, visible_index) {
+            push_thread_elision(rendered, thread, hidden_count);
         }
-        if index + 1 < thread.comments.len() {
-            push_thread_line(
-                rendered,
-                THREAD_BLANK.to_string(),
-                thread,
-                None,
-                false,
-                HIGHLIGHT_THREAD_BODY,
-            );
-        }
+        let comment = &thread.comments[comment_index];
+        let invalidates_later_activity =
+            comment_index + 1 < thread.comments.len() || thread.resolved;
+        push_thread_comment(rendered, thread, comment, invalidates_later_activity);
     }
 
     push_thread_footer(rendered, thread);
+}
+
+fn thread_status_icon(thread: &ReviewThread) -> &'static str {
+    if thread.resolved {
+        THREAD_STATUS_RESOLVED_ICON
+    } else {
+        THREAD_STATUS_OPEN_ICON
+    }
+}
+
+fn thread_label_for_options(thread: &ReviewThread, options: RenderCommentOptions) -> String {
+    if options.show_path {
+        return thread.line_label.clone();
+    }
+    thread_label_without_path(thread)
+}
+
+fn thread_label_without_path(thread: &ReviewThread) -> String {
+    let name = thread
+        .path
+        .as_deref()
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("review");
+    let start_line = thread.anchor.start_line.or(thread.anchor.end_line);
+    let end_line = thread.anchor.end_line.or(thread.anchor.start_line);
+    match (start_line, end_line) {
+        (Some(start), Some(end)) if start != end => format!("{name}:{start}-{end}"),
+        (_, Some(end)) => format!("{name}:{end}"),
+        (Some(start), _) => format!("{name}:{start}"),
+        _ => name.to_string(),
+    }
+}
+
+fn collapsed_count_suffix(thread: &ReviewThread, options: RenderCommentOptions) -> String {
+    if options.collapsed {
+        format!(" [{}]", thread.comments.len())
+    } else {
+        String::new()
+    }
+}
+
+fn visible_comment_indexes(count: usize, max_visible_comments: usize) -> Vec<usize> {
+    if count <= max_visible_comments || max_visible_comments < 3 {
+        return (0..count).collect();
+    }
+    vec![0, count - 1]
+}
+
+fn hidden_comment_count_before(visible_comments: &[usize], visible_index: usize) -> Option<usize> {
+    if visible_index == 0 {
+        return None;
+    }
+    let previous = visible_comments[visible_index - 1];
+    let current = visible_comments[visible_index];
+    let hidden_count = current.saturating_sub(previous + 1);
+    (hidden_count > 0).then_some(hidden_count)
+}
+
+fn push_thread_comment(
+    rendered: &mut RenderedReview,
+    thread: &ReviewThread,
+    comment: &ReviewComment,
+    invalidates_later_activity: bool,
+) {
+    let meta = format!("{THREAD_BODY_PREFIX}{}", comment_meta(comment));
+    push_thread_line(
+        rendered,
+        meta,
+        thread,
+        Some(comment),
+        invalidates_later_activity,
+        HIGHLIGHT_THREAD_META,
+    );
+
+    for line in wrap_comment_body(&comment.comment.body) {
+        push_thread_line(
+            rendered,
+            format!("{THREAD_BODY_PREFIX}{line}"),
+            thread,
+            Some(comment),
+            invalidates_later_activity,
+            HIGHLIGHT_THREAD_BODY,
+        );
+    }
+}
+
+fn push_thread_elision(rendered: &mut RenderedReview, thread: &ReviewThread, hidden_count: usize) {
+    push_thread_line(
+        rendered,
+        format!(
+            "{THREAD_COMMENT_ELISION_PREFIX}… {hidden_count} {THREAD_COMMENT_ELISION_SUFFIX} …"
+        ),
+        thread,
+        None,
+        false,
+        HIGHLIGHT_THREAD_BODY,
+    );
+}
+
+fn push_collapsed_thread_footer(rendered: &mut RenderedReview, thread: &ReviewThread) {
+    let meta = collapsed_thread_meta(thread);
+    let line_text = format!("{THREAD_FOOTER} {meta}");
+    let line = rendered.push_line(
+        truncate_display_line(thread_card_line(&line_text)),
+        RenderedRow::comment(thread, None, false),
+    );
+    let border_start = thread_card_start_col();
+    let border_end = border_start + THREAD_FOOTER.len() as u32;
+    let end_col = rendered.lines[line as usize].len() as u32;
+    rendered.push_highlight(
+        line,
+        border_start,
+        border_end,
+        thread_card_border_highlight(thread),
+    );
+    if end_col > border_end {
+        rendered.push_highlight(line, border_end + 1, end_col, HIGHLIGHT_THREAD_META);
+    }
+    rendered.push_highlight(
+        line,
+        THREAD_RAIL_START_COL,
+        THREAD_RAIL_END_COL,
+        thread_rail_highlight(thread),
+    );
 }
 
 fn push_thread_line(
@@ -1210,11 +1383,21 @@ fn push_thread_line(
     group: &'static str,
 ) {
     let line = rendered.push_line(
-        truncate_display_line(line_text),
+        truncate_display_line(thread_card_line(&line_text)),
         RenderedRow::comment(thread, comment, invalidates_later_activity),
     );
     let end_col = rendered.lines[line as usize].len() as u32;
-    rendered.push_highlight(line, 0, end_col, group);
+    let border_start = thread_card_start_col();
+    let border_end = thread_border_end_col(&line_text);
+    rendered.push_highlight(
+        line,
+        border_start,
+        border_end,
+        thread_card_border_highlight(thread),
+    );
+    if end_col > border_end {
+        rendered.push_highlight(line, border_end, end_col, group);
+    }
     rendered.push_highlight(
         line,
         THREAD_RAIL_START_COL,
@@ -1227,12 +1410,18 @@ fn push_thread_footer(rendered: &mut RenderedReview, thread: &ReviewThread) {
     let note = thread_location_note(thread);
     let line_text = format!("{THREAD_FOOTER} {note}");
     let line = rendered.push_line(
-        truncate_display_line(line_text),
+        truncate_display_line(thread_card_line(&line_text)),
         RenderedRow::comment(thread, None, false),
     );
-    let border_end = THREAD_FOOTER.len() as u32;
+    let border_start = thread_card_start_col();
+    let border_end = border_start + THREAD_FOOTER.len() as u32;
     let end_col = rendered.lines[line as usize].len() as u32;
-    rendered.push_highlight(line, 0, border_end, thread_border_highlight(thread));
+    rendered.push_highlight(
+        line,
+        border_start,
+        border_end,
+        thread_card_border_highlight(thread),
+    );
     if end_col > border_end {
         rendered.push_highlight(
             line,
@@ -1249,12 +1438,41 @@ fn push_thread_footer(rendered: &mut RenderedReview, thread: &ReviewThread) {
     );
 }
 
+fn thread_card_line(line: &str) -> String {
+    format!("{THREAD_CARD_MARGIN}{line}")
+}
+
+fn thread_card_start_col() -> u32 {
+    THREAD_CARD_MARGIN.len() as u32
+}
+
+fn thread_border_end_col(line_text: &str) -> u32 {
+    let border_width = if line_text.starts_with(THREAD_HEADER_PREFIX) {
+        THREAD_HEADER_PREFIX.len() + THREAD_STATUS_OPEN_ICON.len() + 1
+    } else if line_text.starts_with(THREAD_BODY_PREFIX) {
+        THREAD_BODY_PREFIX.len()
+    } else if line_text.starts_with(THREAD_FOOTER) {
+        THREAD_FOOTER.len()
+    } else {
+        0
+    };
+    thread_card_start_col() + border_width as u32
+}
+
 fn thread_border_highlight(thread: &ReviewThread) -> &'static str {
     match thread_placement_state(thread) {
         "context" => HIGHLIGHT_THREAD_BORDER_CONTEXT,
         "stale" => HIGHLIGHT_THREAD_BORDER_STALE,
         "file" | "detached" => HIGHLIGHT_THREAD_BORDER_DETACHED,
         _ => HIGHLIGHT_THREAD_BORDER,
+    }
+}
+
+fn thread_card_border_highlight(thread: &ReviewThread) -> &'static str {
+    if thread.resolved {
+        HIGHLIGHT_THREAD_RESOLVED
+    } else {
+        thread_border_highlight(thread)
     }
 }
 
@@ -1328,8 +1546,40 @@ fn comment_meta(comment: &ReviewComment) -> String {
     meta
 }
 
+fn collapsed_thread_meta(thread: &ReviewThread) -> String {
+    let Some(comment) = thread.comments.first() else {
+        return THREAD_EMPTY_PREVIEW.to_string();
+    };
+    let timestamp = comment_timestamp(comment.comment.created_at.as_str());
+    let prefix = format!("{timestamp}{COMMENT_META_SEPARATOR}");
+    let width = THREAD_CARD_WIDTH
+        .saturating_sub(THREAD_CARD_MARGIN.chars().count())
+        .saturating_sub(THREAD_FOOTER.chars().count())
+        .saturating_sub(1)
+        .saturating_sub(prefix.chars().count())
+        .max(1);
+    format!(
+        "{prefix}{}",
+        truncate_display_text(first_sentence(&comment.comment.body), width)
+    )
+}
+
+fn first_sentence(body: &str) -> String {
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if body.is_empty() {
+        return THREAD_EMPTY_PREVIEW.to_string();
+    }
+    for (index, ch) in body.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            return body[..=index].trim().to_string();
+        }
+    }
+    body
+}
+
 fn wrap_comment_body(body: &str) -> Vec<String> {
     let width = THREAD_CARD_WIDTH
+        .saturating_sub(THREAD_CARD_MARGIN.chars().count())
         .saturating_sub(THREAD_BODY_PREFIX.chars().count())
         .max(1);
     let mut lines = Vec::new();
@@ -1363,6 +1613,20 @@ fn wrap_comment_body(body: &str) -> Vec<String> {
 
 fn truncate_display_line(line: String) -> String {
     line.chars().take(THREAD_CARD_WIDTH).collect()
+}
+
+fn truncate_display_text(text: String, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text;
+    }
+    if width <= TRUNCATION_SUFFIX.chars().count() {
+        return text.chars().take(width).collect();
+    }
+    let prefix_width = width - TRUNCATION_SUFFIX.chars().count();
+    format!(
+        "{}{TRUNCATION_SUFFIX}",
+        text.chars().take(prefix_width).collect::<String>()
+    )
 }
 
 fn comment_timestamp(input: &str) -> String {
@@ -1454,6 +1718,11 @@ fn comment_row_actions(row: &RenderedRow) -> CodeActionResponse {
                 Some(vec![thread_arg(thread_id)]),
             ));
         }
+        actions.push(command_action(
+            ACTION_TOGGLE_THREAD_COLLAPSED.to_string(),
+            COMMAND_TOGGLE_THREAD_COLLAPSED,
+            Some(vec![thread_arg(thread_id)]),
+        ));
     }
     if row.can_edit.unwrap_or(false) && row.comment_id.is_some() {
         actions.push(command_action(
@@ -1999,6 +2268,7 @@ mod tests {
                 },
                 resolved: true,
                 resolved_head_oid: Some("head-1".to_string()),
+                collapsed: false,
                 comments: Vec::new(),
             }],
             review_threads: Vec::new(),
@@ -2009,7 +2279,7 @@ mod tests {
             !rendered
                 .lines
                 .iter()
-                .any(|line| line.contains(COMMENT_STATUS_RESOLVED))
+                .any(|line| line.contains(THREAD_STATUS_RESOLVED_ICON))
         );
     }
 
@@ -2065,6 +2335,7 @@ mod tests {
                 },
                 resolved: true,
                 resolved_head_oid: Some("head-1".to_string()),
+                collapsed: false,
                 comments: Vec::new(),
             }],
             review_threads: Vec::new(),
@@ -2075,7 +2346,7 @@ mod tests {
             rendered
                 .lines
                 .iter()
-                .any(|line| line.contains(COMMENT_STATUS_RESOLVED))
+                .any(|line| line.contains(&format!("{THREAD_STATUS_RESOLVED_ICON} src/main.rs:1")))
         );
         assert_eq!(rendered.sidebar_counts.files, 1);
         assert_eq!(rendered.sidebar_counts.comments, 1);
@@ -2137,6 +2408,7 @@ mod tests {
                 },
                 resolved: false,
                 resolved_head_oid: None,
+                collapsed: false,
                 comments: vec![ReviewComment {
                     comment: Comment {
                         id: CommentId::from_raw("cmt_test"),
@@ -2259,6 +2531,7 @@ mod tests {
                 },
                 resolved: false,
                 resolved_head_oid: None,
+                collapsed: false,
                 comments: vec![ReviewComment {
                     comment: Comment {
                         id: CommentId::from_raw("cmt_test"),
@@ -2294,6 +2567,100 @@ mod tests {
                 .highlights
                 .iter()
                 .any(|highlight| { highlight.group == HIGHLIGHT_THREAD_BORDER_CONTEXT })
+        );
+    }
+
+    #[test]
+    fn renders_collapsed_threads_as_compact_summary() {
+        let rendered = render_review_payload(ReviewProjection {
+            review_id: "repo".to_string(),
+            target_label: "working tree".to_string(),
+            current_head_oid: Some("head-1".to_string()),
+            is_branch_review: false,
+            files: vec![ReviewFile {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                is_changed: true,
+                comment_count: 1,
+                added_lines: 1,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                crate::diff::FileContent {
+                    old: None,
+                    new: Some(vec!["fn main() {}".to_string()]),
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                FileDiff {
+                    path: "src/main.rs".to_string(),
+                    hunks: vec![crate::diff::DiffHunk {
+                        old: None,
+                        new: Some(crate::diff::LineRange { start: 1, end: 1 }),
+                        sections: vec![crate::diff::DiffSection::Added {
+                            added: crate::diff::NewRange {
+                                new: crate::diff::LineRange { start: 1, end: 1 },
+                            },
+                        }],
+                    }],
+                },
+            )]),
+            threads: vec![ReviewThread {
+                id: "thread-1".to_string(),
+                scope: THREAD_SCOPE_LINE.to_string(),
+                path: Some("src/main.rs".to_string()),
+                line_label: "src/main.rs:1".to_string(),
+                anchor: ReviewThreadAnchor {
+                    side: Some(SIDE_NEW.to_string()),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    placement: Some("exact".to_string()),
+                    line_placements: Vec::new(),
+                },
+                resolved: false,
+                resolved_head_oid: None,
+                collapsed: true,
+                comments: vec![ReviewComment {
+                    comment: Comment {
+                        id: CommentId::from_raw("cmt_test"),
+                        thread_id: ThreadId::from_raw("thr_test"),
+                        author: Author {
+                            kind: AuthorKind::Human,
+                            display_name: "jonas".to_string(),
+                            email: None,
+                        },
+                        body: "hidden while collapsed".to_string(),
+                        created_at: PeersTimestamp::from_rfc3339_unchecked("2026-05-28T12:00:00Z"),
+                        edited_at: None,
+                        deleted_at: None,
+                    },
+                    can_edit: true,
+                }],
+            }],
+            review_threads: Vec::new(),
+            commits: Vec::new(),
+        });
+
+        let comment_rows = rendered
+            .rows
+            .iter()
+            .filter(|row| row.thread_id.as_deref() == Some("thread-1"))
+            .count();
+        assert_eq!(comment_rows, 2);
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line == "  ╭─ ● src/main.rs:1 [1]")
+        );
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.contains(" · hidden while collapsed"))
         );
     }
 

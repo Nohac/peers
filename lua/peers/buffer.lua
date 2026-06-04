@@ -11,6 +11,7 @@ local SOURCE_NAMESPACE = vim.api.nvim_create_namespace("peers-review-source")
 local DIAGNOSTIC_NAMESPACE = vim.api.nvim_create_namespace("peers-review-diagnostics")
 local ADD_FALLBACK_FG = "#3fb950"
 local DELETE_FALLBACK_FG = "#f85149"
+local RESOLVED_FALLBACK_FG = "#3fb950"
 local THREAD_FALLBACK_FG = "#58a6ff"
 local THREAD_CONTEXT_FALLBACK_FG = "#d29922"
 local THREAD_STALE_FALLBACK_FG = "#f85149"
@@ -38,6 +39,11 @@ local DELETE_FOREGROUND_GROUPS = {
   "Removed",
   "DiagnosticError",
   "DiffDelete",
+}
+local RESOLVED_FOREGROUND_GROUPS = {
+  "GitSignsAdd",
+  "Added",
+  "DiagnosticOk",
 }
 local ADD_BACKGROUND_GROUPS = {
   "DiffAdd",
@@ -107,8 +113,8 @@ local COMMENT_REPLY_UNAVAILABLE_MESSAGE = "Peers reply is only available on comm
 local COMMENT_EDIT_UNAVAILABLE_MESSAGE = "Peers edit is only available on editable comments"
 local COMMENT_DELETE_UNAVAILABLE_MESSAGE = "Peers delete is only available on editable comments"
 local COMMENT_THREAD_UNAVAILABLE_MESSAGE = "Peers thread action is only available on comment threads"
+local COMMENT_COLLAPSE_UNAVAILABLE_MESSAGE = "Peers collapse is only available on comment threads"
 local OPEN_SOURCE_KEY = "<CR>"
-local OPEN_SOURCE_DESC = "Open source file"
 local COMMENT_CONFIRM_CHOICES = "&Proceed\n&Cancel"
 local COMMENT_CONFIRM_DEFAULT = 2
 local COMMENT_CONFIRM_DANGER = "WarningMsg"
@@ -277,6 +283,7 @@ local function define_diff_gutter_highlights()
   local thread_context_fg = foreground_from(THREAD_CONTEXT_FOREGROUND_GROUPS, THREAD_CONTEXT_FALLBACK_FG)
   local thread_stale_fg = foreground_from(THREAD_STALE_FOREGROUND_GROUPS, THREAD_STALE_FALLBACK_FG)
   local thread_detached_fg = foreground_from(THREAD_DETACHED_FOREGROUND_GROUPS, THREAD_DETACHED_FALLBACK_FG)
+  local thread_resolved_fg = foreground_from(RESOLVED_FOREGROUND_GROUPS, RESOLVED_FALLBACK_FG)
   pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadBorderContext", {
     default = true,
     [HIGHLIGHT_FG] = thread_context_fg,
@@ -288,6 +295,11 @@ local function define_diff_gutter_highlights()
   pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadBorderDetached", {
     default = true,
     [HIGHLIGHT_FG] = thread_detached_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadResolved", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_resolved_fg,
+    [HIGHLIGHT_BOLD] = true,
   })
   pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadHeader", {
     default = true,
@@ -934,6 +946,37 @@ local function restore_win_view(win, view)
   end)
 end
 
+local clamp_cursor
+
+local function review_window_for(buf)
+  local current = vim.api.nvim_get_current_win()
+  if vim.api.nvim_win_is_valid(current) and vim.api.nvim_win_get_buf(current) == buf then
+    return current
+  end
+  local wins = vim.fn.win_findbuf(buf)
+  return wins[1]
+end
+
+local function review_win_for_row(buf, line)
+  local win = review_window_for(buf)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  if line then
+    local clamped_line, col = clamp_cursor(buf, line, 0)
+    pcall(vim.api.nvim_win_set_cursor, win, { clamped_line, col })
+  end
+  return win
+end
+
+local function focus_review_row(buf, line)
+  local win = review_win_for_row(buf, line)
+  if win then
+    vim.api.nvim_set_current_win(win)
+  end
+  return win
+end
+
 local function row_thread_offset(rows, index, thread_id)
   local first = index
   while first > 1 do
@@ -1062,7 +1105,7 @@ local function cursor_col_for_anchor(anchor)
   return anchor and anchor.fallback_col or 0
 end
 
-local function clamp_cursor(buf, line, col)
+clamp_cursor = function(buf, line, col)
   local line_count = math.max(1, vim.api.nvim_buf_line_count(buf))
   line = math.max(1, math.min(line or 1, line_count))
   local text = vim.api.nvim_buf_get_lines(buf, line - 1, line, false)[1] or ""
@@ -1292,6 +1335,12 @@ local function render_review_now(buf, state)
       current.render_in_flight = false
     end
     timing.log(state.root, "buffer", string.format("render_review_now rpc %.1fms buf=%s", timing.ms(start), tostring(buf)))
+    if current and review_refresh_is_paused(current) then
+      current.pending_refresh = true
+      timing.log(current.root, "buffer", "render_review_now deferred reason=" .. review_refresh_pause_reason(current) .. " buf=" .. tostring(buf))
+      schedule_pending_refresh_check(buf, current)
+      return
+    end
     apply_render(state.root, buf, render, state.client_id)
     current = RENDER_STATES[buf]
     if current and current.render_again then
@@ -1512,6 +1561,7 @@ end
 
 local function close_composer(state)
   local review_win = state and state.composer_review_win or nil
+  local return_win = state and state.composer_return_win or nil
   pcall(vim.cmd, "stopinsert")
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.api.nvim_win_close(state.composer_win, true)
@@ -1522,8 +1572,10 @@ local function close_composer(state)
   state.composer_win = nil
   state.composer_buf = nil
   state.composer_review_win = nil
+  state.composer_return_win = nil
+  state.composer_return_sidebar_focus = nil
   state.composer_review_view = nil
-  return review_win
+  return review_win, return_win
 end
 
 local function composer_width(review_win)
@@ -1531,8 +1583,11 @@ local function composer_width(review_win)
   return math.max(COMPOSER_MIN_WIDTH, math.min(COMPOSER_MAX_WIDTH, available))
 end
 
-local function composer_row()
-  local winline = vim.fn.winline()
+local function composer_row(review_win)
+  local ok, winline = pcall(vim.api.nvim_win_call, review_win, vim.fn.winline)
+  if not ok then
+    winline = vim.fn.winline()
+  end
   if winline > COMPOSER_HEIGHT + 3 then
     return winline - COMPOSER_HEIGHT - 2
   end
@@ -1543,7 +1598,7 @@ local function composer_config(review_win, title)
   return {
     relative = "win",
     win = review_win,
-    row = composer_row(),
+    row = composer_row(review_win),
     col = COMPOSER_GUTTER_COL,
     width = composer_width(review_win),
     height = COMPOSER_HEIGHT,
@@ -1561,18 +1616,18 @@ end
 local function apply_mutation_render(state, review_buf, render)
   state.pending_refresh = false
   local review_view = state.composer_review_view
-  local review_win = close_composer(state)
-  if
-    review_win
-    and vim.api.nvim_win_is_valid(review_win)
-    and vim.api.nvim_win_get_buf(review_win) == review_buf
-  then
-    vim.api.nvim_set_current_win(review_win)
-  end
-  apply_render(state.root, review_buf, render, state.client_id)
+  local review_win, return_win = close_composer(state)
+  apply_render(state.root, review_buf, render, state.client_id, { force = true })
   if review_win and vim.api.nvim_win_is_valid(review_win) and review_view then
     restore_win_view(review_win, review_view)
     save_current_view(review_buf)
+  end
+  if return_win and vim.api.nvim_win_is_valid(return_win) then
+    vim.api.nvim_set_current_win(return_win)
+    local current = RENDER_STATES[review_buf]
+    if current and current.sidebar_buf and vim.api.nvim_win_get_buf(return_win) == current.sidebar_buf then
+      current.sidebar_has_focus = true
+    end
   end
 end
 
@@ -1604,14 +1659,39 @@ local function submit_composer(review_buf, draft_buf, on_submit)
   on_submit(state, body)
 end
 
+local function current_review_row(buf)
+  local state = RENDER_STATES[buf]
+  if not state then
+    return nil
+  end
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  return state.rows[cursor[1]], cursor[1]
+end
+
 local function open_composer(review_buf, opts)
   local state = RENDER_STATES[review_buf]
   if not state then
     return
   end
 
+  opts = opts or {}
   close_composer(state)
-  local review_win = vim.api.nvim_get_current_win()
+  local review_win = opts.review_win or vim.api.nvim_get_current_win()
+  if not review_win or not vim.api.nvim_win_is_valid(review_win) then
+    review_win = review_window_for(review_buf)
+  end
+  if not review_win or not vim.api.nvim_win_is_valid(review_win) then
+    vim.notify(COMMENT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  local return_win = opts.return_win or review_win
+  local return_sidebar_focus = state.sidebar_buf
+    and return_win
+    and vim.api.nvim_win_is_valid(return_win)
+    and vim.api.nvim_win_get_buf(return_win) == state.sidebar_buf
+  if return_sidebar_focus then
+    state.sidebar_has_focus = false
+  end
   local draft_buf = vim.api.nvim_create_buf(false, true)
   vim.bo[draft_buf].buftype = "nofile"
   vim.bo[draft_buf].bufhidden = "wipe"
@@ -1622,10 +1702,19 @@ local function open_composer(review_buf, opts)
     plain = true,
   }))
 
-  local draft_win = vim.api.nvim_open_win(draft_buf, true, composer_config(review_win, opts.title))
+  local ok, draft_win = pcall(vim.api.nvim_open_win, draft_buf, false, composer_config(review_win, opts.title))
+  if not ok or not draft_win or not vim.api.nvim_win_is_valid(draft_win) then
+    if vim.api.nvim_buf_is_valid(draft_buf) then
+      vim.api.nvim_buf_delete(draft_buf, { force = true })
+    end
+    vim.notify(COMMENT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
   state.composer_buf = draft_buf
   state.composer_win = draft_win
   state.composer_review_win = review_win
+  state.composer_return_win = return_win
+  state.composer_return_sidebar_focus = return_sidebar_focus
   state.composer_review_view = save_win_view(review_win)
 
   vim.keymap.set({ "n", "i" }, COMPOSER_SUBMIT_MAP, function()
@@ -1633,24 +1722,98 @@ local function open_composer(review_buf, opts)
   end, { buffer = draft_buf, nowait = true })
   vim.keymap.set("n", COMPOSER_CANCEL_MAP, function()
     close_composer(state)
+    if return_win and vim.api.nvim_win_is_valid(return_win) then
+      vim.api.nvim_set_current_win(return_win)
+      if return_sidebar_focus then
+        state.sidebar_has_focus = true
+      end
+    end
     flush_pending_refresh(review_buf)
   end, { buffer = draft_buf, nowait = true })
   vim.keymap.set("n", "<Esc>", function()
     close_composer(state)
+    if return_win and vim.api.nvim_win_is_valid(return_win) then
+      vim.api.nvim_set_current_win(return_win)
+      if return_sidebar_focus then
+        state.sidebar_has_focus = true
+      end
+    end
     flush_pending_refresh(review_buf)
   end, { buffer = draft_buf, nowait = true })
 
-  vim.cmd("startinsert")
+  vim.schedule(function()
+    if not vim.api.nvim_win_is_valid(draft_win) or not vim.api.nvim_buf_is_valid(draft_buf) then
+      return
+    end
+    local entered = pcall(vim.api.nvim_set_current_win, draft_win)
+    if not entered then
+      close_composer(state)
+      if return_win and vim.api.nvim_win_is_valid(return_win) then
+        pcall(vim.api.nvim_set_current_win, return_win)
+      end
+      return
+    end
+    pcall(vim.cmd, "startinsert")
+  end)
 end
 
-function apply_render(root, buf, render, client_id)
+local function create_thread_for_row(buf, row, composer_opts)
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+
+  if row and row.kind == ROW_KIND_FILE_HEADER and row.path then
+    open_composer(buf, vim.tbl_extend("force", composer_opts or {}, {
+      on_submit = function(state, body)
+        lsp.create_thread(state.client_id, buf, {
+          scope = ROW_SCOPE_FILE,
+          path = row.path,
+          body = body,
+        }, function(render)
+          apply_mutation_render(state, buf, render)
+        end)
+      end,
+    }))
+    return
+  end
+
+  if not row_is_commentable(row) then
+    vim.notify(COMMENT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+
+  open_composer(buf, vim.tbl_extend("force", composer_opts or {}, {
+    on_submit = function(state, body)
+      lsp.create_thread(state.client_id, buf, {
+        scope = row.scope or ROW_SCOPE_LINE,
+        path = row.path,
+        side = row.side,
+        start_line = row.start_line or row.source_line,
+        end_line = row.end_line or row.source_line,
+        body = body,
+      }, function(render)
+        apply_mutation_render(state, buf, render)
+      end)
+    end,
+  }))
+end
+
+function apply_render(root, buf, render, client_id, opts)
   if not render or not render.lines then
     return
   end
 
+  opts = opts or {}
   local total_start = timing.now()
   local stage_start = total_start
   local existing = RENDER_STATES[buf]
+  if existing and not opts.force and review_refresh_is_paused(existing) then
+    existing.pending_refresh = true
+    schedule_pending_refresh_check(buf, existing)
+    timing.log(existing.root, "buffer", "apply_render deferred reason=" .. review_refresh_pause_reason(existing) .. " buf=" .. tostring(buf))
+    return
+  end
   local cursor_anchors = save_buffer_cursor_anchors(buf)
   local remembered_view = existing and existing.view or nil
   if existing then
@@ -1743,8 +1906,7 @@ end
 
 function M.comment_current(buf, anchor)
   buf = buf or vim.api.nvim_get_current_buf()
-  local state = RENDER_STATES[buf]
-  if not state then
+  if not RENDER_STATES[buf] then
     return
   end
 
@@ -1781,37 +1943,17 @@ function M.comment_current(buf, anchor)
     return
   end
 
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local row = state.rows[cursor[1]]
-  if not row_is_commentable(row) then
-    vim.notify(COMMENT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
-    return
-  end
-
-  open_composer(buf, {
-    on_submit = function(state, body)
-      lsp.create_thread(state.client_id, buf, {
-        scope = row.scope or ROW_SCOPE_LINE,
-        path = row.path,
-        side = row.side,
-        start_line = row.start_line or row.source_line,
-        end_line = row.end_line or row.source_line,
-        body = body,
-      }, function(render)
-        apply_mutation_render(state, buf, render)
-      end)
-    end,
-  })
+  create_thread_for_row(buf, current_review_row(buf))
 end
 
-function M.reply_to_thread(buf, input)
+function M.reply_to_thread(buf, input, composer_opts)
   buf = buf or vim.api.nvim_get_current_buf()
   if not input or not input.thread_id then
     vim.notify(COMMENT_REPLY_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
     return
   end
 
-  open_composer(buf, {
+  open_composer(buf, vim.tbl_extend("force", composer_opts or {}, {
     on_submit = function(state, body)
       lsp.reply_to_thread(state.client_id, buf, {
         thread_id = input.thread_id,
@@ -1820,7 +1962,7 @@ function M.reply_to_thread(buf, input)
         apply_mutation_render(state, buf, render)
       end)
     end,
-  })
+  }))
 end
 
 function M.edit_comment(buf, input)
@@ -1901,6 +2043,103 @@ function M.reopen_thread(buf, input)
   }, function(render)
     apply_mutation_render(state, buf, render)
   end)
+end
+
+function M.toggle_thread_collapsed(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state or not input or not input.thread_id then
+    vim.notify(COMMENT_COLLAPSE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  lsp.toggle_thread_collapsed(state.client_id, buf, {
+    thread_id = input.thread_id,
+  }, function(render)
+    apply_mutation_render(state, buf, render)
+  end)
+end
+
+function M.comment_or_reply(buf, row, line, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  opts = opts or {}
+  local composer_opts = opts.composer_opts or {}
+  if line then
+    local review_win = opts.focus and focus_review_row(buf, line) or review_win_for_row(buf, line)
+    if review_win and not composer_opts.review_win then
+      composer_opts.review_win = review_win
+    end
+  end
+  if opts.return_win and not composer_opts.return_win then
+    composer_opts.return_win = opts.return_win
+  end
+  row = row or current_review_row(buf)
+  if row and row.thread_id then
+    M.reply_to_thread(buf, { thread_id = row.thread_id }, composer_opts)
+    return
+  end
+  create_thread_for_row(buf, row, composer_opts)
+end
+
+function M.delete_selected_comment(buf, row, line, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  if line and opts and opts.focus then
+    focus_review_row(buf, line)
+  end
+  row = row or current_review_row(buf)
+  if not row or not row.comment_id or row.can_edit == false then
+    vim.notify(COMMENT_DELETE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  M.delete_comment(buf, {
+    comment_id = row.comment_id,
+    invalidates_later_activity = true,
+  })
+end
+
+function M.toggle_selected_thread_resolved(buf, row, line, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  if line and opts and opts.focus then
+    focus_review_row(buf, line)
+  end
+  row = row or current_review_row(buf)
+  if not row or not row.thread_id then
+    vim.notify(COMMENT_THREAD_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  if row.resolved == true then
+    M.reopen_thread(buf, { thread_id = row.thread_id })
+  else
+    M.resolve_thread(buf, { thread_id = row.thread_id })
+  end
+end
+
+function M.toggle_selected_thread_collapsed(buf, row, line, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  if line and opts and opts.focus then
+    focus_review_row(buf, line)
+  end
+  row = row or current_review_row(buf)
+  if not row or not row.thread_id then
+    vim.notify(COMMENT_COLLAPSE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  M.toggle_thread_collapsed(buf, { thread_id = row.thread_id })
 end
 
 function M.is_review_buffer(buf)
@@ -1992,7 +2231,35 @@ local function set_review_keymaps(buf)
     M.open_source_at_cursor(buf)
   end, {
     buffer = buf,
-    desc = OPEN_SOURCE_DESC,
+    desc = "Open source file",
+    nowait = true,
+  })
+  vim.keymap.set("n", "c", function()
+    M.comment_or_reply(buf)
+  end, {
+    buffer = buf,
+    desc = "Comment or reply in Peers review",
+    nowait = true,
+  })
+  vim.keymap.set("n", "D", function()
+    M.delete_selected_comment(buf)
+  end, {
+    buffer = buf,
+    desc = "Delete Peers comment",
+    nowait = true,
+  })
+  vim.keymap.set("n", "r", function()
+    M.toggle_selected_thread_resolved(buf)
+  end, {
+    buffer = buf,
+    desc = "Resolve or reopen Peers thread",
+    nowait = true,
+  })
+  vim.keymap.set("n", "x", function()
+    M.toggle_selected_thread_collapsed(buf)
+  end, {
+    buffer = buf,
+    desc = "Collapse or expand Peers thread",
     nowait = true,
   })
   sidebar.set_review_keymaps(buf, RENDER_STATES)

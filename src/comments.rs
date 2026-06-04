@@ -166,6 +166,12 @@ pub enum PeersEvent {
         reopened_at: PeersTimestamp,
         author: Author,
     },
+    ThreadCollapseUpdated {
+        thread_id: ThreadId,
+        updated_at: PeersTimestamp,
+        author: Author,
+        collapsed: bool,
+    },
     ThreadArchived {
         thread_id: ThreadId,
         archived_at: PeersTimestamp,
@@ -220,37 +226,12 @@ pub struct ThreadPayload {
     pub created_at: PeersTimestamp,
     pub updated_at: PeersTimestamp,
     pub provenance: CreationProvenance,
+    #[facet(default)]
     pub resolved_head_oid: Option<String>,
+    #[facet(default)]
+    pub collapsed: bool,
     pub archived_at: Option<PeersTimestamp>,
     pub pruned_at: Option<PeersTimestamp>,
-}
-
-#[derive(Clone, Debug, Facet, PartialEq)]
-struct LegacyThreadPayload {
-    pub id: ThreadId,
-    pub status: ThreadStatus,
-    pub anchor: CommentAnchor,
-    pub created_at: PeersTimestamp,
-    pub updated_at: PeersTimestamp,
-    pub provenance: CreationProvenance,
-    pub archived_at: Option<PeersTimestamp>,
-    pub pruned_at: Option<PeersTimestamp>,
-}
-
-impl LegacyThreadPayload {
-    fn into_thread_payload(self) -> ThreadPayload {
-        ThreadPayload {
-            id: self.id,
-            status: self.status,
-            anchor: self.anchor,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            provenance: self.provenance,
-            resolved_head_oid: None,
-            archived_at: self.archived_at,
-            pruned_at: self.pruned_at,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
@@ -287,6 +268,7 @@ pub struct CommentThread {
     pub comments: Vec<Comment>,
     pub resolved: bool,
     pub resolved_head_oid: Option<String>,
+    pub collapsed: bool,
     pub created_at: PeersTimestamp,
     pub updated_at: PeersTimestamp,
     pub archived_at: Option<PeersTimestamp>,
@@ -351,12 +333,7 @@ pub fn encode_thread_payload(payload: &ThreadPayload) -> Result<String> {
 }
 
 pub fn decode_thread_payload(input: &str) -> Result<ThreadPayload> {
-    match facet_json::from_str::<ThreadPayload>(input) {
-        Ok(payload) => Ok(payload),
-        Err(current_error) => facet_json::from_str::<LegacyThreadPayload>(input)
-            .map(LegacyThreadPayload::into_thread_payload)
-            .with_context(|| format!("failed to decode thread payload: {current_error}")),
-    }
+    facet_json::from_str(input).context("failed to decode thread payload")
 }
 
 pub fn encode_comment_payload(payload: &Comment) -> Result<String> {
@@ -399,6 +376,7 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
                     comments: vec![comment.clone()],
                     resolved: payload.status == ThreadStatus::Resolved,
                     resolved_head_oid: payload.resolved_head_oid.clone(),
+                    collapsed: payload.collapsed,
                     created_at: payload.created_at.clone(),
                     updated_at: payload.updated_at.clone(),
                     archived_at: payload.archived_at.clone(),
@@ -505,6 +483,18 @@ fn apply_event(state: &mut PeersState, payloads: &PayloadStore, event: &PeersEve
             thread.resolved = false;
             thread.resolved_head_oid = None;
             thread.updated_at = reopened_at.clone();
+        }
+        PeersEvent::ThreadCollapseUpdated {
+            thread_id,
+            updated_at,
+            collapsed,
+            ..
+        } => {
+            let thread = state.threads.get_mut(thread_id).ok_or_else(|| {
+                anyhow!("collapse update references unknown thread `{thread_id}`")
+            })?;
+            thread.collapsed = *collapsed;
+            thread.updated_at = updated_at.clone();
         }
         PeersEvent::ThreadArchived {
             thread_id,
@@ -680,6 +670,7 @@ mod tests {
             updated_at: timestamp("2026-05-28T12:01:00Z"),
             provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
             resolved_head_oid: None,
+            collapsed: false,
             archived_at: None,
             pruned_at: None,
         };
@@ -739,6 +730,7 @@ mod tests {
             updated_at: timestamp("2026-05-28T12:02:00Z"),
             provenance: CreationProvenance::from_target(&ReviewTarget::WorkingTree),
             resolved_head_oid: None,
+            collapsed: false,
             archived_at: None,
             pruned_at: None,
         };

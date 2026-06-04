@@ -59,6 +59,11 @@ pub trait PeersReview {
         token: String,
         request: ThreadRequest,
     ) -> std::result::Result<ReviewProjection, String>;
+    async fn toggle_thread_collapsed(
+        &self,
+        token: String,
+        request: ThreadRequest,
+    ) -> std::result::Result<ReviewProjection, String>;
 }
 
 #[derive(Clone)]
@@ -188,6 +193,18 @@ impl PeersReview for ReviewApi {
         self.check_token(&token).map_err(format_error)?;
         self.provider
             .reopen_thread(request)
+            .await
+            .map_err(format_error)
+    }
+
+    async fn toggle_thread_collapsed(
+        &self,
+        token: String,
+        request: ThreadRequest,
+    ) -> std::result::Result<ReviewProjection, String> {
+        self.check_token(&token).map_err(format_error)?;
+        self.provider
+            .toggle_thread_collapsed(request)
             .await
             .map_err(format_error)
     }

@@ -15,6 +15,10 @@ local KEY_FILES = "o"
 local KEY_COMMENTS = "i"
 local KEY_HIDE = "q"
 local KEY_OPEN = "<CR>"
+local KEY_COMMENT = "c"
+local KEY_DELETE_COMMENT = "D"
+local KEY_TOGGLE_RESOLVED = "r"
+local KEY_TOGGLE_COLLAPSED = "x"
 local NAMESPACE = vim.api.nvim_create_namespace("peers-sidebar")
 local FOLDER_ICON = "󰉋"
 local OPEN_STATUS = "●"
@@ -45,6 +49,7 @@ local HIGHLIGHT_TAB_INACTIVE = "PeersSidebarTabInactive"
 local HIGHLIGHT_TAB_FILL = "PeersSidebarTabFill"
 local HIGHLIGHT_THREAD_META = "PeersSidebarThreadMeta"
 local HIGHLIGHT_COMMENT_ELISION = "PeersSidebarCommentElision"
+local HIGHLIGHT_THREAD_LOCATION_NOTE = "PeersSidebarThreadLocationNote"
 local HIGHLIGHT_THREAD_RESOLVED = "PeersSidebarThreadResolved"
 local STATUSLINE_ESCAPE_PATTERN = "([%%])"
 
@@ -86,6 +91,7 @@ local function define_highlights()
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_TAB_FILL, { default = true, link = "TabLineFill" })
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_THREAD_META, { default = true, link = "PeersDiffThreadMeta" })
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_COMMENT_ELISION, { default = true, link = "Comment" })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_THREAD_LOCATION_NOTE, { default = true, link = "PeersDiffThreadLocationNote" })
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_THREAD_RESOLVED, { default = true, fg = add_fg, bold = true })
 end
 
@@ -158,6 +164,14 @@ local function window_valid(state)
   return state and state.sidebar_win and vim.api.nvim_win_is_valid(state.sidebar_win)
 end
 
+local function composer_active(state)
+  return state
+    and (
+      (state.composer_win and vim.api.nvim_win_is_valid(state.composer_win))
+      or (state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf))
+    )
+end
+
 local function sidebar_windows(state)
   if not state or not state.sidebar_buf or not vim.api.nvim_buf_is_valid(state.sidebar_buf) then
     return {}
@@ -213,6 +227,9 @@ local function ensure_buffer(review_buf, state)
       group = state.sidebar_augroup,
       buffer = buf,
       callback = function()
+        if composer_active(state) then
+          return
+        end
         state.sidebar_has_focus = true
       end,
     })
@@ -271,6 +288,14 @@ end
 local function current_window_kind(review_buf, state)
   local current = vim.api.nvim_get_current_win()
   local current_buf = vim.api.nvim_win_get_buf(current)
+  if composer_active(state) then
+    if state.composer_buf and current_buf == state.composer_buf then
+      return "composer"
+    end
+    if state.composer_return_sidebar_focus and state.sidebar_buf and current_buf == state.sidebar_buf then
+      return "composer"
+    end
+  end
   if current_buf == review_buf then
     return "review"
   end
@@ -289,6 +314,9 @@ local function should_show(review_buf, state, focus, window_kind)
   end
   if window_kind == "sidebar" then
     return true
+  end
+  if window_kind == "composer" then
+    return window_valid(state) or can_show(review_buf, state)
   end
   if state.sidebar_has_focus then
     return true
@@ -393,6 +421,24 @@ end
 local function push_line(lines, rows, text, target)
   table.insert(lines, text)
   table.insert(rows, target or {})
+end
+
+local function span(col, width, highlight)
+  if not highlight or width <= 0 then
+    return nil
+  end
+  return {
+    col = col,
+    width = width,
+    highlight = highlight,
+  }
+end
+
+local function push_span(spans, col, width, highlight)
+  local item = span(col, width, highlight)
+  if item then
+    table.insert(spans, item)
+  end
 end
 
 local function sidebar_counts(state)
@@ -568,24 +614,19 @@ local function build_files(state)
       local name = shorten(file.name, width)
       local line = prefix .. name .. suffix
       local delta_col = #prefix + #name
-      local delta_highlights = {}
+      local spans = {}
+      push_span(spans, #file_prefix, 1, file_status_highlight(file.file_status))
       if suffix ~= "" then
         delta_col = delta_col + 1
         for _, part in ipairs(delta_parts) do
-          table.insert(delta_highlights, {
-            col = delta_col,
-            highlight = part.highlight,
-            width = #part.text,
-          })
+          push_span(spans, delta_col, #part.text, part.highlight)
           delta_col = delta_col + #part.text + 1
         end
       end
       push_line(lines, rows, line, {
-        delta_highlights = delta_highlights,
+        spans = spans,
         target_line = file.target_line,
         path = file.path,
-        status_col = #file_prefix,
-        status_highlight = file_status_highlight(file.file_status),
       })
     end
   end
@@ -609,6 +650,28 @@ local function thread_label(row)
   return name
 end
 
+local function thread_location_note(thread)
+  local placement = thread.anchor_placement
+  if placement == "exact" then
+    return "exact source match"
+  elseif placement == "per_line_hash" then
+    return "source lines match"
+  elseif placement == "moved_exact" then
+    return "moved exact source match"
+  elseif placement == "context" then
+    return "anchored by surrounding context"
+  elseif placement == "window" then
+    return "expanded source window"
+  elseif placement == "line_fallback" then
+    return "stale line fallback"
+  elseif placement == "file_fallback" then
+    return "file-level fallback"
+  elseif placement == "detached" then
+    return "detached from current source"
+  end
+  return "source location"
+end
+
 local function build_comments(state)
   local groups = {}
   local group_order = {}
@@ -627,10 +690,17 @@ local function build_comments(state)
           seen_comments = {},
           target_line = index,
           label = thread_label(row),
+          anchor_placement = row.anchor_placement,
+          collapsed = row.collapsed == true,
+          placement_state = row.placement_state,
           resolved = row.resolved == true,
+          summary = row.thread_summary,
         }
         by_id[row.thread_id] = thread
         table.insert(groups[dir], thread)
+      end
+      if row.thread_summary and not thread.summary then
+        thread.summary = row.thread_summary
       end
       if row.comment_id and row.comment_body and not thread.seen_comments[row.comment_id] then
         thread.seen_comments[row.comment_id] = true
@@ -650,19 +720,19 @@ local function build_comments(state)
     if comment.meta then
       local meta_prefix = "│ "
       local meta = meta_prefix .. shorten(comment.meta, WIDTH - display_width(meta_prefix))
+      local spans = {}
+      push_span(spans, 0, #meta_prefix, border_highlight)
+      push_span(spans, #meta_prefix, #meta - #meta_prefix, HIGHLIGHT_THREAD_META)
       push_line(lines, rows, meta, {
-        border_highlight = border_highlight,
-        border_width = #meta_prefix,
-        meta_highlight = HIGHLIGHT_THREAD_META,
-        meta_col = #meta_prefix,
-        meta_width = #meta - #meta_prefix,
+        spans = spans,
         target_line = comment.target_line,
       })
     end
     local body_prefix = "│ "
+    local spans = {}
+    push_span(spans, 0, #body_prefix, border_highlight)
     push_line(lines, rows, body_prefix .. shorten_end((comment.body or ""):match("[^\n]*") or "", WIDTH - display_width(body_prefix)), {
-      border_highlight = border_highlight,
-      border_width = #body_prefix,
+      spans = spans,
       target_line = comment.target_line,
     })
   end
@@ -671,12 +741,11 @@ local function build_comments(state)
     local elision_prefix = "│ "
     local label = "… " .. hidden_count .. " comments hidden …"
     local line = elision_prefix .. shorten_end(label, WIDTH - display_width(elision_prefix))
+    local spans = {}
+    push_span(spans, 0, #elision_prefix, border_highlight)
+    push_span(spans, #elision_prefix, #line - #elision_prefix, HIGHLIGHT_COMMENT_ELISION)
     push_line(lines, rows, line, {
-      border_highlight = border_highlight,
-      border_width = #elision_prefix,
-      elision_col = #elision_prefix,
-      elision_highlight = HIGHLIGHT_COMMENT_ELISION,
-      elision_width = #line - #elision_prefix,
+      spans = spans,
       target_line = thread.target_line,
     })
   end
@@ -691,10 +760,14 @@ local function build_comments(state)
       local status = thread.resolved and RESOLVED_STATUS or OPEN_STATUS
       local border_highlight = thread.resolved and HIGHLIGHT_THREAD_RESOLVED or nil
       local header_prefix = "╭─ " .. status .. " "
-      local header = header_prefix .. shorten(thread.label, WIDTH - display_width(header_prefix))
+      local header_suffix = thread.collapsed and (" [" .. #thread.comments .. "]") or ""
+      local header = header_prefix
+        .. shorten(thread.label, WIDTH - display_width(header_prefix) - display_width(header_suffix))
+        .. header_suffix
+      local header_spans = {}
+      push_span(header_spans, 0, #header_prefix, border_highlight)
       push_line(lines, rows, header, {
-        border_highlight = border_highlight,
-        border_width = #header_prefix,
+        spans = header_spans,
         target_line = thread.target_line,
       })
       if #thread.comments > 3 then
@@ -707,9 +780,14 @@ local function build_comments(state)
           push_comment(comment, border_highlight)
         end
       end
-      push_line(lines, rows, "╰─", {
-        border_highlight = border_highlight,
-        border_width = #"╰─",
+      local footer_prefix = "╰─ "
+      local footer_text = thread.collapsed and thread.summary or thread_location_note(thread)
+      local footer = footer_prefix .. shorten(footer_text or thread_location_note(thread), WIDTH - display_width(footer_prefix))
+      local footer_spans = {}
+      push_span(footer_spans, 0, #"╰─", border_highlight)
+      push_span(footer_spans, #footer_prefix, #footer - #footer_prefix, HIGHLIGHT_THREAD_LOCATION_NOTE)
+      push_line(lines, rows, footer, {
+        spans = footer_spans,
         target_line = thread.target_line,
       })
     end
@@ -764,37 +842,11 @@ local function render(review_buf, state)
   end
   vim.api.nvim_buf_clear_namespace(sidebar_buf, NAMESPACE, 0, -1)
   for index, row in ipairs(rows) do
-    if row.border_highlight then
-      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, 0, {
-        end_col = row.border_width or 0,
-        hl_group = row.border_highlight,
+    for _, item in ipairs(row.spans or {}) do
+      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, item.col, {
+        end_col = item.col + item.width,
+        hl_group = item.highlight,
       })
-    end
-    if row.meta_highlight then
-      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, row.meta_col or 0, {
-        end_col = (row.meta_col or 0) + (row.meta_width or 0),
-        hl_group = row.meta_highlight,
-      })
-    end
-    if row.elision_highlight then
-      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, row.elision_col or 0, {
-        end_col = (row.elision_col or 0) + (row.elision_width or 0),
-        hl_group = row.elision_highlight,
-      })
-    end
-    if row.status_col and row.status_highlight then
-      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, row.status_col, {
-        end_col = row.status_col + 1,
-        hl_group = row.status_highlight,
-      })
-    end
-    for _, delta in ipairs(row.delta_highlights or {}) do
-      if delta.highlight then
-        vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, delta.col, {
-          end_col = delta.col + delta.width,
-          hl_group = delta.highlight,
-        })
-      end
     end
   end
   restore_cursor(state)
@@ -836,6 +888,18 @@ local function set_sidebar_keymaps(buf, states)
   vim.keymap.set("n", KEY_OPEN, function()
     M.open_item(buf, states)
   end, { buffer = buf, desc = "Open Peers sidebar item", nowait = true })
+  vim.keymap.set("n", KEY_COMMENT, function()
+    M.review_action(buf, states, "comment")
+  end, { buffer = buf, desc = "Comment or reply in Peers review", nowait = true })
+  vim.keymap.set("n", KEY_DELETE_COMMENT, function()
+    M.review_action(buf, states, "delete")
+  end, { buffer = buf, desc = "Delete Peers comment", nowait = true })
+  vim.keymap.set("n", KEY_TOGGLE_RESOLVED, function()
+    M.review_action(buf, states, "toggle_resolved")
+  end, { buffer = buf, desc = "Resolve or reopen Peers thread", nowait = true })
+  vim.keymap.set("n", KEY_TOGGLE_COLLAPSED, function()
+    M.review_action(buf, states, "toggle_collapsed")
+  end, { buffer = buf, desc = "Collapse or expand Peers thread", nowait = true })
   vim.keymap.set("n", KEY_HIDE, function()
     M.hide(buf, states)
   end, { buffer = buf, desc = "Hide Peers sidebar", nowait = true })
@@ -971,6 +1035,31 @@ function M.open_item(buf, states)
   end
 end
 
+function M.review_action(buf, states, action)
+  local review_buf, state = review_state_for(buf, states)
+  if not state or not state.sidebar_rows then
+    return
+  end
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local item = state.sidebar_rows[cursor[1]]
+  if not item or not item.target_line then
+    return
+  end
+  local row = state.rows and state.rows[item.target_line] or nil
+  local buffer = require("peers.buffer")
+  if action == "comment" then
+    buffer.comment_or_reply(review_buf, row, item.target_line, {
+      return_win = vim.api.nvim_get_current_win(),
+    })
+  elseif action == "delete" then
+    buffer.delete_selected_comment(review_buf, row)
+  elseif action == "toggle_resolved" then
+    buffer.toggle_selected_thread_resolved(review_buf, row)
+  elseif action == "toggle_collapsed" then
+    buffer.toggle_selected_thread_collapsed(review_buf, row)
+  end
+end
+
 function M.mark_review_active(review_buf, states)
   local state = states[review_buf]
   if state and state.sidebar_has_focus and window_valid(state) then
@@ -985,11 +1074,9 @@ function M.mark_review_active(review_buf, states)
 end
 
 function M.set_review_keymaps(buf, states)
-  for _, key in ipairs({ KEY_FOCUS_REVIEW, string.upper(KEY_FOCUS_REVIEW) }) do
-    vim.keymap.set("n", key, function()
-      M.focus_review(buf, states)
-    end, { buffer = buf, desc = "Focus Peers diff", nowait = true })
-  end
+  vim.keymap.set("n", KEY_FOCUS_REVIEW, function()
+    M.focus_review(buf, states)
+  end, { buffer = buf, desc = "Focus Peers diff", nowait = true })
   for _, key in ipairs({ KEY_FILES, string.upper(KEY_FILES) }) do
     vim.keymap.set("n", key, function()
       M.show(buf, states, MODE_FILES, true)

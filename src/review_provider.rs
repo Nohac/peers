@@ -133,6 +133,7 @@ impl ReviewProvider {
                 updated_at: now.clone(),
                 provenance: CreationProvenance::from_target(&self.target),
                 resolved_head_oid: None,
+                collapsed: false,
                 archived_at: None,
                 pruned_at: None,
             },
@@ -333,6 +334,28 @@ impl ReviewProvider {
         self.updates.notify_review_changed();
         Ok(review)
     }
+
+    pub async fn toggle_thread_collapsed(
+        &self,
+        request: ThreadRequest,
+    ) -> Result<ReviewProjection> {
+        let thread_id = ThreadId::new(request.thread_id)?;
+        let mut thread = load_thread_payload(&self.repo_root, &thread_id).await?;
+        let now = now_rfc3339()?;
+        thread.collapsed = !thread.collapsed;
+        thread.updated_at = now.clone();
+        write_thread_payload(&self.repo_root, &thread).await?;
+        let event = PeersEvent::ThreadCollapseUpdated {
+            thread_id,
+            updated_at: now,
+            author: self.author.clone(),
+            collapsed: thread.collapsed,
+        };
+        append_peers_event(&self.repo_root, &event, Some(&self.target)).await?;
+        let review = self.get_review().await?;
+        self.updates.notify_review_changed();
+        Ok(review)
+    }
 }
 
 #[instrument(name = "load_initial_diff", skip_all, fields(contexts = contexts.len()))]
@@ -382,6 +405,7 @@ pub struct ReviewThread {
     pub anchor: ReviewThreadAnchor,
     pub resolved: bool,
     pub resolved_head_oid: Option<String>,
+    pub collapsed: bool,
     pub comments: Vec<ReviewComment>,
 }
 
@@ -704,6 +728,7 @@ fn review_thread(
         anchor,
         resolved: thread.resolved,
         resolved_head_oid: thread.resolved_head_oid.clone(),
+        collapsed: thread.collapsed,
         comments: thread
             .comments
             .iter()
@@ -933,6 +958,7 @@ mod tests {
                     }],
                     resolved: false,
                     resolved_head_oid: None,
+                    collapsed: false,
                     created_at: timestamp.clone(),
                     updated_at: timestamp,
                     archived_at: None,

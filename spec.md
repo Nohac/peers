@@ -294,6 +294,7 @@ Event kinds:
 - `thread_title_updated`
 - `thread_resolved`
 - `thread_reopened`
+- `thread_collapse_updated`
 - `thread_anchored`
 - `thread_archived`
 - `thread_pruned`
@@ -303,6 +304,8 @@ Derived state is rebuilt by loading thread/comment payloads and replaying events
 Agent comment disposition is distinct from thread resolution. An agent-authored comment may be pending, accepted, or declined. Accepting an agent comment means a human has acknowledged the feedback as valid or useful; it does not automatically apply code and does not automatically resolve the thread. Declining an agent comment means a human has explicitly rejected that feedback; if the declined comment is the only remaining actionable item in the thread, the UI may offer `Decline and resolve`, but the storage model should still record the decline and the resolve as separate events. The latest disposition event for a comment wins.
 
 Threads may have an optional short title stored in the thread payload and updated through an append-only `thread_title_updated` event. The title is display metadata for collapsed/resolved thread rows and summaries; it should be concise enough to remind the reader what the thread was about without reopening it. When an agent resolves a thread, it must set or update this title as part of the resolution flow. Human resolution may allow an optional title, but should not require one.
+
+Threads may also store durable UI metadata such as `collapsed: bool` in the thread payload. Toggling collapsed state should update the payload and append a lightweight `thread_collapse_updated` event containing the thread id, timestamp, author, and new collapsed value.
 
 `thread_archived` and `thread_pruned` are intended for `peers clean`. Prefer append-only cleanup events first. A later explicit compaction command may rewrite the event log into a smaller canonical form, but ordinary cleanup should not silently rewrite history.
 
@@ -637,6 +640,7 @@ Expected behavior:
 - Peers owns the render model. The `peersdiff` LSP exposes a custom `peers/renderReview` request that returns synthetic lines, row metadata, structural highlights, and symbol metadata derived from the shared review provider.
 - The Lua attachment layer applies rendered lines and extmarks to the synthetic buffer, while Rust remains the source of truth for row semantics and review data.
 - Structural highlights cover file headers, hunk headers, line numbers, add/delete gutter markers, and comment rows. Prefer gutter/prefix color over full-line color unless a stronger visual treatment is required.
+- Inline comment threads and the comment sidebar should share the same box-drawing shape: `╭─ <status glyph> <label>`, `│ <author/time>`, `│ <body>`, and `╰─ <anchor status>`. Inline diff threads include the repo path in the label and collapse expanded threads only when they exceed six messages. Sidebar comment threads omit the path from the label and collapse thread bodies when they exceed three messages. Expanded inline headers should use the compact open/resolved glyph instead of `[Open]`/`[Resolved]`, should not show `n comment(s)`, and should rely on the footer for anchor status such as `stale line fallback`.
 - Current-side added and context rows should mirror syntax/highlight state from hidden real file buffers so the review buffer follows the user's Neovim theme and language setup. This mirroring must be viewport-scoped for performance on large reviews. The current group-based approach can use Neovim inspection APIs such as `vim.inspect_pos`; if group/link behavior keeps diverging from visible source buffers, a future improvement is to resolve the inspected highlight stack into concrete foreground/style attributes per range, cache Peers-owned highlight groups by those attributes, and apply those concrete groups in the review buffer. Source background colors should usually not be copied because diff rows have Peers-owned backgrounds. Deleted/base-side rows may start with structural diff coloring only.
 - If Neovim has an unsaved modified buffer for a reviewed file, the synthetic review buffer must not render that file's diff. It should show a clear per-file warning instead and publish an error diagnostic on the review buffer so normal diagnostic navigation can find it. Peers should never silently reload or overwrite a modified user buffer.
 - Do not depend on Neovim folds or persistent split sidebars for the primary workflow.
@@ -660,7 +664,7 @@ Peers should keep a row map for each synthetic review buffer:
 review row -> repo path, side, source line/range, source column mapping, thread/comment identity
 ```
 
-Row metadata should be rich enough for context-aware actions: source rows include line/range anchor data, file and hunk rows include file scope, and comment rows include thread id, comment id, comment body, author kind, ownership/editability, invalidation risk, resolved state, and any agent comment disposition.
+Row metadata should be rich enough for context-aware actions: source rows include line/range anchor data, file and hunk rows include file scope, and comment rows include thread id, comment id, comment body, author kind, ownership/editability, invalidation risk, resolved state, collapsed state, and any agent comment disposition.
 
 Neovim sidebar:
 
@@ -669,8 +673,9 @@ Neovim sidebar:
 - Sidebar visibility is driven by the active window: while the sidebar is focused, live updates and resizes must keep it open and preserve focus unless the user presses `q` or `d`; while the main review/diff window is focused, hide the sidebar when that window is 90 columns or narrower, and keep or restore it above 90 columns unless the user explicitly closed it with `q`.
 - The sidebar has at least two modes: changed/visible files and comment/thread overview. It should preserve its mode and cursor independently from the main review cursor across refreshes.
 - File sidebar content should group files by parent path, render the directory row before file rows, use box-drawing border/tree glyphs rather than ASCII separators, and include compact colored Git status letters (`A`, `M`, `D`, `R`, `U`, `B`) plus added, removed, and net-delta line counts.
-- Comment sidebar content should use the same box-drawing visual language as inline comments, including compact open/resolved status glyphs.
-- From either the review buffer or the sidebar, normal-mode `d`/`D` focuses the main diff/review view, `o`/`O` opens or focuses the files sidebar mode, and `i`/`I` opens or focuses the comments sidebar mode.
+- Comment sidebar content should use the same box-drawing visual language as inline comments, including compact open/resolved status glyphs and an anchor-status footer.
+- From either the review buffer or the sidebar, normal-mode `o`/`O` opens or focuses the files sidebar mode, and `i`/`I` opens or focuses the comments sidebar mode. In the sidebar, normal-mode `d` focuses the main diff/review view.
+- Review-owned shortcut actions should work from both the review buffer and sidebar when the selected row has enough metadata: `c` opens the composer or replies to the selected thread/comment, `D` deletes the selected editable comment with confirmation, `r` toggles the selected thread between resolved and reopened, and `x` toggles collapsed/expanded thread state. Sidebar actions proxy through the owning review buffer rather than running a separate LSP client.
 - In the sidebar, `<CR>` jumps the main review window to the selected file/thread/comment row. `q` hides the sidebar.
 - Sidebar buffers are read-only review UI surfaces, so normal-mode insert keys such as `i`, `o`, and related uppercase variants may be remapped there.
 - Limitation: Neovim does not provide a native way to make a focusable sidebar window delegate arbitrary buffer/window commands to its attached review window. Because the sidebar uses `winfixbuf`, buffer-switching commands issued while focused in the sidebar may be blocked or no-op depending on the caller. Users should press `d` to return to the review window or `q` to close the sidebar before normal buffer/window operations.
@@ -921,7 +926,7 @@ Inline thread behavior:
 - Existing threads render directly below their anchored line or range in both diff and full-file views.
 - Multiple threads on the same line or range render in a stable order by creation time.
 - Resolved threads may be collapsed by default, but unresolved threads should be visible without opening a side panel.
-- Collapsed resolved threads should show the thread title when present, plus compact status/metadata, so the row remains useful as a context reminder.
+- Collapsed threads should show a compact header with status/count metadata and the thread title when present, so the row remains useful as a context reminder.
 - Reply, edit, delete, resolve, and reopen actions are available from the inline thread.
 - Creating a new thread opens the composer inline at the selected range after the comment affordance is clicked.
 - If an anchor becomes outdated or detached, show the thread inline at the best relocated position when possible; otherwise show it in a clear detached/outdated section for that file.
