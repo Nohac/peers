@@ -2154,6 +2154,45 @@ function M.toggle_selected_thread_collapsed(buf, row, line, opts)
   M.toggle_thread_collapsed(buf, { thread_id = row.thread_id, row = row })
 end
 
+function M.ask_agent(buf, prompt)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    vim.notify("Peers agent invocation is only available in a Peers review buffer", vim.log.levels.WARN)
+    return
+  end
+  prompt = vim.trim(prompt or "")
+  if prompt == "" then
+    vim.notify("Peers agent prompt is empty", vim.log.levels.WARN)
+    return
+  end
+
+  lsp.ask_agent(state.client_id, buf, {
+    prompt = prompt,
+  }, function(result)
+    local suffix = result and result.thread_id and (" to " .. result.thread_id) or ""
+    vim.notify("Peers agent request sent" .. suffix, vim.log.levels.INFO)
+  end)
+end
+
+function M.respond_to_thread(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state or not input or not input.thread_id then
+    vim.notify("Peers agent thread response is only available on comment threads", vim.log.levels.WARN)
+    return
+  end
+
+  M.ask_agent(
+    buf,
+    "Please respond to Peers thread `"
+      .. input.thread_id
+      .. "`. Inspect the thread and current code context, then reply using `peers comment --agent \"Codex (GPT-5)\" reply "
+      .. input.thread_id
+      .. " --body ...`. Do not make code changes unless the thread explicitly asks for them."
+  )
+end
+
 function M.is_review_buffer(buf)
   return RENDER_STATES[buf or vim.api.nvim_get_current_buf()] ~= nil
 end

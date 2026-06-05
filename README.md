@@ -62,9 +62,12 @@ peers comment resolve thr_123
 Agent-oriented usage:
 
 ```bash
-peers --agent comment add --path src/foo.rs --side new --lines 42:47 --body-file -
+peers agent codex
+peers comment --agent "Codex (GPT-5)" add --path src/foo.rs --side new --lines 42:47 --body-file -
 peers agent-context
 ```
+
+Inside Neovim, `:PeersAgent <prompt>` sends a prompt to the active Codex app-server session recorded in `.peers/agent-session.json`.
 
 Neovim session usage:
 

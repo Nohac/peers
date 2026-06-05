@@ -8,6 +8,7 @@ local AUGROUP = "peers-nvim-session"
 local COMMAND = "Peers"
 local COMMAND_REVIEW = "PeersReview"
 local COMMAND_COMMENT = "PeersComment"
+local COMMAND_AGENT = "PeersAgent"
 local COMMAND_STOP = "PeersStop"
 local SUBCOMMAND_DIFF = "diff"
 local SUBCOMMAND_REVIEW = "review"
@@ -72,6 +73,12 @@ local function define_commands()
   vim.api.nvim_create_user_command(COMMAND_COMMENT, function()
     buffer.comment_current()
   end, {})
+
+  vim.api.nvim_create_user_command(COMMAND_AGENT, function(command)
+    buffer.ask_agent(nil, command.args)
+  end, {
+    nargs = "+",
+  })
 end
 
 local function define_autocmds()

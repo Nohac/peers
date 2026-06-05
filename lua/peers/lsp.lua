@@ -12,6 +12,7 @@ local DELETE_COMMENT_METHOD = "peers/deleteComment"
 local RESOLVE_THREAD_METHOD = "peers/resolveThread"
 local REOPEN_THREAD_METHOD = "peers/reopenThread"
 local TOGGLE_THREAD_COLLAPSED_METHOD = "peers/toggleThreadCollapsed"
+local ASK_AGENT_METHOD = "peers/askAgent"
 local REVIEW_UPDATED_NOTIFICATION = "peers/reviewUpdated"
 local COMMAND_ADD_COMMENT = "peers.addComment"
 local COMMAND_REPLY = "peers.reply"
@@ -20,6 +21,7 @@ local COMMAND_DELETE_COMMENT = "peers.deleteComment"
 local COMMAND_RESOLVE_THREAD = "peers.resolveThread"
 local COMMAND_REOPEN_THREAD = "peers.reopenThread"
 local COMMAND_TOGGLE_THREAD_COLLAPSED = "peers.toggleThreadCollapsed"
+local COMMAND_RESPOND_TO_THREAD = "peers.respondToThread"
 local INVALID_LSP_URL_ERROR = "Invalid nvim_lsp_url: "
 local RENDER_READY_TIMEOUT = 5000
 local RENDER_READY_INTERVAL = 50
@@ -49,6 +51,7 @@ local COMMAND_HANDLERS = {
   [COMMAND_RESOLVE_THREAD] = "resolve_thread",
   [COMMAND_REOPEN_THREAD] = "reopen_thread",
   [COMMAND_TOGGLE_THREAD_COLLAPSED] = "toggle_thread_collapsed",
+  [COMMAND_RESPOND_TO_THREAD] = "respond_to_thread",
 }
 
 local MUTATION_METHODS = {
@@ -238,6 +241,23 @@ for function_name, method in pairs(MUTATION_METHODS) do
   M[function_name] = function(client_id, buf, request, on_render)
     mutate(client_id, buf, method, request, on_render)
   end
+end
+
+function M.ask_agent(client_id, buf, request, on_done)
+  local client = vim.lsp.get_client_by_id(client_id)
+  if not client then
+    return
+  end
+
+  client:request(ASK_AGENT_METHOD, request, function(error, result)
+    if error then
+      vim.notify(error.message or tostring(error), vim.log.levels.ERROR)
+      return
+    end
+    if on_done then
+      on_done(result)
+    end
+  end, buf)
 end
 
 return M

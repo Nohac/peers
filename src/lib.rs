@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod anchors;
 pub mod cli;
 pub mod comments;

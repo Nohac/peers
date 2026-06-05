@@ -142,10 +142,72 @@ Agent support:
 
 ```bash
 peers skill
-peers --agent comment add ...
-peers --author-kind agent --author-name Codex comment reply ...
+peers --agent "Codex (GPT-5)" review
+peers comment --agent "Codex (GPT-5)" reply ...
 peers agent-context
+peers agent -- codex --remote %addr
+peers agent codex
+peers agent attach --addr ws://127.0.0.1:4500
 ```
+
+`peers agent` is a launcher/session wrapper, not a model API client. It should start or attach to a local agent server, write `.peers/agent-session.json`, expand template variables in the user command, and then run the command the user supplied. Peers owns the local session metadata and prompt construction; the external agent owns authentication, model selection, tools, permissions, and its normal TUI behavior.
+
+The generic launcher form is:
+
+```bash
+peers agent [--listen ws|<addr>] -- <command> [args...]
+```
+
+Template variables are expanded in the command before launching:
+
+```text
+%addr       Full agent server address, such as ws://127.0.0.1:4500
+%host       Agent server host, usually 127.0.0.1
+%port       Agent server port
+%repo       Repository root
+%session    Path to .peers/agent-session.json
+```
+
+The built-in Codex convenience preset:
+
+```bash
+peers agent codex
+```
+
+is equivalent to a template like:
+
+```bash
+peers agent -- codex --remote %addr
+```
+
+Use a loopback websocket listener for local Codex integration for now. Peers should allocate a free local port by binding `127.0.0.1:0`, start `codex app-server --listen ws://127.0.0.1:<port>`, validate the endpoint, and then launch the user's agent command with `%addr` expanded to the selected address. This avoids hardcoding ports while also avoiding Codex's implicit Unix socket path behavior, where `unix://` does not reveal a stable path and explicit paths may fail depending on the environment. If the port is claimed between allocation and app-server startup, Peers should retry with a newly allocated port.
+
+Existing agent sessions can be attached explicitly:
+
+```bash
+peers agent attach --addr ws://127.0.0.1:4500
+```
+
+Attach should validate that the local app-server endpoint is reachable before writing `.peers/agent-session.json`. Neovim agent actions should read `.peers/agent-session.json`; if no usable agent session exists, they should show a concise prompt suggesting `peers agent codex` or `peers agent attach --addr <addr>`.
+
+The Neovim integration should route agent engagement through the existing `peersdiff` LSP connection rather than shelling out from Lua. The first narrow surface is a prompt-based `peers/askAgent` custom method exposed as `:PeersAgent <prompt>`. The backend reads `.peers/agent-session.json`, connects to the Codex app-server websocket, finds the most recent loaded thread for the repo working directory, and submits a `turn/start` text input. Codex-specific protocol and websocket details belong in a dedicated Rust module; the higher-level agent/session module should remain responsible for launcher/session metadata. A later refactor should introduce a small generic agent trait before adding non-Codex providers.
+
+Future `.peers/config.toml` support should allow local presets without hardcoding one agent:
+
+```toml
+[agent]
+default = "codex"
+
+[agent.presets.codex]
+listen = "ws"
+command = ["codex", "--remote", "%addr"]
+```
+
+The first implemented agent engagement actions should be:
+
+- Review open comments without code changes.
+- Create a Peers comment and immediately ask the agent to respond/follow up.
+- Ask the agent to fix selected/open comments, with instructions to reply and resolve through the Peers CLI.
 
 Any Peers command that needs live repo state should attach to the local Peers process when one is running, or start one when necessary. Commands that only print static help, such as `peers skill`, do not need a session. Neovim is an attachment surface for the same process rather than a separate command namespace.
 
@@ -160,8 +222,9 @@ The file includes the process id, current repo/view metadata, Vox URL, `peersdif
 Environment overrides:
 
 ```bash
-PEERS_AUTHOR_KIND=agent
-PEERS_AUTHOR_NAME=Codex
+PEERS_AGENT="Codex (GPT-5)"
+PEERS_AUTHOR_NAME="Jonas"
+PEERS_AUTHOR_EMAIL="jonas@example.com"
 ```
 
 ## Review Modes
@@ -232,7 +295,7 @@ Author kinds:
 - `human`
 - `agent`
 
-If an agent identity is not specified, use `ai agent`.
+Agent identity must be explicit for agent-authored comments and agent-launched Peers sessions. `peers comment --agent <identity>` records the provided identity directly, and root `peers --agent <identity>` can be used for agent-launched sessions. There is no generic fallback agent name.
 
 Identity is descriptive, not a security boundary. Edit/delete ownership is soft and local.
 
@@ -1104,9 +1167,10 @@ Current status:
 | CLI skeleton | Partial | Commands exist, `peers skill` prints an agent workflow overview, and `peers diff`/`peers review` launch repo-scoped local sessions. |
 | Repo-scoped comment architecture | Partial | Canonical storage is now one repo-level event log plus per-thread/comment payload files. Projection relocation remains basic. |
 | Review storage/event log | Partial | Append-only JSONL now records lightweight comment/thread actions under `.peers/events.jsonl`; payloads live under `.peers/threads/`. |
-| Author detection and overrides | Complete | Git config, CLI flags, `PEERS_*` env vars, and agent fallback identity are implemented. |
+| Author detection and overrides | Complete | Git config, CLI flags, `PEERS_*` env vars, and explicit agent identity are implemented. |
 | CLI comment operations | Partial | List/add/reply/edit/delete/resolve/reopen operate on repo-scoped state; richer projection filtering remains. |
 | `peers clean` | Partial | Cleanup previews and archives resolved candidates with confirmation unless explicitly non-interactive; detached/hidden/age policies remain coarse. |
+| Agent launcher/session wrapper | Partial | `peers agent codex`, `peers agent -- <template>`, `peers agent attach --addr ws://...`, and initial Neovim `:PeersAgent <prompt>` invocation are implemented for loopback websocket Codex app-server sessions. Rich comment-aware prompts and a generic agent trait remain. |
 | Agent comment accept/decline | Planned | Agent-authored comments should expose accept/decline code actions and append explicit disposition events without conflating disposition with thread resolution. |
 | Thread titles | Planned | Agent resolution should set a short thread title so collapsed resolved threads can show a useful reminder without expanding the full conversation. |
 | Anchor relocation and visibility policy | Planned | Rich content/context anchors and aggressive unresolved vs conservative resolved visibility are specified but not implemented. |

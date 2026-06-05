@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
+use crate::agent::AgentLaunchRequest;
 use crate::comments::{AuthorKind, CommentThread, PeersEvent, PeersState};
 use crate::diff::{CommentAnchor, FileSide, ReviewTarget};
 use crate::logging;
@@ -55,6 +56,7 @@ Core commands:
 - `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..."`
 - `peers comment --agent "Codex (GPT-5)" resolve <thread-id>`
 - `peers clean --dry-run`
+- `peers agent codex`
 - `peers agent-context`
 
 Notes:
@@ -91,6 +93,7 @@ enum Command {
     Review(ReviewArgs),
     Comment(CommentArgs),
     Clean(CleanArgs),
+    Agent(AgentArgs),
     AgentContext,
 }
 
@@ -108,6 +111,14 @@ struct ReviewArgs {
     base: String,
     #[arg(long, default_value = "HEAD")]
     head: String,
+}
+
+#[derive(Args)]
+struct AgentArgs {
+    #[arg(long, default_value = "ws")]
+    listen: String,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Args)]
@@ -325,6 +336,7 @@ pub async fn run() -> Result<()> {
         }
         Command::Comment(args) => handle_comment(args, &repo.root, repo.author).await?,
         Command::Clean(args) => handle_clean(args, &repo.root, repo.author).await?,
+        Command::Agent(args) => handle_agent(args, &repo.root).await?,
         Command::AgentContext => {
             regenerate_outputs(&repo.root, None).await?;
             println!("{}", peers_paths(&repo.root).agent_context.display());
@@ -332,6 +344,46 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn handle_agent(args: AgentArgs, repo_root: &Path) -> Result<()> {
+    let mut command = args.command;
+    if matches!(command.first().map(String::as_str), Some("attach")) {
+        command.remove(0);
+        let address = parse_agent_attach_address(&command)?;
+        crate::agent::attach_agent(repo_root, &address).await?;
+        println!("Attached agent session at {address}.");
+        println!("{}", peers_paths(repo_root).agent_session.display());
+        return Ok(());
+    }
+
+    crate::agent::launch_agent(
+        repo_root,
+        AgentLaunchRequest {
+            listen: args.listen,
+            command,
+        },
+    )
+    .await
+}
+
+fn parse_agent_attach_address(args: &[String]) -> Result<String> {
+    let mut address = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--addr" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(anyhow!("`peers agent attach --addr` requires a value"));
+                };
+                address = Some(value.clone());
+                index += 2;
+            }
+            value => return Err(anyhow!("unexpected agent attach argument `{value}`")),
+        }
+    }
+
+    address.ok_or_else(|| anyhow!("`peers agent attach` requires `--addr ws://host:port`"))
 }
 
 fn diff_target(args: DiffArgs) -> ReviewTarget {

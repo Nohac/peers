@@ -10,6 +10,7 @@ use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::instrument;
 
+use crate::agent::AgentInvocationRequest;
 use crate::anchors::{AnchorLinePlacement, AnchorPlacement};
 use crate::comments::{Author, AuthorKind, CommentThread};
 use crate::diff::{DiffSection, FileSide, FileStatus, LineRange};
@@ -57,7 +58,7 @@ const COMMAND_DELETE_COMMENT: &str = "peers.deleteComment";
 const COMMAND_RESOLVE_THREAD: &str = "peers.resolveThread";
 const COMMAND_REOPEN_THREAD: &str = "peers.reopenThread";
 const COMMAND_TOGGLE_THREAD_COLLAPSED: &str = "peers.toggleThreadCollapsed";
-const COMMAND_ASK_AGENT: &str = "peers.askAgent";
+const COMMAND_RESPOND_TO_THREAD: &str = "peers.respondToThread";
 
 const ACTION_ADD_LINE_COMMENT: &str = "Peers: Add line comment";
 const ACTION_ADD_RANGE_COMMENT_PREFIX: &str = "Peers: Add comment on lines";
@@ -68,6 +69,7 @@ const ACTION_DELETE_COMMENT: &str = "Peers: Delete comment";
 const ACTION_RESOLVE_THREAD: &str = "Peers: Resolve thread";
 const ACTION_REOPEN_THREAD: &str = "Peers: Reopen thread";
 const ACTION_TOGGLE_THREAD_COLLAPSED: &str = "Peers: Toggle collapse";
+const ACTION_RESPOND_TO_THREAD: &str = "Peers: Respond to thread";
 const NOTIFICATION_REVIEW_UPDATED: &str = "peers/reviewUpdated";
 const METHOD_RENDER_REVIEW: &str = "peers/renderReview";
 const METHOD_CREATE_THREAD: &str = "peers/createThread";
@@ -77,6 +79,7 @@ const METHOD_DELETE_COMMENT: &str = "peers/deleteComment";
 const METHOD_RESOLVE_THREAD: &str = "peers/resolveThread";
 const METHOD_REOPEN_THREAD: &str = "peers/reopenThread";
 const METHOD_TOGGLE_THREAD_COLLAPSED: &str = "peers/toggleThreadCollapsed";
+const METHOD_ASK_AGENT: &str = "peers/askAgent";
 const PARAM_SCOPE: &str = "scope";
 const PARAM_PATH: &str = "path";
 const PARAM_SIDE: &str = "side";
@@ -88,6 +91,7 @@ const PARAM_COMMENT_ID: &str = "comment_id";
 const PARAM_CONTEXT: &str = "context";
 const PARAM_LINE_LABEL: &str = "line_label";
 const PARAM_ANCHOR_PLACEMENT: &str = "anchor_placement";
+const PARAM_PROMPT: &str = "prompt";
 const LSP_INVALID_PARAMS: &str = "invalid Peers request params";
 const LSP_MISSING_FIELD: &str = "missing field";
 const LSP_INVALID_FIELD: &str = "invalid field";
@@ -344,6 +348,14 @@ impl PeersDiffLanguageServer {
             rendered_review.sidebar_counts,
         ))
     }
+
+    async fn ask_agent(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = ask_agent_request(&params)?;
+        let response = crate::agent::invoke_agent(self.provider.repo_root(), request)
+            .await
+            .map_err(|error| LspError::invalid_params(error.to_string()))?;
+        Ok(lsp_payload(response))
+    }
 }
 
 impl LanguageServer for PeersDiffLanguageServer {
@@ -371,7 +383,7 @@ impl LanguageServer for PeersDiffLanguageServer {
                         COMMAND_RESOLVE_THREAD.to_string(),
                         COMMAND_REOPEN_THREAD.to_string(),
                         COMMAND_TOGGLE_THREAD_COLLAPSED.to_string(),
-                        COMMAND_ASK_AGENT.to_string(),
+                        COMMAND_RESPOND_TO_THREAD.to_string(),
                     ],
                     ..Default::default()
                 }),
@@ -504,6 +516,7 @@ async fn serve_lsp_connection(stream: TcpStream, provider: ReviewProvider) -> Re
                 METHOD_TOGGLE_THREAD_COLLAPSED,
                 PeersDiffLanguageServer::toggle_thread_collapsed,
             )
+            .custom_method(METHOD_ASK_AGENT, PeersDiffLanguageServer::ask_agent)
             .finish();
     Server::new(read, write, socket).serve(service).await;
     Ok(())
@@ -1108,6 +1121,14 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
                     }
                 }
             }
+        }
+
+        for thread in file_threads
+            .iter()
+            .copied()
+            .filter(|thread| thread_needs_file_fallback_block(thread))
+        {
+            push_thread_block(&mut rendered, thread);
         }
 
         for thread in file_threads
@@ -1852,6 +1873,13 @@ fn push_inline_threads(
     }
 }
 
+fn thread_needs_file_fallback_block(thread: &ReviewThread) -> bool {
+    thread.scope == THREAD_SCOPE_LINE
+        && thread.path.is_some()
+        && thread.anchor.start_line.is_none()
+        && thread.anchor.end_line.is_none()
+}
+
 fn thread_matches_line(thread: &ReviewThread, path: &str, side: &str, line: u32) -> bool {
     thread.scope == THREAD_SCOPE_LINE
         && thread.path.as_deref() == Some(path)
@@ -2383,6 +2411,11 @@ fn comment_row_actions(row: &RenderedRow) -> CodeActionResponse {
             COMMAND_REPLY,
             Some(vec![thread_arg(thread_id)]),
         ));
+        actions.push(command_action(
+            ACTION_RESPOND_TO_THREAD.to_string(),
+            COMMAND_RESPOND_TO_THREAD,
+            Some(vec![thread_arg(thread_id)]),
+        ));
         if row.resolved.unwrap_or(false) {
             actions.push(command_action(
                 ACTION_REOPEN_THREAD.to_string(),
@@ -2780,6 +2813,12 @@ fn thread_request(params: &LSPAny) -> LspResult<ThreadRequest> {
     })
 }
 
+fn ask_agent_request(params: &LSPAny) -> LspResult<AgentInvocationRequest> {
+    Ok(AgentInvocationRequest {
+        prompt: required_string_param(params, PARAM_PROMPT)?,
+    })
+}
+
 fn thread_render_context(params: &LSPAny) -> LspResult<ThreadRenderContext> {
     let Some(LSPAny::Object(context)) = object_param(params)?.get(PARAM_CONTEXT) else {
         return Err(LspError::invalid_params(format!(
@@ -2904,6 +2943,52 @@ mod tests {
     use crate::review_provider::{ReviewThreadAnchor, ReviewThreadLinePlacement};
 
     use super::*;
+
+    fn action_titles(actions: CodeActionResponse) -> Vec<String> {
+        actions
+            .into_iter()
+            .map(|action| match action {
+                CodeActionOrCommand::Command(command) => command.title,
+                CodeActionOrCommand::CodeAction(action) => action.title,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn respond_to_thread_code_action_only_appears_on_comment_rows() {
+        let rendered = RenderedReview {
+            lines: vec!["comment".to_string(), "source".to_string()],
+            rows: vec![
+                RenderedRow {
+                    thread_id: Some("thr_1".to_string()),
+                    ..RenderedRow::meta(ROW_KIND_COMMENT)
+                },
+                RenderedRow::source(ROW_KIND_CONTEXT, "src/main.rs", SIDE_NEW, 1),
+            ],
+            highlights: Vec::new(),
+            symbols: Vec::new(),
+            sidebar: RenderedSidebar::default(),
+            sidebar_counts: RenderedSidebarCounts::default(),
+        };
+
+        let comment_titles = action_titles(code_actions_for_range(
+            &rendered,
+            Range {
+                start: Position::new(0, 0),
+                end: Position::new(0, 0),
+            },
+        ));
+        let source_titles = action_titles(code_actions_for_range(
+            &rendered,
+            Range {
+                start: Position::new(1, 0),
+                end: Position::new(1, 0),
+            },
+        ));
+
+        assert!(comment_titles.contains(&ACTION_RESPOND_TO_THREAD.to_string()));
+        assert!(!source_titles.contains(&ACTION_RESPOND_TO_THREAD.to_string()));
+    }
 
     #[test]
     fn renders_unchanged_files_with_open_comments() {
@@ -3180,6 +3265,114 @@ mod tests {
                 .iter()
                 .any(|highlight| { highlight.group == HIGHLIGHT_THREAD_LOCATION_NOTE })
         );
+    }
+
+    #[test]
+    fn renders_line_thread_relocated_to_file_fallback() {
+        let rendered = render_review_payload(ReviewProjection {
+            review_id: "repo".to_string(),
+            target_label: "working tree".to_string(),
+            current_head_oid: Some("head-1".to_string()),
+            is_branch_review: false,
+            files: vec![ReviewFile {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                is_changed: true,
+                comment_count: 1,
+                added_lines: 1,
+                removed_lines: 0,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                crate::diff::FileContent {
+                    old: None,
+                    new: Some(vec!["fn main() {}".to_string()]),
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                FileDiff {
+                    path: "src/main.rs".to_string(),
+                    hunks: vec![crate::diff::DiffHunk {
+                        old: None,
+                        new: Some(crate::diff::LineRange { start: 1, end: 1 }),
+                        sections: vec![crate::diff::DiffSection::Added {
+                            added: crate::diff::NewRange {
+                                new: crate::diff::LineRange { start: 1, end: 1 },
+                            },
+                        }],
+                    }],
+                },
+            )]),
+            threads: vec![ReviewThread {
+                id: "thread-1".to_string(),
+                scope: THREAD_SCOPE_LINE.to_string(),
+                path: Some("src/main.rs".to_string()),
+                line_label: "src/main.rs:360-406".to_string(),
+                anchor: ReviewThreadAnchor {
+                    side: Some(SIDE_NEW.to_string()),
+                    start_line: None,
+                    end_line: None,
+                    placement: Some(AnchorPlacement::FileFallback),
+                    line_placements: Vec::new(),
+                },
+                resolved: false,
+                resolved_head_oid: None,
+                collapsed: false,
+                comments: vec![ReviewComment {
+                    comment: Comment {
+                        id: CommentId::from_raw("cmt_test"),
+                        thread_id: ThreadId::from_raw("thr_test"),
+                        author: Author {
+                            kind: AuthorKind::Human,
+                            display_name: "jonas".to_string(),
+                            email: None,
+                        },
+                        body: "deleted range".to_string(),
+                        created_at: PeersTimestamp::from_rfc3339_unchecked("2026-05-28T12:00:00Z"),
+                        edited_at: None,
+                        deleted_at: None,
+                    },
+                    can_edit: true,
+                }],
+            }],
+            review_threads: Vec::new(),
+            commits: Vec::new(),
+        });
+
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.contains("deleted range"))
+        );
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.contains("file-level fallback"))
+        );
+        assert!(rendered.rows.iter().any(|row| {
+            row.kind == ROW_KIND_COMMENT && row.thread_id.as_deref() == Some("thread-1")
+        }));
+        assert!(
+            rendered
+                .sidebar
+                .comments
+                .lines
+                .iter()
+                .any(|line| line.contains("deleted range"))
+        );
+        assert!(
+            rendered
+                .sidebar
+                .comments
+                .lines
+                .iter()
+                .any(|line| line.contains("file-level fallback"))
+        );
+        assert_eq!(rendered.sidebar_counts.comments, 1);
     }
 
     #[test]
