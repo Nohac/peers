@@ -118,14 +118,6 @@ impl Author {
             email: None,
         }
     }
-
-    pub fn fallback_agent() -> Self {
-        Self {
-            kind: AuthorKind::Agent,
-            display_name: "ai agent".to_string(),
-            email: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]

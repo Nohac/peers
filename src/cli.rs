@@ -40,8 +40,8 @@ Agent workflow:
 2. Use each thread anchor to inspect the referenced file and line/range.
 3. Make the requested code changes in the working tree.
 4. Run the relevant project checks.
-5. Reply to each addressed thread with `peers --agent comment reply <thread-id> --body "..."`
-6. Resolve completed threads with `peers --agent comment resolve <thread-id>`.
+5. Reply to each addressed thread with `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "..."`
+6. Resolve completed threads with `peers comment --agent "Codex (GPT-5)" resolve <thread-id>`.
 7. If a comment cannot be addressed, reply with the blocker instead of resolving it.
 
 Core commands:
@@ -51,9 +51,9 @@ Core commands:
 - `peers review --base main --head HEAD`
 - `peers comment list --status open --context`
 - `peers comment list --status open --context 5`
-- `peers comment add --path src/foo.rs --side new --lines 42:47 --body "..."`
-- `peers comment reply <thread-id> --body "Done: ..."`
-- `peers comment resolve <thread-id>`
+- `peers comment --human add --path src/foo.rs --side new --lines 42:47 --body "..."`
+- `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..."`
+- `peers comment --agent "Codex (GPT-5)" resolve <thread-id>`
 - `peers clean --dry-run`
 - `peers agent-context`
 
@@ -61,6 +61,9 @@ Notes:
 - Prefer the CLI over editing `.peers/events.jsonl` or payload files manually.
 - Comment ids start with `cmt_`; thread ids start with `thr_`.
 - Open means unresolved. Complete means resolved.
+- Comment mutations require exactly one explicit author flag: `--human` or `--agent <identity>`.
+- Agents should identify themselves with their model, for example `--agent "Codex (GPT-5)"`.
+- Root `--agent <identity>` can also be supplied via `PEERS_AGENT`.
 - Use `--body-file -` to read a multiline reply body from stdin.
 "#;
 
@@ -68,13 +71,11 @@ Notes:
 #[command(name = "peers")]
 #[command(about = "Local Git review tool")]
 pub struct Cli {
-    #[arg(long)]
-    agent: bool,
-    #[arg(long, value_enum)]
-    author_kind: Option<AuthorKindArg>,
-    #[arg(long)]
+    #[arg(long, env = "PEERS_AGENT", value_name = "IDENTITY")]
+    agent: Option<String>,
+    #[arg(long, env = "PEERS_AUTHOR_NAME")]
     author_name: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "PEERS_AUTHOR_EMAIL")]
     author_email: Option<String>,
     #[arg(long, hide = true, global = true)]
     nvim_listen: Option<String>,
@@ -88,10 +89,7 @@ enum Command {
     Skill,
     Diff(DiffArgs),
     Review(ReviewArgs),
-    Comment {
-        #[command(subcommand)]
-        command: CommentCommand,
-    },
+    Comment(CommentArgs),
     Clean(CleanArgs),
     AgentContext,
 }
@@ -110,6 +108,14 @@ struct ReviewArgs {
     base: String,
     #[arg(long, default_value = "HEAD")]
     head: String,
+}
+
+#[derive(Args)]
+struct CommentArgs {
+    #[command(flatten)]
+    author: CommentAuthorArgs,
+    #[command(subcommand)]
+    command: CommentCommand,
 }
 
 #[derive(Subcommand)]
@@ -197,6 +203,51 @@ struct ThreadCommandArgs {
 }
 
 #[derive(Args)]
+struct CommentAuthorArgs {
+    #[arg(
+        id = "comment_human",
+        long = "human",
+        global = true,
+        conflicts_with = "comment_agent"
+    )]
+    human: bool,
+    #[arg(
+        id = "comment_agent",
+        long = "agent",
+        global = true,
+        conflicts_with = "comment_human",
+        value_name = "IDENTITY"
+    )]
+    agent: Option<String>,
+}
+
+impl CommentAuthorArgs {
+    fn selection(&self) -> Result<CommentAuthorSelection> {
+        match (self.human, self.agent.as_deref()) {
+            (true, None) => Ok(CommentAuthorSelection::Human),
+            (false, Some(identity)) => {
+                let identity = identity.trim();
+                if identity.is_empty() {
+                    return Err(anyhow!("agent identity cannot be empty"));
+                }
+                Ok(CommentAuthorSelection::Agent(identity.to_string()))
+            }
+            (false, None) => Err(anyhow!(
+                "comment mutations require an explicit author: pass either `--human` or `--agent <identity>`"
+            )),
+            (true, Some(_)) => Err(anyhow!(
+                "comment mutations accept only one author flag: pass either `--human` or `--agent <identity>`"
+            )),
+        }
+    }
+}
+
+enum CommentAuthorSelection {
+    Human,
+    Agent(String),
+}
+
+#[derive(Args)]
 struct CleanArgs {
     #[arg(long)]
     dry_run: bool,
@@ -215,21 +266,6 @@ struct CleanArgs {
 #[derive(Clone, Copy, ValueEnum)]
 enum CleanStatus {
     Complete,
-}
-
-#[derive(Clone, ValueEnum)]
-enum AuthorKindArg {
-    Human,
-    Agent,
-}
-
-impl From<AuthorKindArg> for AuthorKind {
-    fn from(value: AuthorKindArg) -> Self {
-        match value {
-            AuthorKindArg::Human => Self::Human,
-            AuthorKindArg::Agent => Self::Agent,
-        }
-    }
 }
 
 #[derive(Clone, ValueEnum)]
@@ -262,7 +298,6 @@ pub async fn run() -> Result<()> {
     }
 
     let repo = discover_repo(AuthorOverride {
-        kind: cli.author_kind.map(Into::into),
         name: cli.author_name,
         email: cli.author_email,
         agent: cli.agent,
@@ -288,7 +323,7 @@ pub async fn run() -> Result<()> {
             )
             .await?;
         }
-        Command::Comment { command } => handle_comment(command, &repo.root, repo.author).await?,
+        Command::Comment(args) => handle_comment(args, &repo.root, repo.author).await?,
         Command::Clean(args) => handle_clean(args, &repo.root, repo.author).await?,
         Command::AgentContext => {
             regenerate_outputs(&repo.root, None).await?;
@@ -325,13 +360,36 @@ async fn open_review_session(
 }
 
 async fn handle_comment(
-    command: CommentCommand,
+    args: CommentArgs,
     repo_root: &Path,
     author: crate::comments::Author,
 ) -> Result<()> {
+    let CommentArgs {
+        author: comment_author_args,
+        command,
+    } = args;
+
     match command {
         CommentCommand::List(args) => handle_comment_list(args, repo_root).await,
-        command => handle_comment_mutation(command, repo_root, author).await,
+        command => {
+            let selection = comment_author_args.selection()?;
+            handle_comment_mutation(command, repo_root, comment_author(author, selection)).await
+        }
+    }
+}
+
+fn comment_author(
+    author: crate::comments::Author,
+    selection: CommentAuthorSelection,
+) -> crate::comments::Author {
+    match selection {
+        CommentAuthorSelection::Human if author.kind == AuthorKind::Human => author,
+        CommentAuthorSelection::Human => crate::comments::Author::fallback_human(),
+        CommentAuthorSelection::Agent(display_name) => crate::comments::Author {
+            kind: AuthorKind::Agent,
+            display_name,
+            email: None,
+        },
     }
 }
 

@@ -31,49 +31,45 @@ pub fn discover_repo(author_override: AuthorOverride) -> Result<RepoContext> {
         .map(Path::to_path_buf)
         .or_else(|| repo.path().parent().map(Path::to_path_buf))
         .ok_or_else(|| anyhow!("could not determine repository root"))?;
-    let author = author_override.into_author(&repo);
+    let author = author_override.into_author(&repo)?;
 
     Ok(RepoContext { root, author })
 }
 
 pub struct AuthorOverride {
-    pub kind: Option<AuthorKind>,
     pub name: Option<String>,
     pub email: Option<String>,
-    pub agent: bool,
+    pub agent: Option<String>,
 }
 
 impl AuthorOverride {
-    pub fn into_author(self, repo: &gix::Repository) -> Author {
-        let env_kind = std::env::var("PEERS_AUTHOR_KIND").ok();
-        let env_name = std::env::var("PEERS_AUTHOR_NAME").ok();
-        let env_email = std::env::var("PEERS_AUTHOR_EMAIL").ok();
-
-        let kind = self
-            .kind
-            .or_else(|| env_kind.as_deref().and_then(parse_author_kind))
-            .unwrap_or(if self.agent {
-                AuthorKind::Agent
-            } else {
-                AuthorKind::Human
-            });
-
+    pub fn into_author(self, repo: &gix::Repository) -> Result<Author> {
+        let agent_identity = self.agent;
+        let kind = if agent_identity.is_some() {
+            AuthorKind::Agent
+        } else {
+            AuthorKind::Human
+        };
         let git_author = git_author(repo);
+        let configured_name = match kind {
+            AuthorKind::Human => self.name,
+            AuthorKind::Agent => agent_identity,
+        };
         let display_name = author_display_name(
             &kind,
-            self.name.or(env_name),
+            configured_name,
             git_author
                 .as_ref()
                 .map(|author| author.display_name.clone()),
-        );
+        )?;
 
-        let email = author_email(&kind, self.email.or(env_email), git_author);
+        let email = author_email(&kind, self.email, git_author);
 
-        Author {
+        Ok(Author {
             kind,
             display_name,
             email,
-        }
+        })
     }
 }
 
@@ -81,11 +77,19 @@ fn author_display_name(
     kind: &AuthorKind,
     configured_name: Option<String>,
     git_name: Option<String>,
-) -> String {
-    configured_name.unwrap_or_else(|| match kind {
-        AuthorKind::Human => git_name.unwrap_or_else(|| Author::fallback_human().display_name),
-        AuthorKind::Agent => Author::fallback_agent().display_name,
-    })
+) -> Result<String> {
+    if let Some(configured_name) = configured_name {
+        let configured_name = configured_name.trim();
+        if configured_name.is_empty() {
+            return Err(anyhow!("author name cannot be empty"));
+        }
+        return Ok(configured_name.to_string());
+    }
+
+    match kind {
+        AuthorKind::Human => Ok(git_name.unwrap_or_else(|| Author::fallback_human().display_name)),
+        AuthorKind::Agent => Err(anyhow!("agent author identity must be explicit")),
+    }
 }
 
 fn author_email(
@@ -97,14 +101,6 @@ fn author_email(
         AuthorKind::Human => git_author.and_then(|author| author.email),
         AuthorKind::Agent => None,
     })
-}
-
-fn parse_author_kind(input: &str) -> Option<AuthorKind> {
-    match input {
-        "human" => Some(AuthorKind::Human),
-        "agent" => Some(AuthorKind::Agent),
-        _ => None,
-    }
 }
 
 fn git_author(repo: &gix::Repository) -> Option<Author> {
