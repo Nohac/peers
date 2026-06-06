@@ -109,6 +109,7 @@ peers comment add \
   --body-file -
 
 peers comment reply thr_123 --body "I fixed this."
+peers comment reply thr_123 --body "I fixed this." --resolve
 peers comment reply thr_123 --body-file -
 peers comment list
 peers comment list --status open
@@ -207,7 +208,7 @@ The first implemented agent engagement actions should be:
 
 - Review open comments without code changes.
 - Create a Peers comment and immediately ask the agent to respond/follow up.
-- Ask the agent to fix selected/open comments, with instructions to reply and resolve through the Peers CLI.
+- Ask the agent to fix selected/open comments, with instructions to reply and resolve through `peers comment reply --resolve`.
 
 Any Peers command that needs live repo state should attach to the local Peers process when one is running, or start one when necessary. Commands that only print static help, such as `peers skill`, do not need a session. Neovim is an attachment surface for the same process rather than a separate command namespace.
 

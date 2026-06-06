@@ -41,9 +41,8 @@ Agent workflow:
 2. Use each thread anchor to inspect the referenced file and line/range.
 3. Make the requested code changes in the working tree.
 4. Run the relevant project checks.
-5. Reply to each addressed thread with `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "..."`
-6. Resolve completed threads with `peers comment --agent "Codex (GPT-5)" resolve <thread-id>`.
-7. If a comment cannot be addressed, reply with the blocker instead of resolving it.
+5. For completed threads, reply and resolve in one command with `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..." --resolve`.
+6. If a comment cannot be addressed, reply with the blocker without `--resolve`.
 
 Core commands:
 - `peers diff`
@@ -54,7 +53,8 @@ Core commands:
 - `peers comment list --status open --context 5`
 - `peers comment --human add --path src/foo.rs --side new --lines 42:47 --body "..."`
 - `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..."`
-- `peers comment --agent "Codex (GPT-5)" resolve <thread-id>`
+- `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..." --resolve`
+- `peers comment --agent "Codex (GPT-5)" resolve <thread-id>` for manual resolve-only actions
 - `peers clean --dry-run`
 - `peers agent codex`
 - `peers agent-context`
@@ -192,6 +192,8 @@ struct ReplyCommentArgs {
     body: Option<String>,
     #[arg(long)]
     body_file: Option<PathBuf>,
+    #[arg(long)]
+    resolve: bool,
 }
 
 #[derive(Args)]
@@ -483,7 +485,22 @@ async fn handle_comment_mutation(
                     body,
                 })
                 .await?;
-            println!("Added reply to thread `{}`.", args.thread_id);
+            if args.resolve {
+                provider
+                    .resolve_thread(ThreadRequest {
+                        thread_id: args.thread_id.clone(),
+                    })
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve thread `{}` after adding reply",
+                            args.thread_id
+                        )
+                    })?;
+                println!("Added reply and resolved thread `{}`.", args.thread_id);
+            } else {
+                println!("Added reply to thread `{}`.", args.thread_id);
+            }
         }
         CommentCommand::Edit(args) => {
             let body = read_body(args.body, args.body_file).await?;
