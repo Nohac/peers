@@ -496,6 +496,15 @@ local function set_sidebar_keymaps(buf, states)
   vim.keymap.set("n", KEY_COMMENT, function()
     M.review_action(buf, states, "comment")
   end, { buffer = buf, desc = "Comment or reply in Peers review", nowait = true })
+  vim.keymap.set("n", "A", function()
+    M.review_action(buf, states, "agent_review_open")
+  end, { buffer = buf, desc = "Ask agent to review all open Peers threads", nowait = true })
+  vim.keymap.set("n", "R", function()
+    M.review_action(buf, states, "agent_complete")
+  end, { buffer = buf, desc = "Ask agent to respond and resolve Peers thread", nowait = true })
+  vim.keymap.set("n", "C", function()
+    M.review_action(buf, states, "agent_comment")
+  end, { buffer = buf, desc = "Ask agent to comment on Peers thread", nowait = true })
   vim.keymap.set("n", KEY_DELETE_COMMENT, function()
     M.review_action(buf, states, "delete")
   end, { buffer = buf, desc = "Delete Peers comment", nowait = true })
@@ -642,7 +651,15 @@ end
 
 function M.review_action(buf, states, action)
   local review_buf, state = review_state_for(buf, states)
-  if not state or not state.sidebar_rows then
+  if not state then
+    return
+  end
+  local buffer = require("peers.buffer")
+  if action == "agent_review_open" then
+    buffer.agent_review_open_threads(review_buf)
+    return
+  end
+  if not state.sidebar_rows then
     return
   end
   local cursor = vim.api.nvim_win_get_cursor(0)
@@ -651,11 +668,14 @@ function M.review_action(buf, states, action)
     return
   end
   local row = state.rows and state.rows[item.target_line] or nil
-  local buffer = require("peers.buffer")
   if action == "comment" then
     buffer.comment_or_reply(review_buf, row, item.target_line, {
       return_win = vim.api.nvim_get_current_win(),
     })
+  elseif action == "agent_complete" then
+    buffer.agent_complete_selected_thread(review_buf, row)
+  elseif action == "agent_comment" then
+    buffer.agent_comment_selected_thread(review_buf, row)
   elseif action == "delete" then
     buffer.delete_selected_comment(review_buf, row)
   elseif action == "toggle_resolved" then

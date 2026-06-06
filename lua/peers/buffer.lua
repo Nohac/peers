@@ -1677,6 +1677,68 @@ local function current_review_row(buf)
   return state.rows[cursor[1]], cursor[1]
 end
 
+local function selected_review_range()
+  local mode = vim.fn.mode()
+  local start_row
+  local end_row
+  if mode == "v" or mode == "V" or mode == "\22" then
+    start_row = vim.fn.line("v")
+    end_row = vim.fn.line(".")
+  else
+    start_row = vim.fn.getpos("'<")[2]
+    end_row = vim.fn.getpos("'>")[2]
+  end
+  if start_row == 0 or end_row == 0 then
+    return nil, nil
+  end
+  if start_row > end_row then
+    start_row, end_row = end_row, start_row
+  end
+  return start_row, end_row
+end
+
+local function visual_line_anchor(buf)
+  local state = RENDER_STATES[buf]
+  if not state then
+    return nil
+  end
+  local start_row, end_row = selected_review_range()
+  if not start_row then
+    return nil
+  end
+
+  local path = nil
+  local side = nil
+  local start_line = nil
+  local end_line = nil
+  for index = start_row, end_row do
+    local row = state.rows[index]
+    if row_is_commentable(row) then
+      if path and (row.path ~= path or row.side ~= side) then
+        return nil
+      end
+      path = row.path
+      side = row.side
+      local row_start = row.source_start_line or row.source_line
+      local row_end = row.source_line or row.source_start_line
+      start_line = math.min(start_line or row_start, row_start)
+      end_line = math.max(end_line or row_end, row_end)
+    end
+  end
+
+  if not path or not side or not start_line or not end_line then
+    return nil
+  end
+
+  return {
+    scope = ROW_SCOPE_LINE,
+    path = path,
+    side = side,
+    start_line = start_line,
+    end_line = end_line,
+  }
+end
+
 local function open_composer(review_buf, opts)
   local state = RENDER_STATES[review_buf]
   if not state then
@@ -1952,6 +2014,16 @@ function M.comment_current(buf, anchor)
   create_thread_for_row(buf, current_review_row(buf))
 end
 
+function M.comment_visual_selection(buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local anchor = visual_line_anchor(buf)
+  if not anchor then
+    vim.notify(COMMENT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  M.comment_current(buf, anchor)
+end
+
 function M.reply_to_thread(buf, input, composer_opts)
   buf = buf or vim.api.nvim_get_current_buf()
   if not input or not input.thread_id then
@@ -2137,6 +2209,23 @@ function M.toggle_selected_thread_resolved(buf, row, line, opts)
   end
 end
 
+function M.agent_complete_selected_thread(buf, row, line, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  if line and opts and opts.focus then
+    focus_review_row(buf, line)
+  end
+  row = row or current_review_row(buf)
+  if not row or not row.thread_id then
+    vim.notify("Peers agent thread completion is only available on comment threads", vim.log.levels.WARN)
+    return
+  end
+  M.agent_complete_thread(buf, { thread_id = row.thread_id })
+end
+
 function M.toggle_selected_thread_collapsed(buf, row, line, opts)
   buf = buf or vim.api.nvim_get_current_buf()
   local state = RENDER_STATES[buf]
@@ -2152,6 +2241,23 @@ function M.toggle_selected_thread_collapsed(buf, row, line, opts)
     return
   end
   M.toggle_thread_collapsed(buf, { thread_id = row.thread_id, row = row })
+end
+
+function M.agent_comment_selected_thread(buf, row, line, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  if line and opts and opts.focus then
+    focus_review_row(buf, line)
+  end
+  row = row or current_review_row(buf)
+  if not row or not row.thread_id then
+    vim.notify("Peers agent thread response is only available on comment threads", vim.log.levels.WARN)
+    return
+  end
+  M.agent_comment_thread(buf, { thread_id = row.thread_id })
 end
 
 function M.ask_agent(buf, prompt)
@@ -2175,7 +2281,7 @@ function M.ask_agent(buf, prompt)
   end)
 end
 
-function M.respond_to_thread(buf, input)
+function M.agent_comment_thread(buf, input)
   buf = buf or vim.api.nvim_get_current_buf()
   local state = RENDER_STATES[buf]
   if not state or not input or not input.thread_id then
@@ -2185,11 +2291,53 @@ function M.respond_to_thread(buf, input)
 
   M.ask_agent(
     buf,
-    "Please respond to Peers thread `"
+    "Please comment on Peers thread `"
       .. input.thread_id
       .. "`. Inspect the thread and current code context, then reply using `peers comment --agent \"Codex (GPT-5)\" reply "
       .. input.thread_id
       .. " --body ...`. Do not make code changes unless the thread explicitly asks for them."
+  )
+end
+
+function M.respond_to_thread(buf, input)
+  M.agent_comment_thread(buf, input)
+end
+
+function M.agent_complete_thread(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state or not input or not input.thread_id then
+    vim.notify("Peers agent thread completion is only available on comment threads", vim.log.levels.WARN)
+    return
+  end
+
+  M.ask_agent(
+    buf,
+    "Please respond to and resolve Peers thread `"
+      .. input.thread_id
+      .. "`. Inspect the thread and current code context, make the requested code changes, then reply using `peers comment --agent \"Codex (GPT-5)\" reply "
+      .. input.thread_id
+      .. " --body ...`. When the thread is complete, resolve it using `peers comment --agent \"Codex (GPT-5)\" resolve "
+      .. input.thread_id
+      .. "`."
+  )
+end
+
+function M.complete_thread(buf, input)
+  M.agent_complete_thread(buf, input)
+end
+
+function M.agent_review_open_threads(buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    vim.notify("Peers agent review is only available in a Peers review buffer", vim.log.levels.WARN)
+    return
+  end
+
+  M.ask_agent(
+    buf,
+    "Please do a full review of all currently open Peers threads in this repository. Start by running `peers comment list --status open --context 8`, inspect each thread and its current code context, make requested code changes when a thread calls for them, then reply to each addressed thread using `peers comment --agent \"Codex (GPT-5)\" reply <thread-id> --body ...`. Resolve completed threads using `peers comment --agent \"Codex (GPT-5)\" resolve <thread-id>`. If a thread cannot be completed, reply with the blocker and leave it open."
   )
 end
 
@@ -2292,6 +2440,13 @@ local function set_review_keymaps(buf)
     desc = "Comment or reply in Peers review",
     nowait = true,
   })
+  vim.keymap.set("x", "c", function()
+    M.comment_visual_selection(buf)
+  end, {
+    buffer = buf,
+    desc = "Comment on selected Peers review lines",
+    nowait = true,
+  })
   vim.keymap.set("n", "D", function()
     M.delete_selected_comment(buf)
   end, {
@@ -2299,11 +2454,32 @@ local function set_review_keymaps(buf)
     desc = "Delete Peers comment",
     nowait = true,
   })
+  vim.keymap.set("n", "A", function()
+    M.agent_review_open_threads(buf)
+  end, {
+    buffer = buf,
+    desc = "Ask agent to review all open Peers threads",
+    nowait = true,
+  })
+  vim.keymap.set("n", "R", function()
+    M.agent_complete_selected_thread(buf)
+  end, {
+    buffer = buf,
+    desc = "Ask agent to respond and resolve Peers thread",
+    nowait = true,
+  })
   vim.keymap.set("n", "r", function()
     M.toggle_selected_thread_resolved(buf)
   end, {
     buffer = buf,
     desc = "Resolve or reopen Peers thread",
+    nowait = true,
+  })
+  vim.keymap.set("n", "C", function()
+    M.agent_comment_selected_thread(buf)
+  end, {
+    buffer = buf,
+    desc = "Ask agent to comment on Peers thread",
     nowait = true,
   })
   vim.keymap.set("n", "x", function()
