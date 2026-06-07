@@ -47,7 +47,7 @@ Prefer:
 fn encode_event(event: &ReviewEvent) -> Result<String>;
 fn replay_events(events: &[PeersEvent], payloads: &PayloadStore) -> Result<PeersState>;
 async fn parse_events_from_reader(reader: impl AsyncBufRead + Unpin) -> Result<Vec<PeersEvent>>;
-async fn render_agent_context(state: &PeersState, target: Option<&ReviewTarget>, out: impl AsyncWrite + Unpin) -> Result<()>;
+async fn render_review_markdown(state: &PeersState, target: Option<&ReviewTarget>, out: impl AsyncWrite + Unpin) -> Result<()>;
 ```
 
 Keep path wrappers small and uninteresting:
@@ -82,7 +82,7 @@ Apply the same rule to Git access:
 
 Canonical review data is repo-scoped. Lightweight transition events are append-only JSONL under `.peers/events.jsonl`; thread and comment payloads live under `.peers/threads/<thread-id>/`.
 
-Generated files such as `review.md` and `agent-context.md` are views over the event log, not canonical state.
+Generated files such as `review.md` are views over the event log, not canonical state.
 
 Agents should normally use CLI commands to add/reply/resolve comments. Payload files and the JSONL action log must remain simple enough to inspect in emergencies.
 

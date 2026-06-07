@@ -18,7 +18,8 @@ use crate::comments::{
 };
 use crate::diff::{
     CommentAnchor, FileContent, FileContextRequest, FileDiff, FileSide, LineAnchor,
-    ReviewDiffPayload, ReviewFile, ReviewTarget, load_review_diff_with_contexts,
+    ReviewDiffPayload, ReviewFile, ReviewTarget, load_review_diff_for_context,
+    load_review_diff_with_contexts,
 };
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
@@ -113,6 +114,33 @@ impl ReviewProvider {
         let review = self.get_review().await?;
         self.updates.notify_diff_changed();
         Ok(review)
+    }
+
+    pub async fn thread_anchor_placement(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<AnchorPlacement>> {
+        let thread_id = ThreadId::new(thread_id)?;
+        let thread = load_thread_payload(&self.repo_root, &thread_id).await?;
+        match &thread.anchor {
+            CommentAnchor::Line { line } => {
+                let context = FileContextRequest {
+                    path: line.path.clone(),
+                    old_path: line.old_path.clone(),
+                    side: Some(line.side.clone()),
+                    start_line: Some(line.start_line),
+                    end_line: Some(line.end_line),
+                };
+                let diff =
+                    load_review_diff_for_context(&self.repo_root, &self.target, &context).await?;
+                let anchor_indexes = ReviewAnchorIndexes::new(&diff);
+                Ok(Some(
+                    relocate_review_line_anchor(line, &anchor_indexes).placement,
+                ))
+            }
+            CommentAnchor::File { .. } => Ok(Some(AnchorPlacement::FileFallback)),
+            CommentAnchor::Review => Ok(None),
+        }
     }
 
     pub async fn create_thread(&self, request: CreateThreadRequest) -> Result<ReviewProjection> {

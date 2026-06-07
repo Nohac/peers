@@ -48,23 +48,24 @@ peers review --base main
 peers review --base origin/main
 ```
 
-Create and manage comments:
+Create and manage threads:
 
 ```bash
-peers comment list
-peers comment list --status open
-peers comment list --status complete
-peers comment add --path src/foo.rs --side new --lines 42:47 --body "This needs validation."
-peers comment reply thr_123 --body "Fixed in the latest change."
-peers comment resolve thr_123
+peers thread list
+peers thread list --status open
+peers thread list --status complete
+peers thread show thr_123 --context 8
+peers thread show thr_123 --context 8 --evidence
+peers thread add --path src/foo.rs --side new --lines 42:47 --body "This needs validation."
+peers thread reply thr_123 --body "Fixed in the latest change."
+peers thread resolve thr_123
 ```
 
 Agent-oriented usage:
 
 ```bash
 peers agent codex
-peers comment --agent "Codex (GPT-5)" add --path src/foo.rs --side new --lines 42:47 --body-file -
-peers agent-context
+peers thread --agent "Codex (GPT-5)" add --path src/foo.rs --side new --lines 42:47 --body-file -
 ```
 
 Inside Neovim, `:PeersAgent <prompt>` sends a prompt to the active Codex app-server session recorded in `.peers/agent-session.json`.
@@ -135,10 +136,9 @@ Reviews are planned to be stored in the reviewed repository:
         cmt_123.json
   session.json
   review.md
-  agent-context.md
 ```
 
-`events.jsonl` is the canonical append-only action log. Thread/comment payload files hold bodies and anchors. Markdown files are generated for humans and agents.
+`events.jsonl` is the canonical append-only action log. Thread/comment payload files hold bodies and anchors. `review.md` is a generated human-readable view.
 
 ## Development
 

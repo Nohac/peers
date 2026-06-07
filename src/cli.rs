@@ -6,13 +6,14 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 use crate::agent::AgentLaunchRequest;
-use crate::comments::{AuthorKind, CommentThread, PeersEvent, PeersState};
+use crate::anchors::AnchorPlacement;
+use crate::comments::{AuthorKind, CommentThread, PeersEvent, PeersState, ThreadPayload};
 use crate::diff::{CommentAnchor, FileSide, ReviewTarget};
 use crate::logging;
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
     AuthorOverride, append_peers_event, discover_repo, load_peers_state, load_thread_payload,
-    now_rfc3339, peers_paths, regenerate_outputs, write_thread_payload,
+    now_rfc3339, peers_paths, write_thread_payload,
 };
 use crate::review_provider::{
     CreateThreadRequest, EditCommentRequest, ReviewProvider, ThreadBodyRequest, ThreadRequest,
@@ -25,9 +26,10 @@ const REVIEW_LABEL: &str = "Review";
 const TARGET_LABEL: &str = "Target";
 const THREADS_LABEL: &str = "Threads";
 const THREAD_LABEL: &str = "Thread";
+const ANCHOR_LABEL: &str = "Anchor";
 const UPDATED_LABEL: &str = "Updated";
 const EDITED_LABEL: &str = "edited";
-const NO_COMMENTS_MESSAGE: &str = "No comments.";
+const NO_THREADS_MESSAGE: &str = "No threads.";
 const HUMAN_AUTHOR_KIND_LABEL: &str = "human";
 const AGENT_AUTHOR_KIND_LABEL: &str = "agent";
 const RESOLVED_THREAD_STATUS: &str = "resolved";
@@ -37,33 +39,34 @@ const PEERS_SKILL_TEXT: &str = r#"Peers is a local Git review tool. It stores re
 inside the reviewed repository so humans and agents can share the same review state.
 
 Agent workflow:
-1. Run `peers comment list --status open --context` to see unresolved review comments with source context.
+1. Run `peers thread list --status open --context` to see unresolved review threads with source context.
 2. Use each thread anchor to inspect the referenced file and line/range.
 3. Make the requested code changes in the working tree.
 4. Run the relevant project checks.
-5. For completed threads, reply and resolve in one command with `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..." --resolve`.
-6. If a comment cannot be addressed, reply with the blocker without `--resolve`.
+5. For a selected thread, run `peers thread show <thread-id> --context 8` before acting; it includes the current anchor status and original evidence when the anchor is not exact.
+6. For completed threads, reply and resolve in one command with `peers thread --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..." --resolve`.
+7. If a thread cannot be addressed, reply with the blocker without `--resolve`.
 
 Core commands:
 - `peers diff`
 - `peers diff --cached`
 - `peers diff --all`
 - `peers review --base main --head HEAD`
-- `peers comment list --status open --context`
-- `peers comment list --status open --context 5`
-- `peers comment --human add --path src/foo.rs --side new --lines 42:47 --body "..."`
-- `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..."`
-- `peers comment --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..." --resolve`
-- `peers comment --agent "Codex (GPT-5)" resolve <thread-id>` for manual resolve-only actions
+- `peers thread list --status open --context`
+- `peers thread list --status open --context 5`
+- `peers thread show <thread-id> --context 8`
+- `peers thread --human add --path src/foo.rs --side new --lines 42:47 --body "..."`
+- `peers thread --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..."`
+- `peers thread --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..." --resolve`
+- `peers thread --agent "Codex (GPT-5)" resolve <thread-id>` for manual resolve-only actions
 - `peers clean --dry-run`
 - `peers agent codex`
-- `peers agent-context`
 
 Notes:
 - Prefer the CLI over editing `.peers/events.jsonl` or payload files manually.
 - Comment ids start with `cmt_`; thread ids start with `thr_`.
 - Open means unresolved. Complete means resolved.
-- Comment mutations require exactly one explicit author flag: `--human` or `--agent <identity>`.
+- Thread mutations require exactly one explicit author flag: `--human` or `--agent <identity>`.
 - Agents should identify themselves with their model, for example `--agent "Codex (GPT-5)"`.
 - Root `--agent <identity>` can also be supplied via `PEERS_AGENT`.
 - Use `--body-file -` to read a multiline reply body from stdin.
@@ -91,10 +94,10 @@ enum Command {
     Skill,
     Diff(DiffArgs),
     Review(ReviewArgs),
-    Comment(CommentArgs),
+    #[command(alias = "comment")]
+    Thread(ThreadArgs),
     Clean(CleanArgs),
     Agent(AgentArgs),
-    AgentContext,
 }
 
 #[derive(Args, Clone)]
@@ -122,17 +125,19 @@ struct AgentArgs {
 }
 
 #[derive(Args)]
-struct CommentArgs {
+struct ThreadArgs {
     #[command(flatten)]
     author: CommentAuthorArgs,
     #[command(subcommand)]
-    command: CommentCommand,
+    command: ThreadCommand,
 }
 
 #[derive(Subcommand)]
-enum CommentCommand {
-    /// List visible comment threads.
+enum ThreadCommand {
+    /// List visible threads.
     List(ListCommentsArgs),
+    /// Show one thread with optional source context.
+    Show(ShowThreadArgs),
     Add(AddCommentArgs),
     Reply(ReplyCommentArgs),
     Edit(EditCommentArgs),
@@ -155,6 +160,23 @@ struct ListCommentsArgs {
         value_name = "LINES"
     )]
     context: Option<usize>,
+}
+
+#[derive(Args)]
+struct ShowThreadArgs {
+    thread_id: String,
+    #[arg(
+        long,
+        alias = "conext",
+        num_args = 0..=1,
+        default_missing_value = "3",
+        value_name = "LINES"
+    )]
+    context: Option<usize>,
+    #[arg(long, conflicts_with = "no_evidence")]
+    evidence: bool,
+    #[arg(long)]
+    no_evidence: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -246,10 +268,10 @@ impl CommentAuthorArgs {
                 Ok(CommentAuthorSelection::Agent(identity.to_string()))
             }
             (false, None) => Err(anyhow!(
-                "comment mutations require an explicit author: pass either `--human` or `--agent <identity>`"
+                "thread mutations require an explicit author: pass either `--human` or `--agent <identity>`"
             )),
             (true, Some(_)) => Err(anyhow!(
-                "comment mutations accept only one author flag: pass either `--human` or `--agent <identity>`"
+                "thread mutations accept only one author flag: pass either `--human` or `--agent <identity>`"
             )),
         }
     }
@@ -336,13 +358,9 @@ pub async fn run() -> Result<()> {
             )
             .await?;
         }
-        Command::Comment(args) => handle_comment(args, &repo.root, repo.author).await?,
+        Command::Thread(args) => handle_thread(args, &repo.root, repo.author).await?,
         Command::Clean(args) => handle_clean(args, &repo.root, repo.author).await?,
         Command::Agent(args) => handle_agent(args, &repo.root).await?,
-        Command::AgentContext => {
-            regenerate_outputs(&repo.root, None).await?;
-            println!("{}", peers_paths(&repo.root).agent_context.display());
-        }
     }
 
     Ok(())
@@ -413,21 +431,22 @@ async fn open_review_session(
     server.run_until_shutdown().await
 }
 
-async fn handle_comment(
-    args: CommentArgs,
+async fn handle_thread(
+    args: ThreadArgs,
     repo_root: &Path,
     author: crate::comments::Author,
 ) -> Result<()> {
-    let CommentArgs {
+    let ThreadArgs {
         author: comment_author_args,
         command,
     } = args;
 
     match command {
-        CommentCommand::List(args) => handle_comment_list(args, repo_root).await,
+        ThreadCommand::List(args) => handle_thread_list(args, repo_root).await,
+        ThreadCommand::Show(args) => handle_thread_show(args, repo_root, author.clone()).await,
         command => {
             let selection = comment_author_args.selection()?;
-            handle_comment_mutation(command, repo_root, comment_author(author, selection)).await
+            handle_thread_mutation(command, repo_root, comment_author(author, selection)).await
         }
     }
 }
@@ -447,8 +466,8 @@ fn comment_author(
     }
 }
 
-async fn handle_comment_mutation(
-    command: CommentCommand,
+async fn handle_thread_mutation(
+    command: ThreadCommand,
     repo_root: &Path,
     author: crate::comments::Author,
 ) -> Result<()> {
@@ -459,8 +478,10 @@ async fn handle_comment_mutation(
         ReviewUpdateBroadcaster::new(),
     );
     match command {
-        CommentCommand::List(_) => unreachable!("list commands are handled before mutations"),
-        CommentCommand::Add(args) => {
+        ThreadCommand::List(_) | ThreadCommand::Show(_) => {
+            unreachable!("read-only commands are handled before mutations")
+        }
+        ThreadCommand::Add(args) => {
             let body = read_body(args.body, args.body_file).await?;
             let review = provider
                 .create_thread(CreateThreadRequest {
@@ -477,7 +498,7 @@ async fn handle_comment_mutation(
                 review.threads.len()
             );
         }
-        CommentCommand::Reply(args) => {
+        ThreadCommand::Reply(args) => {
             let body = read_body(args.body, args.body_file).await?;
             provider
                 .reply_to_thread(ThreadBodyRequest {
@@ -502,7 +523,7 @@ async fn handle_comment_mutation(
                 println!("Added reply to thread `{}`.", args.thread_id);
             }
         }
-        CommentCommand::Edit(args) => {
+        ThreadCommand::Edit(args) => {
             let body = read_body(args.body, args.body_file).await?;
             provider
                 .edit_comment(EditCommentRequest {
@@ -512,7 +533,7 @@ async fn handle_comment_mutation(
                 .await?;
             println!("Edited comment `{}`.", args.comment_id);
         }
-        CommentCommand::Delete(args) => {
+        ThreadCommand::Delete(args) => {
             provider
                 .delete_comment(crate::review_provider::CommentRequest {
                     comment_id: args.comment_id.clone(),
@@ -520,7 +541,7 @@ async fn handle_comment_mutation(
                 .await?;
             println!("Deleted comment `{}`.", args.comment_id);
         }
-        CommentCommand::Resolve(args) => {
+        ThreadCommand::Resolve(args) => {
             provider
                 .resolve_thread(ThreadRequest {
                     thread_id: args.thread_id.clone(),
@@ -528,7 +549,7 @@ async fn handle_comment_mutation(
                 .await?;
             println!("Resolved thread `{}`.", args.thread_id);
         }
-        CommentCommand::Reopen(args) => {
+        ThreadCommand::Reopen(args) => {
             provider
                 .reopen_thread(ThreadRequest {
                     thread_id: args.thread_id.clone(),
@@ -540,7 +561,7 @@ async fn handle_comment_mutation(
 
     let state = load_peers_state(repo_root).await?;
     println!(
-        "Repo comments now have {} thread(s), {} unresolved.",
+        "Repo now has {} thread(s), {} unresolved.",
         state.threads.len(),
         state.unresolved_threads().count()
     );
@@ -548,7 +569,7 @@ async fn handle_comment_mutation(
     Ok(())
 }
 
-async fn handle_comment_list(args: ListCommentsArgs, repo_root: &Path) -> Result<()> {
+async fn handle_thread_list(args: ListCommentsArgs, repo_root: &Path) -> Result<()> {
     let state = load_peers_state(repo_root).await?;
     print_comment_list(
         &state,
@@ -558,6 +579,32 @@ async fn handle_comment_list(args: ListCommentsArgs, repo_root: &Path) -> Result
         args.context.map(|lines| CommentListContext { lines }),
     )
     .await?;
+    Ok(())
+}
+
+async fn handle_thread_show(
+    args: ShowThreadArgs,
+    repo_root: &Path,
+    author: crate::comments::Author,
+) -> Result<()> {
+    let state = load_peers_state(repo_root).await?;
+    let thread = state
+        .threads
+        .values()
+        .find(|thread| thread.id.as_str() == args.thread_id.as_str())
+        .ok_or_else(|| anyhow!("unknown thread `{}`", args.thread_id))?;
+
+    println!("{REVIEW_LABEL}: repo");
+    println!("{TARGET_LABEL}: repo-scoped");
+    let projected_anchor = projected_anchor_status(repo_root, author, &args.thread_id).await?;
+    print_comment_thread(thread, projected_anchor.location_note);
+    if let Some(lines) = args.context {
+        print_comment_context(repo_root, thread, CommentListContext { lines }).await?;
+    }
+    if should_print_original_evidence(args.evidence, args.no_evidence, projected_anchor.placement) {
+        let payload = load_thread_payload(repo_root, &thread.id).await?;
+        print_original_evidence(&payload);
+    }
     Ok(())
 }
 
@@ -589,12 +636,12 @@ async fn print_comment_list(
         .collect();
 
     if visible_threads.is_empty() {
-        println!("{NO_COMMENTS_MESSAGE}");
+        println!("{NO_THREADS_MESSAGE}");
         return Ok(());
     }
 
     for thread in visible_threads {
-        print_comment_thread(thread);
+        print_comment_thread(thread, None);
         if let Some(context) = context {
             print_comment_context(repo_root, thread, context).await?;
         }
@@ -610,7 +657,7 @@ fn comment_list_status_matches(thread: &CommentThread, status_filter: &CommentLi
     }
 }
 
-fn print_comment_thread(thread: &CommentThread) {
+fn print_comment_thread(thread: &CommentThread, anchor_status: Option<&'static str>) {
     let status = if thread.resolved {
         RESOLVED_THREAD_STATUS
     } else {
@@ -620,6 +667,9 @@ fn print_comment_thread(thread: &CommentThread) {
     println!();
     println!("[{status}] {}", thread.anchor.label());
     println!("{THREAD_LABEL}: {}", thread.id);
+    if let Some(anchor_status) = anchor_status {
+        println!("{ANCHOR_LABEL}: {anchor_status}");
+    }
     println!("{UPDATED_LABEL}: {}", thread.updated_at);
 
     for comment in &thread.comments {
@@ -637,6 +687,129 @@ fn print_comment_thread(thread: &CommentThread) {
             comment.id, comment.author.display_name, comment.created_at
         );
         print_indented_body(&comment.body);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedAnchorStatus {
+    placement: Option<AnchorPlacement>,
+    location_note: Option<&'static str>,
+}
+
+async fn projected_anchor_status(
+    repo_root: &Path,
+    author: crate::comments::Author,
+    thread_id: &str,
+) -> Result<ProjectedAnchorStatus> {
+    let provider = ReviewProvider::new(
+        repo_root.to_path_buf(),
+        ReviewTarget::WorkingTree,
+        author,
+        ReviewUpdateBroadcaster::new(),
+    );
+    let placement = provider.thread_anchor_placement(thread_id).await?;
+    Ok(ProjectedAnchorStatus {
+        placement,
+        location_note: placement.map(AnchorPlacement::location_note),
+    })
+}
+
+fn should_print_original_evidence(
+    force: bool,
+    suppress: bool,
+    placement: Option<AnchorPlacement>,
+) -> bool {
+    if suppress {
+        return false;
+    }
+    if force {
+        return true;
+    }
+    !matches!(placement, Some(AnchorPlacement::Exact) | None)
+}
+
+fn print_original_evidence(payload: &ThreadPayload) {
+    println!("Original evidence:");
+    println!("  Created in: {}", payload.provenance.view_kind);
+    if let Some(branch) = &payload.provenance.branch {
+        println!("  Branch: {branch}");
+    }
+    if let Some(head_oid) = &payload.provenance.head_oid {
+        println!("  Head: {head_oid}");
+    }
+    if let Some(merge_base_oid) = &payload.provenance.merge_base_oid {
+        println!("  Merge base: {merge_base_oid}");
+    }
+
+    match &payload.anchor {
+        CommentAnchor::Line { line } => print_line_anchor_evidence(line),
+        CommentAnchor::File { path } => println!("  File: {path}"),
+        CommentAnchor::Review => println!("  Scope: review"),
+    }
+}
+
+fn print_line_anchor_evidence(line: &crate::diff::LineAnchor) {
+    println!("  Path: {}", line.path);
+    if let Some(old_path) = &line.old_path {
+        println!("  Old path: {old_path}");
+    }
+    println!("  Side: {}", file_side_label(&line.side));
+    if line.start_line == line.end_line {
+        println!("  Lines: {}", line.start_line);
+    } else {
+        println!("  Lines: {}-{}", line.start_line, line.end_line);
+    }
+    if let Some(hunk_header) = &line.hunk_header {
+        println!("  Hunk: {hunk_header}");
+    }
+    if let Some(view_kind) = &line.view_kind {
+        println!("  Anchor view: {view_kind}");
+    }
+    if let Some(branch) = &line.branch {
+        println!("  Anchor branch: {branch}");
+    }
+    if let Some(head_oid) = &line.head_oid {
+        println!("  Anchor head: {head_oid}");
+    }
+    if let Some(base_oid) = &line.base_oid {
+        println!("  Anchor base: {base_oid}");
+    }
+    if let Some(merge_base_oid) = &line.merge_base_oid {
+        println!("  Anchor merge base: {merge_base_oid}");
+    }
+
+    if let Some(selected_text) = &line.selected_text {
+        print_evidence_text_block("Selected", selected_text);
+    }
+    print_evidence_lines_block("Before", &line.context_before);
+    print_evidence_lines_block("After", &line.context_after);
+}
+
+fn file_side_label(side: &FileSide) -> &'static str {
+    match side {
+        FileSide::Old => "old",
+        FileSide::New => "new",
+    }
+}
+
+fn print_evidence_text_block(label: &str, text: &str) {
+    println!("  {label}:");
+    if text.is_empty() {
+        println!("    ");
+        return;
+    }
+    for line in text.lines() {
+        println!("    {line}");
+    }
+}
+
+fn print_evidence_lines_block(label: &str, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    println!("  {label}:");
+    for line in lines {
+        println!("    {line}");
     }
 }
 

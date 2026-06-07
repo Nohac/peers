@@ -524,52 +524,6 @@ fn visible_comments(comments: Vec<Comment>) -> Vec<Comment> {
         .collect()
 }
 
-pub async fn render_agent_context(
-    state: &PeersState,
-    target: Option<&ReviewTarget>,
-    mut out: impl AsyncWrite + Unpin,
-) -> Result<()> {
-    out.write_all(b"# Peers Review\n\nReview: repo-scoped comments\n")
-        .await?;
-
-    if let Some(target) = target {
-        out.write_all(format!("Target: {}\n", target.label()).as_bytes())
-            .await?;
-    }
-
-    let unresolved: Vec<_> = state.unresolved_threads().collect();
-    out.write_all(format!("Unresolved comments: {}\n\n", unresolved.len()).as_bytes())
-        .await?;
-
-    if unresolved.is_empty() {
-        out.write_all(b"No unresolved comments.\n").await?;
-        return Ok(());
-    }
-
-    for thread in unresolved {
-        out.write_all(format!("## {}\n\n", thread.anchor.label()).as_bytes())
-            .await?;
-        out.write_all(format!("Thread: `{}`\n\n", thread.id).as_bytes())
-            .await?;
-        for comment in &thread.comments {
-            out.write_all(
-                format!(
-                    "- {} ({:?}) at {}: {}\n",
-                    comment.author.display_name,
-                    comment.author.kind,
-                    comment.created_at,
-                    comment.visible_body().replace('\n', "\n  ")
-                )
-                .as_bytes(),
-            )
-            .await?;
-        }
-        out.write_all(b"\n").await?;
-    }
-
-    Ok(())
-}
-
 pub async fn render_review_markdown(
     state: &PeersState,
     target: Option<&ReviewTarget>,

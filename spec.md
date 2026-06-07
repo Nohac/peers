@@ -93,36 +93,39 @@ peers review --base main
 peers review --base origin/main
 ```
 
-Comment commands:
+Thread commands:
 
 ```bash
-peers comment add \
+peers thread add \
   --path src/foo.rs \
   --side new \
   --lines 42:47 \
   --body "This bypasses validation."
 
-peers comment add \
+peers thread add \
   --path src/foo.rs \
   --side new \
   --lines 42:47 \
   --body-file -
 
-peers comment reply thr_123 --body "I fixed this."
-peers comment reply thr_123 --body "I fixed this." --resolve
-peers comment reply thr_123 --body-file -
-peers comment list
-peers comment list --status open
-peers comment list --status open --context
-peers comment list --status open --context 5
-peers comment list --status complete
-peers comment list --scope repo
-peers comment edit cmt_123 --body "Updated comment."
-peers comment delete cmt_123
-peers comment accept cmt_agent_123
-peers comment decline cmt_agent_123 --body "This is intentional because ..."
-peers comment resolve thr_123
-peers comment reopen thr_123
+peers thread reply thr_123 --body "I fixed this."
+peers thread reply thr_123 --body "I fixed this." --resolve
+peers thread reply thr_123 --body-file -
+peers thread list
+peers thread list --status open
+peers thread list --status open --context
+peers thread list --status open --context 5
+peers thread list --status complete
+peers thread list --scope repo
+peers thread show thr_123 --context 8
+peers thread show thr_123 --context 8 --evidence
+peers thread show thr_123 --context 8 --no-evidence
+peers thread edit cmt_123 --body "Updated comment."
+peers thread delete cmt_123
+peers thread accept cmt_agent_123
+peers thread decline cmt_agent_123 --body "This is intentional because ..."
+peers thread resolve thr_123
+peers thread reopen thr_123
 ```
 
 Cleanup commands:
@@ -144,8 +147,7 @@ Agent support:
 ```bash
 peers skill
 peers --agent "Codex (GPT-5)" review
-peers comment --agent "Codex (GPT-5)" reply ...
-peers agent-context
+peers thread --agent "Codex (GPT-5)" reply ...
 peers agent -- codex --remote %addr
 peers agent codex
 peers agent attach --addr ws://127.0.0.1:4500
@@ -208,7 +210,7 @@ The first implemented agent engagement actions should be:
 
 - Review open comments without code changes.
 - Create a Peers comment and immediately ask the agent to respond/follow up.
-- Ask the agent to fix selected/open comments, with instructions to reply and resolve through `peers comment reply --resolve`.
+- Ask the agent to fix selected/open comments, with instructions to reply and resolve through `peers thread reply --resolve`.
 
 Any Peers command that needs live repo state should attach to the local Peers process when one is running, or start one when necessary. Commands that only print static help, such as `peers skill`, do not need a session. Neovim is an attachment surface for the same process rather than a separate command namespace.
 
@@ -296,7 +298,7 @@ Author kinds:
 - `human`
 - `agent`
 
-Agent identity must be explicit for agent-authored comments and agent-launched Peers sessions. `peers comment --agent <identity>` records the provided identity directly, and root `peers --agent <identity>` can be used for agent-launched sessions. There is no generic fallback agent name.
+Agent identity must be explicit for agent-authored comments and agent-launched Peers sessions. `peers thread --agent <identity>` records the provided identity directly, and root `peers --agent <identity>` can be used for agent-launched sessions. There is no generic fallback agent name.
 
 Identity is descriptive, not a security boundary. Edit/delete ownership is soft and local.
 
@@ -314,7 +316,6 @@ Canonical Peers state is stored inside the reviewed project and is scoped to the
         cmt_01j.json
   session.json
   review.md
-  agent-context.md
 ```
 
 Canonical state is split between a lightweight append-only action log and per-thread payload files.
@@ -327,11 +328,9 @@ Canonical state is split between a lightweight append-only action log and per-th
 
 Diff and review modes are live projections over this repo-scoped state, not owners of comment state.
 
-`review.md` is generated for humans.
+`review.md` is generated for humans. Agents should inspect threads through `peers thread list --context` and `peers thread show <thread-id> --context`.
 
-`agent-context.md` is generated for agents and should contain unresolved comments with enough file, line, and surrounding context to act on them.
-
-File-level and repo/review-level comments should also be included in generated review summaries and agent context.
+File-level and repo/review-level comments should also be included in generated review summaries and CLI thread context output.
 
 Use append-only JSONL events for the action log so agents can append safely and merge conflicts stay manageable. Payload files should stay small and individually addressable so comment bodies are easy to inspect and cleanup/compaction does not require rewriting one large log.
 
@@ -421,9 +420,11 @@ Open comments are part of the projection, not decoration on top of changed hunks
 
 Resolved comments should be hidden more aggressively as context changes. Exact matches may remain available behind a show-resolved option. Weak matches, file-only matches, and detached resolved comments should be hidden from normal diff/editor projections by default, while remaining available through explicit complete/resolved/global listing and cleanup previews.
 
-`peers comment list --context [lines]` should eventually render context from the projection, not only from live file line numbers. When an anchor still relocates cleanly, it can show current source context. When the source has drifted, moved, or detached, it should fall back to the stored original selected text and before/after snippets so agents can still see what the comment originally referred to. The output should label current, moved/stale, and original-only context distinctly.
+`peers thread list --context [lines]` should eventually render context from the projection, not only from live file line numbers. When an anchor still relocates cleanly, it can show current source context. When the source has drifted, moved, or detached, it should fall back to the stored original selected text and before/after snippets so agents can still see what the comment originally referred to. The output should label current, moved/stale, and original-only context distinctly.
 
-Peers should support explicitly updating a thread or comment anchor from the current projected context. This is useful when a human or agent has verified that a relocated/stale placement is the intended new source location and wants future relocation to use the updated text, range hashes, per-line hashes, before/after context, path, and line/range as the new evidence. The operation should be explicit, such as `peers comment update-context <thread-id>` or a Neovim code action labeled `Update thread context from current location`, and should append an event rather than silently rewriting history. The old anchor/evidence should remain available in history for audit/debugging. Updating context should not resolve the thread, accept an agent comment, or change comment body text; it only refreshes attachment evidence.
+`peers thread show <thread-id> --context [lines]` should include the current anchor placement status. It should print stored original evidence automatically when the current placement is not exact, support `--evidence` to force original evidence, and support `--no-evidence` to suppress it. Original evidence should include the stored path, side, line/range, creation provenance, selected text, and before/after context. Stored hashes remain relocation internals and should not be shown in normal human/agent output.
+
+Peers should support explicitly updating a thread or comment anchor from the current projected context. This is useful when a human or agent has verified that a relocated/stale placement is the intended new source location and wants future relocation to use the updated text, range hashes, per-line hashes, before/after context, path, and line/range as the new evidence. The operation should be explicit, such as `peers thread update-context <thread-id>` or a Neovim code action labeled `Update thread context from current location`, and should append an event rather than silently rewriting history. The old anchor/evidence should remain available in history for audit/debugging. Updating context should not resolve the thread, accept an agent comment, or change comment body text; it only refreshes attachment evidence.
 
 ## Cleanup
 
@@ -459,7 +460,7 @@ async fn parse_events(input: &str) -> Result<Vec<PeersEvent>>;
 async fn parse_events_from_reader(reader: impl AsyncBufRead + Unpin) -> Result<Vec<PeersEvent>>;
 fn encode_event(event: &PeersEvent) -> Result<String>;
 fn replay_events(events: &[PeersEvent], payloads: &PayloadStore) -> Result<PeersState>;
-async fn render_agent_context(state: &PeersState, target: Option<&ReviewTarget>, out: impl AsyncWrite + Unpin) -> Result<()>;
+async fn render_review_markdown(state: &PeersState, target: Option<&ReviewTarget>, out: impl AsyncWrite + Unpin) -> Result<()>;
 ```
 
 Thin untested wrappers:
@@ -649,11 +650,11 @@ Open Peers projections should stay current without manual refresh whenever local
 Sources that must update the open UI:
 
 - Local file changes that alter the reviewed diff.
-- CLI comment operations, including human and agent `peers comment add/reply/edit/delete/resolve/reopen` commands.
+- CLI comment operations, including human and agent `peers thread add/reply/edit/delete/resolve/reopen` commands.
 - Comment operations from another open Neovim instance or future UI.
 - File viewed/unviewed changes.
 - Review submission events.
-- Regenerated `review.md` and `agent-context.md` output when their source event log changes.
+- Regenerated `review.md` output when its source event log changes.
 
 Implementation expectations:
 
@@ -982,7 +983,7 @@ Agent comment accept/decline:
 - Accept records human acknowledgement that the agent feedback is valid or worth acting on. It should keep the thread unresolved unless the user separately resolves it.
 - Decline records human rejection of the agent feedback. The action should prompt for an optional reason and append it either as transition metadata or as a normal human reply linked to the decline.
 - If declining the last actionable agent comment in a thread, the UI may offer a combined `Decline and resolve` action, but it must append both `agent_comment_declined` and `thread_resolved` so history remains explicit.
-- Accepted unresolved agent comments should remain in `agent-context.md` as accepted work items until the thread is resolved.
+- Accepted unresolved agent comments should remain visible in `peers thread list --status open --context` until the thread is resolved.
 - Declined comments should be hidden from default open/actionable agent context, but remain visible in complete/global listings and thread history.
 - Reopening a resolved thread does not erase prior accept/decline decisions. A later agent reply starts pending again and can be accepted or declined independently.
 - Future patch/suggestion support may let `Accept agent comment` apply a machine-readable edit before recording acceptance. Until then, acceptance is a disposition marker only, not a code-changing operation.
@@ -1213,6 +1214,6 @@ Current priority order:
 9. Preserve Neovim cursor and viewport by semantic row anchors during live refreshes.
 10. Retarget Neovim rendering and realtime updates to repo-scoped projections.
 11. Improve Neovim diagnostics for detached/stale unresolved comments and cleanup candidates.
-12. Keep generated `review.md` and `agent-context.md` as views over repo-scoped projections.
+12. Keep generated `review.md` and CLI thread context output as views over repo-scoped projections.
 13. Add Arborium highlighting only if it still matters after Neovim Tree-sitter mirroring covers the primary workflow.
 14. Revisit Vox RPC only after the Neovim-first provider model is stable.

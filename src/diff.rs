@@ -246,26 +246,56 @@ pub async fn load_review_diff_with_contexts(
     let repo_root = repo_root.to_path_buf();
     let target = target.clone();
     let contexts = contexts.to_vec();
-    tokio::task::spawn_blocking(move || load_review_diff_sync(&repo_root, &target, &contexts))
+    tokio::task::spawn_blocking(move || load_review_diff_sync(&repo_root, &target, &contexts, None))
         .await
         .context(DIFF_TASK_ERROR)?
+}
+
+pub async fn load_review_diff_for_context(
+    repo_root: &Path,
+    target: &ReviewTarget,
+    context: &FileContextRequest,
+) -> Result<ReviewDiffPayload> {
+    let repo_root = repo_root.to_path_buf();
+    let target = target.clone();
+    let context = context.clone();
+    tokio::task::spawn_blocking(move || {
+        let contexts = vec![context];
+        let paths = context_paths(&contexts);
+        load_review_diff_sync(&repo_root, &target, &contexts, Some(&paths))
+    })
+    .await
+    .context(DIFF_TASK_ERROR)?
 }
 
 fn load_review_diff_sync(
     repo_root: &Path,
     target: &ReviewTarget,
     contexts: &[FileContextRequest],
+    selected_paths: Option<&BTreeSet<String>>,
 ) -> Result<ReviewDiffPayload> {
     let repo = gix::discover(repo_root).context(GIT_DISCOVER_ERROR)?;
     let resolved = ResolvedTarget::resolve(&repo, target)?;
     let context_paths = context_paths(contexts);
-    let old_snapshot = snapshot_for_source(repo_root, &repo, &resolved.old_source, &context_paths)?;
+    let old_snapshot = snapshot_for_source(
+        repo_root,
+        &repo,
+        &resolved.old_source,
+        &context_paths,
+        selected_paths,
+    )?;
     let old_paths = old_snapshot
         .keys()
         .chain(context_paths.iter())
         .cloned()
         .collect();
-    let new_snapshot = snapshot_for_source(repo_root, &repo, &resolved.new_source, &old_paths)?;
+    let new_snapshot = snapshot_for_source(
+        repo_root,
+        &repo,
+        &resolved.new_source,
+        &old_paths,
+        selected_paths,
+    )?;
     let entries = diff_entries(&old_snapshot, &new_snapshot)?;
     let mut files = Vec::new();
     let mut file_contents_by_path = BTreeMap::new();
@@ -392,15 +422,23 @@ fn snapshot_for_source(
     repo: &gix::Repository,
     source: &ContentSource,
     extra_worktree_paths: &BTreeSet<String>,
+    selected_paths: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
     match source {
-        ContentSource::Worktree => worktree_snapshot(repo_root, extra_worktree_paths),
-        ContentSource::Index => index_snapshot(repo),
-        ContentSource::Commit { rev, allow_missing } => commit_snapshot(repo, rev, *allow_missing),
+        ContentSource::Worktree => {
+            worktree_snapshot(repo_root, extra_worktree_paths, selected_paths)
+        }
+        ContentSource::Index => index_snapshot(repo, selected_paths),
+        ContentSource::Commit { rev, allow_missing } => {
+            commit_snapshot(repo, rev, *allow_missing, selected_paths)
+        }
     }
 }
 
-fn index_snapshot(repo: &gix::Repository) -> Result<BTreeMap<String, Vec<u8>>> {
+fn index_snapshot(
+    repo: &gix::Repository,
+    selected_paths: Option<&BTreeSet<String>>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
     let index = repo.index_or_empty()?;
     let mut snapshot = BTreeMap::new();
     for entry in index.entries() {
@@ -408,6 +446,9 @@ fn index_snapshot(repo: &gix::Repository) -> Result<BTreeMap<String, Vec<u8>>> {
             continue;
         }
         let path = bstr_path_to_string(entry.path(&index))?;
+        if selected_paths.is_some_and(|selected_paths| !selected_paths.contains(&path)) {
+            continue;
+        }
         let blob = repo.find_blob(entry.id)?;
         snapshot.insert(path, blob.data.to_vec());
     }
@@ -418,6 +459,7 @@ fn commit_snapshot(
     repo: &gix::Repository,
     rev: &str,
     allow_missing: bool,
+    selected_paths: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
     let id = match repo.rev_parse_single(rev) {
         Ok(id) => id,
@@ -435,6 +477,9 @@ fn commit_snapshot(
             continue;
         }
         let path = bstr_path_to_string(entry.path(&index))?;
+        if selected_paths.is_some_and(|selected_paths| !selected_paths.contains(&path)) {
+            continue;
+        }
         let blob = repo.find_blob(entry.id)?;
         snapshot.insert(path, blob.data.to_vec());
     }
@@ -444,25 +489,33 @@ fn commit_snapshot(
 fn worktree_snapshot(
     repo_root: &Path,
     extra_paths: &BTreeSet<String>,
+    selected_paths: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
-    let mut paths = extra_paths.clone();
-    for entry in WalkBuilder::new(repo_root)
-        .hidden(false)
-        .filter_entry(|entry| !is_internal_entry(entry.path()))
-        .build()
-    {
-        let entry = entry?;
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
+    let mut paths = match selected_paths {
+        Some(selected_paths) => selected_paths.clone(),
+        None => {
+            let mut paths = extra_paths.clone();
+            for entry in WalkBuilder::new(repo_root)
+                .hidden(false)
+                .filter_entry(|entry| !is_internal_entry(entry.path()))
+                .build()
+            {
+                let entry = entry?;
+                if !entry
+                    .file_type()
+                    .is_some_and(|file_type| file_type.is_file())
+                {
+                    continue;
+                }
+                let path = relative_worktree_path(repo_root, entry.path())?;
+                if !path.is_empty() {
+                    paths.insert(path);
+                }
+            }
+            paths
         }
-        let path = relative_worktree_path(repo_root, entry.path())?;
-        if !path.is_empty() {
-            paths.insert(path);
-        }
-    }
+    };
+    paths.extend(extra_paths.iter().cloned());
 
     let mut snapshot = BTreeMap::new();
     for path in paths {

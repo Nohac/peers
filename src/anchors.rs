@@ -37,6 +37,19 @@ impl AnchorPlacement {
             AnchorPlacement::Detached => "detached",
         }
     }
+
+    pub fn location_note(self) -> &'static str {
+        match self {
+            AnchorPlacement::Exact => "exact source match",
+            AnchorPlacement::PerLineHash => "source lines match",
+            AnchorPlacement::MovedExact => "moved exact source match",
+            AnchorPlacement::Context => "anchored by surrounding context",
+            AnchorPlacement::Window => "expanded source window",
+            AnchorPlacement::LineFallback => "stale line fallback",
+            AnchorPlacement::FileFallback => "file-level fallback",
+            AnchorPlacement::Detached => "detached from current source",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Facet, PartialEq, Eq)]

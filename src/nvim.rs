@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -225,11 +226,52 @@ impl NvimLspServer {
 struct PeersDiffLanguageServer {
     client: Client,
     provider: ReviewProvider,
+    render_cache: Mutex<Option<RenderedReviewCache>>,
 }
 
 impl PeersDiffLanguageServer {
     fn new(client: Client, provider: ReviewProvider) -> Self {
-        Self { client, provider }
+        Self {
+            client,
+            provider,
+            render_cache: Mutex::new(None),
+        }
+    }
+
+    fn render_review_response(&self, review: ReviewProjection) -> LSPAny {
+        let rendered = render_payload(review);
+        self.cache_rendered_review(&rendered);
+        rendered.into_lsp()
+    }
+
+    fn cache_rendered_review(&self, rendered: &RenderedReview) {
+        let mut cache = self
+            .render_cache
+            .lock()
+            .expect("render cache mutex poisoned");
+        *cache = Some(RenderedReviewCache {
+            rows: rendered.rows.clone(),
+            sidebar: rendered.sidebar.clone(),
+            sidebar_counts: rendered.sidebar_counts.clone(),
+        });
+    }
+
+    fn update_cached_thread_sidebar(
+        &self,
+        thread_id: &str,
+        replacement_rows: &[RenderedRow],
+    ) -> Option<(RenderedSidebar, RenderedSidebarCounts)> {
+        let mut cache = self
+            .render_cache
+            .lock()
+            .expect("render cache mutex poisoned");
+        let cache = cache.as_mut()?;
+        let (first, last) = rendered_thread_block_range(&cache.rows, thread_id)?;
+        cache
+            .rows
+            .splice(first..=last, replacement_rows.iter().cloned());
+        cache.sidebar = render_sidebar(&cache.rows);
+        Some((cache.sidebar.clone(), cache.sidebar_counts.clone()))
     }
 
     async fn review_summary(&self) -> String {
@@ -263,7 +305,9 @@ impl PeersDiffLanguageServer {
             .get_review()
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(rendered_review_into_lsp(render_payload(review)))
+        let rendered = render_payload(review);
+        self.cache_rendered_review(&rendered);
+        Ok(rendered_review_into_lsp(rendered))
     }
 
     async fn create_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -273,7 +317,7 @@ impl PeersDiffLanguageServer {
             .create_thread(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(render_review_payload(review).into_lsp())
+        Ok(self.render_review_response(review))
     }
 
     async fn reply_to_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -283,7 +327,7 @@ impl PeersDiffLanguageServer {
             .reply_to_thread(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(render_review_payload(review).into_lsp())
+        Ok(self.render_review_response(review))
     }
 
     async fn edit_comment(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -293,7 +337,7 @@ impl PeersDiffLanguageServer {
             .edit_comment(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(render_review_payload(review).into_lsp())
+        Ok(self.render_review_response(review))
     }
 
     async fn delete_comment(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -303,7 +347,7 @@ impl PeersDiffLanguageServer {
             .delete_comment(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(render_review_payload(review).into_lsp())
+        Ok(self.render_review_response(review))
     }
 
     async fn resolve_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -313,7 +357,7 @@ impl PeersDiffLanguageServer {
             .resolve_thread(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(render_review_payload(review).into_lsp())
+        Ok(self.render_review_response(review))
     }
 
     async fn reopen_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -323,7 +367,7 @@ impl PeersDiffLanguageServer {
             .reopen_thread(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(render_review_payload(review).into_lsp())
+        Ok(self.render_review_response(review))
     }
 
     async fn toggle_thread_collapsed(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -334,19 +378,13 @@ impl PeersDiffLanguageServer {
             .toggle_thread_collapsed_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        let review = self
-            .provider
-            .get_review()
-            .await
-            .map_err(|_| LspError::internal_error())?;
-        let rendered_review = render_review_payload(review);
-        Ok(render_thread_patch(
-            thread,
-            self.provider.author(),
-            context,
-            rendered_review.sidebar,
-            rendered_review.sidebar_counts,
-        ))
+        let patch = render_thread_patch(thread, self.provider.author(), context);
+        let (sidebar, sidebar_counts) = self
+            .update_cached_thread_sidebar(&patch.thread_id, &patch.rows)
+            .map_or((None, None), |(sidebar, sidebar_counts)| {
+                (Some(sidebar), Some(sidebar_counts))
+            });
+        Ok(patch.into_lsp(sidebar, sidebar_counts))
     }
 
     async fn ask_agent(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -532,6 +570,13 @@ struct RenderedReview {
     sidebar_counts: RenderedSidebarCounts,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RenderedReviewCache {
+    rows: Vec<RenderedRow>,
+    sidebar: RenderedSidebar,
+    sidebar_counts: RenderedSidebarCounts,
+}
+
 impl RenderedReview {
     fn push_line(&mut self, line: String, row: RenderedRow) -> u32 {
         let index = self.lines.len() as u32;
@@ -627,9 +672,7 @@ fn render_thread_patch(
     thread: CommentThread,
     current_author: &Author,
     context: ThreadRenderContext,
-    sidebar: RenderedSidebar,
-    sidebar_counts: RenderedSidebarCounts,
-) -> LSPAny {
+) -> RenderedThreadPatch {
     let thread = review_thread_from_context(thread, current_author, context);
     let thread_id = thread.id.clone();
     let collapsed = thread.collapsed;
@@ -643,16 +686,41 @@ fn render_thread_patch(
     };
     push_thread_block(&mut rendered, &thread);
 
-    lsp_payload(ThreadPatchPayload {
-        kind: "thread_patch",
+    RenderedThreadPatch {
         thread_id,
         collapsed,
         lines: rendered.lines,
         rows: rendered.rows,
         highlights: rendered.highlights,
-        sidebar,
-        sidebar_counts,
-    })
+    }
+}
+
+#[derive(Debug)]
+struct RenderedThreadPatch {
+    thread_id: String,
+    collapsed: bool,
+    lines: Vec<String>,
+    rows: Vec<RenderedRow>,
+    highlights: Vec<RenderedHighlight>,
+}
+
+impl RenderedThreadPatch {
+    fn into_lsp(
+        self,
+        sidebar: Option<RenderedSidebar>,
+        sidebar_counts: Option<RenderedSidebarCounts>,
+    ) -> LSPAny {
+        lsp_payload(ThreadPatchPayload {
+            kind: "thread_patch",
+            thread_id: self.thread_id,
+            collapsed: self.collapsed,
+            lines: self.lines,
+            rows: self.rows,
+            highlights: self.highlights,
+            sidebar,
+            sidebar_counts,
+        })
+    }
 }
 
 #[derive(Debug, Facet)]
@@ -663,8 +731,8 @@ struct ThreadPatchPayload {
     lines: Vec<String>,
     rows: Vec<RenderedRow>,
     highlights: Vec<RenderedHighlight>,
-    sidebar: RenderedSidebar,
-    sidebar_counts: RenderedSidebarCounts,
+    sidebar: Option<RenderedSidebar>,
+    sidebar_counts: Option<RenderedSidebarCounts>,
 }
 
 fn review_thread_from_context(
@@ -700,19 +768,19 @@ fn review_thread_from_context(
     }
 }
 
-#[derive(Debug, Default, Facet)]
+#[derive(Clone, Debug, Default, Facet)]
 struct RenderedSidebarCounts {
     files: u32,
     comments: u32,
 }
 
-#[derive(Debug, Default, Facet)]
+#[derive(Clone, Debug, Default, Facet)]
 struct RenderedSidebar {
     files: RenderedSidebarPanel,
     comments: RenderedSidebarPanel,
 }
 
-#[derive(Debug, Default, Facet)]
+#[derive(Clone, Debug, Default, Facet)]
 struct RenderedSidebarPanel {
     lines: Vec<String>,
     rows: Vec<RenderedSidebarRow>,
@@ -737,10 +805,11 @@ impl RenderedSidebarPanel {
     }
 }
 
-#[derive(Debug, Default, Facet)]
+#[derive(Clone, Debug, Default, Facet)]
 struct RenderedSidebarRow {
     target_line: Option<u32>,
     path: Option<String>,
+    thread_id: Option<String>,
 }
 
 impl RenderedSidebarRow {
@@ -748,6 +817,15 @@ impl RenderedSidebarRow {
         Self {
             target_line: Some(target_line as u32),
             path: None,
+            thread_id: None,
+        }
+    }
+
+    fn thread(target_line: usize, thread_id: &str) -> Self {
+        Self {
+            target_line: Some(target_line as u32),
+            path: None,
+            thread_id: Some(thread_id.to_string()),
         }
     }
 
@@ -755,11 +833,12 @@ impl RenderedSidebarRow {
         Self {
             target_line: Some(target_line as u32),
             path: Some(path),
+            thread_id: None,
         }
     }
 }
 
-#[derive(Debug, Facet)]
+#[derive(Clone, Debug, Facet)]
 struct RenderedRow {
     kind: &'static str,
     path: Option<String>,
@@ -927,7 +1006,21 @@ impl RenderedRow {
     }
 }
 
-#[derive(Debug, Facet)]
+fn rendered_thread_block_range(rows: &[RenderedRow], thread_id: &str) -> Option<(usize, usize)> {
+    let mut first = None;
+    let mut last = None;
+    for (index, row) in rows.iter().enumerate() {
+        if row.thread_id.as_deref() == Some(thread_id) {
+            first.get_or_insert(index);
+            last = Some(index);
+        } else if first.is_some() {
+            break;
+        }
+    }
+    Some((first?, last?))
+}
+
+#[derive(Clone, Debug, Facet)]
 struct RenderedHighlight {
     line: u32,
     start_col: u32,
@@ -1180,6 +1273,7 @@ struct SidebarFile {
 
 #[derive(Debug)]
 struct SidebarThread {
+    id: String,
     target_line: usize,
     label: String,
     resolved: bool,
@@ -1315,6 +1409,7 @@ fn render_sidebar_comments(rows: &[RenderedRow]) -> RenderedSidebarPanel {
                 let group_index = sidebar_group_index(&mut groups, dir);
                 let thread_index = groups[group_index].1.len();
                 groups[group_index].1.push(SidebarThread {
+                    id: thread_id.clone(),
                     target_line: index + 1,
                     label: sidebar_thread_label(row),
                     resolved: row.resolved.unwrap_or(false),
@@ -1396,7 +1491,10 @@ fn push_sidebar_thread(panel: &mut RenderedSidebarPanel, thread: SidebarThread) 
         "{header_prefix}{}{header_suffix}",
         truncate_start(&thread.label, label_width)
     );
-    let line = panel.push_line(header, RenderedSidebarRow::target(thread.target_line));
+    let line = panel.push_line(
+        header,
+        RenderedSidebarRow::thread(thread.target_line, &thread.id),
+    );
     if let Some(group) = sidebar_thread_border_highlight(thread.resolved) {
         panel.push_highlight(line, 0, header_prefix.len() as u32, group);
     }
@@ -1410,12 +1508,18 @@ fn push_sidebar_thread(panel: &mut RenderedSidebarPanel, thread: SidebarThread) 
             {
                 push_sidebar_comment_elision(
                     panel,
+                    &thread.id,
                     thread.target_line,
                     hidden_count,
                     thread.resolved,
                 );
             }
-            push_sidebar_comment(panel, &thread.comments[comment_index], thread.resolved);
+            push_sidebar_comment(
+                panel,
+                &thread.id,
+                &thread.comments[comment_index],
+                thread.resolved,
+            );
         }
     }
 
@@ -1436,7 +1540,10 @@ fn push_sidebar_thread(panel: &mut RenderedSidebarPanel, thread: SidebarThread) 
             SIDEBAR_WIDTH.saturating_sub(display_width(&footer_prefix))
         )
     );
-    let line = panel.push_line(footer, RenderedSidebarRow::target(thread.target_line));
+    let line = panel.push_line(
+        footer,
+        RenderedSidebarRow::thread(thread.target_line, &thread.id),
+    );
     if let Some(group) = sidebar_thread_border_highlight(thread.resolved) {
         panel.push_highlight(line, 0, THREAD_FOOTER.len() as u32, group);
     }
@@ -1450,6 +1557,7 @@ fn push_sidebar_thread(panel: &mut RenderedSidebarPanel, thread: SidebarThread) 
 
 fn push_sidebar_comment(
     panel: &mut RenderedSidebarPanel,
+    thread_id: &str,
     comment: &SidebarComment,
     resolved: bool,
 ) {
@@ -1461,7 +1569,10 @@ fn push_sidebar_comment(
             SIDEBAR_WIDTH.saturating_sub(display_width(meta_prefix))
         )
     );
-    let line = panel.push_line(meta, RenderedSidebarRow::target(comment.target_line));
+    let line = panel.push_line(
+        meta,
+        RenderedSidebarRow::thread(comment.target_line, thread_id),
+    );
     if let Some(group) = sidebar_thread_border_highlight(resolved) {
         panel.push_highlight(line, 0, meta_prefix.len() as u32, group);
     }
@@ -1480,7 +1591,10 @@ fn push_sidebar_comment(
             SIDEBAR_WIDTH.saturating_sub(display_width(meta_prefix))
         )
     );
-    let line = panel.push_line(body_line, RenderedSidebarRow::target(comment.target_line));
+    let line = panel.push_line(
+        body_line,
+        RenderedSidebarRow::thread(comment.target_line, thread_id),
+    );
     if let Some(group) = sidebar_thread_border_highlight(resolved) {
         panel.push_highlight(line, 0, meta_prefix.len() as u32, group);
     }
@@ -1488,6 +1602,7 @@ fn push_sidebar_comment(
 
 fn push_sidebar_comment_elision(
     panel: &mut RenderedSidebarPanel,
+    thread_id: &str,
     target_line: usize,
     hidden_count: usize,
     resolved: bool,
@@ -1498,7 +1613,10 @@ fn push_sidebar_comment_elision(
         "{prefix}{}",
         truncate_end(&label, SIDEBAR_WIDTH.saturating_sub(display_width(prefix)))
     );
-    let line = panel.push_line(line_text, RenderedSidebarRow::target(target_line));
+    let line = panel.push_line(
+        line_text,
+        RenderedSidebarRow::thread(target_line, thread_id),
+    );
     if let Some(group) = sidebar_thread_border_highlight(resolved) {
         panel.push_highlight(line, 0, prefix.len() as u32, group);
     }
@@ -1666,17 +1784,9 @@ fn sidebar_thread_border_highlight(resolved: bool) -> Option<&'static str> {
 }
 
 fn placement_location_note(placement: Option<AnchorPlacement>) -> &'static str {
-    match placement {
-        Some(AnchorPlacement::Exact) => "exact source match",
-        Some(AnchorPlacement::PerLineHash) => "source lines match",
-        Some(AnchorPlacement::MovedExact) => "moved exact source match",
-        Some(AnchorPlacement::Context) => "anchored by surrounding context",
-        Some(AnchorPlacement::Window) => "expanded source window",
-        Some(AnchorPlacement::LineFallback) => "stale line fallback",
-        Some(AnchorPlacement::FileFallback) => "file-level fallback",
-        Some(AnchorPlacement::Detached) => "detached from current source",
-        _ => "source location",
-    }
+    placement
+        .map(AnchorPlacement::location_note)
+        .unwrap_or("source location")
 }
 
 fn first_line(text: &str) -> String {

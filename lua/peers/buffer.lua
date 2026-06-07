@@ -2293,7 +2293,9 @@ function M.agent_comment_thread(buf, input)
     buf,
     "Please comment on Peers thread `"
       .. input.thread_id
-      .. "`. Inspect the thread and current code context, then reply using `peers comment --agent \"Codex (GPT-5)\" reply "
+      .. "`. Inspect it with `peers thread show "
+      .. input.thread_id
+      .. " --context 8`, then reply using `peers thread --agent \"Codex (GPT-5)\" reply "
       .. input.thread_id
       .. " --body ...`. Do not make code changes unless the thread explicitly asks for them."
   )
@@ -2315,7 +2317,9 @@ function M.agent_complete_thread(buf, input)
     buf,
     "Please respond to and resolve Peers thread `"
       .. input.thread_id
-      .. "`. Inspect the thread and current code context, make the requested code changes, then reply using `peers comment --agent \"Codex (GPT-5)\" reply "
+      .. "`. Inspect it with `peers thread show "
+      .. input.thread_id
+      .. " --context 8`, make the requested code changes, then reply using `peers thread --agent \"Codex (GPT-5)\" reply "
       .. input.thread_id
       .. " --body ... --resolve` when the thread is complete. If the thread cannot be completed, reply without `--resolve` and explain the blocker."
   )
@@ -2335,7 +2339,7 @@ function M.agent_review_open_threads(buf)
 
   M.ask_agent(
     buf,
-    "Please do a full review of all currently open Peers threads in this repository. Start by running `peers comment list --status open --context 8`, inspect each thread and its current code context, make requested code changes when a thread calls for them, then reply to each completed thread using `peers comment --agent \"Codex (GPT-5)\" reply <thread-id> --body ... --resolve`. If a thread cannot be completed, reply without `--resolve` with the blocker and leave it open."
+    "Please do a full review of all currently open Peers threads in this repository. Start by running `peers thread list --status open --context 8`, inspect each thread with `peers thread show <thread-id> --context 8` when needed, make requested code changes when a thread calls for them, then reply to each completed thread using `peers thread --agent \"Codex (GPT-5)\" reply <thread-id> --body ... --resolve`. If a thread cannot be completed, reply without `--resolve` with the blocker and leave it open."
   )
 end
 

@@ -8,8 +8,8 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use crate::comments::{
     Author, AuthorKind, Comment, CommentId, PayloadStore, PeersEvent, PeersState, PeersTimestamp,
     ThreadId, ThreadPayload, decode_comment_payload, decode_thread_payload, encode_comment_payload,
-    encode_event, encode_thread_payload, parse_events_from_reader, render_agent_context,
-    render_review_markdown, replay_events,
+    encode_event, encode_thread_payload, parse_events_from_reader, render_review_markdown,
+    replay_events,
 };
 use crate::diff::ReviewTarget;
 
@@ -117,7 +117,6 @@ pub struct PeersPaths {
     pub events: PathBuf,
     pub threads: PathBuf,
     pub review_md: PathBuf,
-    pub agent_context: PathBuf,
     pub session: PathBuf,
     pub agent_session: PathBuf,
     pub backend_log: PathBuf,
@@ -134,7 +133,6 @@ pub fn peers_paths(repo_root: &Path) -> PeersPaths {
         events: root.join("events.jsonl"),
         threads: root.join("threads"),
         review_md: root.join("review.md"),
-        agent_context: root.join("agent-context.md"),
         session: root.join("session.json"),
         agent_session: root.join("agent-session.json"),
         backend_log: root.join("backend.log"),
@@ -304,10 +302,6 @@ pub async fn regenerate_outputs(repo_root: &Path, target: Option<&ReviewTarget>)
     let mut review_md = fs::File::create(&paths.review_md).await?;
     render_review_markdown(&state, target, &mut review_md).await?;
     review_md.flush().await?;
-
-    let mut agent_context = fs::File::create(&paths.agent_context).await?;
-    render_agent_context(&state, target, &mut agent_context).await?;
-    agent_context.flush().await?;
 
     Ok(())
 }
