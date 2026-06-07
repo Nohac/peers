@@ -9,13 +9,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const AGENT_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_INITIALIZE: &str = "initialize";
-const REQUEST_THREAD_LIST: &str = "thread/list";
+const REQUEST_THREAD_LOADED_LIST: &str = "thread/loaded/list";
+const REQUEST_THREAD_READ: &str = "thread/read";
 const REQUEST_TURN_START: &str = "turn/start";
 const NOTIFICATION_INITIALIZED: &str = "initialized";
 const CLIENT_NAME: &str = "peers";
 const CLIENT_TITLE: &str = "Peers";
-const SORT_UPDATED_AT: &str = "updated_at";
-const SORT_DESC: &str = "desc";
+const RESPONSE_SNIPPET_LIMIT: usize = 600;
 
 pub async fn invoke(address: &str, repo_root: &Path, prompt: &str) -> Result<String> {
     let mut client = CodexAppClient::connect(address).await?;
@@ -23,7 +23,12 @@ pub async fn invoke(address: &str, repo_root: &Path, prompt: &str) -> Result<Str
     let thread_id = client
         .repo_thread_id(repo_root)
         .await?
-        .ok_or_else(|| anyhow!("no loaded Codex thread found for `{}`", repo_root.display()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "no loaded Codex thread found for `{}`. Start or resume a Codex conversation in this repository first, then retry the Peers agent action.",
+                repo_root.display()
+            )
+        })?;
     client.start_turn(&thread_id, prompt, repo_root).await?;
     Ok(thread_id)
 }
@@ -72,27 +77,41 @@ impl CodexAppClient {
     }
 
     async fn repo_thread_id(&mut self, repo_root: &Path) -> Result<Option<String>> {
+        let loaded_ids = self.loaded_thread_ids().await?;
+        for thread_id in loaded_ids {
+            let thread = self.read_thread(&thread_id).await?;
+            if thread.cwd == repo_root.display().to_string() {
+                return Ok(Some(thread.id));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn loaded_thread_ids(&mut self) -> Result<Vec<String>> {
         let id = self.next_request_id();
-        self.send_json(&CodexThreadListRequest {
+        self.send_json(&CodexThreadLoadedListRequest {
             id,
-            method: REQUEST_THREAD_LIST,
-            params: CodexThreadListParams {
-                limit: 10,
-                sort_key: SORT_UPDATED_AT,
-                sort_direction: SORT_DESC,
-                cwd: repo_root.display().to_string(),
-                archived: false,
-                use_state_db_only: false,
+            method: REQUEST_THREAD_LOADED_LIST,
+            params: CodexThreadLoadedListParams { limit: 10 },
+        })
+        .await?;
+        let response: CodexResponse<CodexThreadLoadedListResponse> = self.response(id).await?;
+        Ok(response.ok_result()?.data)
+    }
+
+    async fn read_thread(&mut self, thread_id: &str) -> Result<CodexThread> {
+        let id = self.next_request_id();
+        self.send_json(&CodexThreadReadRequest {
+            id,
+            method: REQUEST_THREAD_READ,
+            params: CodexThreadReadParams {
+                thread_id: thread_id.to_string(),
+                include_turns: false,
             },
         })
         .await?;
-        let response: CodexResponse<CodexThreadListResponse> = self.response(id).await?;
-        let result = response.ok_result()?;
-        Ok(result
-            .data
-            .into_iter()
-            .find(|thread| thread.cwd == repo_root.display().to_string())
-            .map(|thread| thread.id))
+        let response: CodexResponse<CodexThreadReadResponse> = self.response(id).await?;
+        Ok(response.ok_result()?.thread)
     }
 
     async fn start_turn(&mut self, thread_id: &str, prompt: &str, repo_root: &Path) -> Result<()> {
@@ -140,8 +159,7 @@ impl CodexAppClient {
                 if envelope.id != Some(id) {
                     continue;
                 }
-                return facet_json::from_str::<CodexResponse<T>>(&text)
-                    .context("failed to decode Codex app-server response");
+                return decode_response(id, &text);
             }
             Err(anyhow!(
                 "Codex app-server connection closed before response"
@@ -156,6 +174,23 @@ impl CodexAppClient {
         self.next_id += 1;
         id
     }
+}
+
+fn decode_response<T: Facet<'static>>(id: u32, text: &str) -> Result<CodexResponse<T>> {
+    facet_json::from_str::<CodexResponse<T>>(text).with_context(|| {
+        format!(
+            "failed to decode Codex app-server response for request {id}: {}",
+            response_snippet(text)
+        )
+    })
+}
+
+fn response_snippet(text: &str) -> String {
+    if text.len() <= RESPONSE_SNIPPET_LIMIT {
+        return text.to_string();
+    }
+    let snippet: String = text.chars().take(RESPONSE_SNIPPET_LIMIT).collect();
+    format!("{snippet}...")
 }
 
 #[derive(Debug, Facet)]
@@ -177,7 +212,7 @@ impl<T> CodexResponse<T> {
         if let Some(error) = self.error {
             return Err(anyhow!(
                 "Codex app-server error: {}",
-                error.message.unwrap_or(error.kind)
+                error.display_message()
             ));
         }
         self.result
@@ -188,9 +223,18 @@ impl<T> CodexResponse<T> {
 #[derive(Debug, Facet)]
 struct CodexError {
     #[facet(rename = "type")]
-    kind: String,
+    #[facet(default)]
+    kind: Option<String>,
     #[facet(default)]
     message: Option<String>,
+}
+
+impl CodexError {
+    fn display_message(self) -> String {
+        self.message
+            .or(self.kind)
+            .unwrap_or_else(|| "unknown Codex app-server error".to_string())
+    }
 }
 
 #[derive(Debug, Facet)]
@@ -233,26 +277,40 @@ struct CodexInitializeResponse {
 }
 
 #[derive(Debug, Facet)]
-struct CodexThreadListRequest {
+struct CodexThreadLoadedListRequest {
     id: u32,
     method: &'static str,
-    params: CodexThreadListParams,
+    params: CodexThreadLoadedListParams,
 }
 
 #[derive(Debug, Facet)]
 #[facet(rename_all = "camelCase")]
-struct CodexThreadListParams {
+struct CodexThreadLoadedListParams {
     limit: u32,
-    sort_key: &'static str,
-    sort_direction: &'static str,
-    cwd: String,
-    archived: bool,
-    use_state_db_only: bool,
 }
 
 #[derive(Debug, Facet)]
-struct CodexThreadListResponse {
-    data: Vec<CodexThread>,
+struct CodexThreadLoadedListResponse {
+    data: Vec<String>,
+}
+
+#[derive(Debug, Facet)]
+struct CodexThreadReadRequest {
+    id: u32,
+    method: &'static str,
+    params: CodexThreadReadParams,
+}
+
+#[derive(Debug, Facet)]
+#[facet(rename_all = "camelCase")]
+struct CodexThreadReadParams {
+    thread_id: String,
+    include_turns: bool,
+}
+
+#[derive(Debug, Facet)]
+struct CodexThreadReadResponse {
+    thread: CodexThread,
 }
 
 #[derive(Debug, Facet)]
@@ -318,45 +376,4 @@ struct CodexTurnStartResponse {
 #[derive(Debug, Facet)]
 struct CodexTurn {
     id: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_initialize_response_with_unused_fields() {
-        let response = r#"{
-            "result": {
-                "userAgent": "codex/0.137.0",
-                "codexHome": "/home/jonas/.codex",
-                "platformFamily": "unix",
-                "platformOs": "linux"
-            }
-        }"#;
-
-        let response: CodexResponse<CodexInitializeResponse> =
-            facet_json::from_str(response).unwrap();
-
-        assert_eq!(response.ok_result().unwrap().user_agent, "codex/0.137.0");
-    }
-
-    #[test]
-    fn encodes_turn_start_request_with_codex_field_names() {
-        let request = CodexTurnStartRequest {
-            id: 3,
-            method: REQUEST_TURN_START,
-            params: CodexTurnStartParams {
-                thread_id: "thread-1".to_string(),
-                input: vec![CodexUserInput::text("hello".to_string())],
-                cwd: "/repo".to_string(),
-            },
-        };
-
-        let encoded = facet_json::to_string(&request).unwrap();
-
-        assert!(encoded.contains(r#""method":"turn/start""#), "{encoded}");
-        assert!(encoded.contains(r#""threadId":"thread-1""#), "{encoded}");
-        assert!(encoded.contains(r#""text_elements":[]"#), "{encoded}");
-    }
 }

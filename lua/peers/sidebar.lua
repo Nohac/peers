@@ -505,6 +505,9 @@ local function set_sidebar_keymaps(buf, states)
   vim.keymap.set("n", "C", function()
     M.review_action(buf, states, "agent_comment")
   end, { buffer = buf, desc = "Ask agent to comment on Peers thread", nowait = true })
+  vim.keymap.set("n", "X", function()
+    M.review_action(buf, states, "agent_commit")
+  end, { buffer = buf, desc = "Ask agent to commit current changes", nowait = true })
   vim.keymap.set("n", KEY_DELETE_COMMENT, function()
     M.review_action(buf, states, "delete")
   end, { buffer = buf, desc = "Delete Peers comment", nowait = true })
@@ -657,6 +660,9 @@ function M.review_action(buf, states, action)
   local buffer = require("peers.buffer")
   if action == "agent_review_open" then
     buffer.agent_review_open_threads(review_buf)
+    return
+  elseif action == "agent_commit" then
+    buffer.agent_commit_changes(review_buf)
     return
   end
   if not state.sidebar_rows then

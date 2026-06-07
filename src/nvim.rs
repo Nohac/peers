@@ -954,6 +954,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         sidebar: RenderedSidebar::default(),
         sidebar_counts: RenderedSidebarCounts::default(),
     };
+    let mut rendered_thread_ids = BTreeSet::<String>::new();
 
     if !review.files.iter().any(review_file_is_visible) {
         render_empty_review(&mut rendered);
@@ -1046,6 +1047,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
                             );
                             push_inline_threads(
                                 &mut rendered,
+                                &mut rendered_thread_ids,
                                 &file_threads,
                                 &file.path,
                                 SIDE_NEW,
@@ -1079,6 +1081,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
                             );
                             push_inline_threads(
                                 &mut rendered,
+                                &mut rendered_thread_ids,
                                 &file_threads,
                                 &file.path,
                                 SIDE_NEW,
@@ -1112,6 +1115,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
                             );
                             push_inline_threads(
                                 &mut rendered,
+                                &mut rendered_thread_ids,
                                 &file_threads,
                                 &file.path,
                                 SIDE_OLD,
@@ -1128,7 +1132,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
             .copied()
             .filter(|thread| thread_needs_file_fallback_block(thread))
         {
-            push_thread_block(&mut rendered, thread);
+            push_thread_block_once(&mut rendered, &mut rendered_thread_ids, thread);
         }
 
         for thread in file_threads
@@ -1136,7 +1140,7 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
             .copied()
             .filter(|thread| thread.scope == THREAD_SCOPE_FILE)
         {
-            push_thread_block(&mut rendered, thread);
+            push_thread_block_once(&mut rendered, &mut rendered_thread_ids, thread);
         }
 
         let end_line = rendered.lines.len().saturating_sub(1) as u32;
@@ -1859,6 +1863,7 @@ fn push_attachment_highlights(
 
 fn push_inline_threads(
     rendered: &mut RenderedReview,
+    rendered_thread_ids: &mut BTreeSet<String>,
     threads: &[&ReviewThread],
     path: &str,
     side: &str,
@@ -1869,7 +1874,7 @@ fn push_inline_threads(
         .copied()
         .filter(|thread| thread_matches_line(thread, path, side, line))
     {
-        push_thread_block(rendered, thread);
+        push_thread_block_once(rendered, rendered_thread_ids, thread);
     }
 }
 
@@ -1910,6 +1915,16 @@ fn push_thread_block(rendered: &mut RenderedReview, thread: &ReviewThread) {
             collapsed: thread.collapsed,
         },
     );
+}
+
+fn push_thread_block_once(
+    rendered: &mut RenderedReview,
+    rendered_thread_ids: &mut BTreeSet<String>,
+    thread: &ReviewThread,
+) {
+    if rendered_thread_ids.insert(thread.id.clone()) {
+        push_thread_block(rendered, thread);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3164,6 +3179,85 @@ mod tests {
         );
         assert_eq!(rendered.sidebar_counts.files, 1);
         assert_eq!(rendered.sidebar_counts.comments, 1);
+    }
+
+    #[test]
+    fn renders_thread_card_once_when_multiple_hunks_cover_anchor() {
+        let rendered = render_review_payload(ReviewProjection {
+            review_id: "repo".to_string(),
+            target_label: "working tree".to_string(),
+            current_head_oid: Some("head-1".to_string()),
+            is_branch_review: false,
+            files: vec![ReviewFile {
+                path: "src/main.rs".to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                is_changed: true,
+                comment_count: 1,
+                added_lines: 0,
+                removed_lines: 1,
+            }],
+            file_contents_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                crate::diff::FileContent {
+                    old: Some(vec!["fn main() {}".to_string()]),
+                    new: None,
+                },
+            )]),
+            file_diffs_by_path: BTreeMap::from([(
+                "src/main.rs".to_string(),
+                FileDiff {
+                    path: "src/main.rs".to_string(),
+                    hunks: vec![
+                        crate::diff::DiffHunk {
+                            old: Some(crate::diff::LineRange { start: 1, end: 1 }),
+                            new: None,
+                            sections: vec![crate::diff::DiffSection::Removed {
+                                removed: crate::diff::OldRange {
+                                    old: crate::diff::LineRange { start: 1, end: 1 },
+                                },
+                            }],
+                        },
+                        crate::diff::DiffHunk {
+                            old: Some(crate::diff::LineRange { start: 1, end: 1 }),
+                            new: None,
+                            sections: vec![crate::diff::DiffSection::Removed {
+                                removed: crate::diff::OldRange {
+                                    old: crate::diff::LineRange { start: 1, end: 1 },
+                                },
+                            }],
+                        },
+                    ],
+                },
+            )]),
+            threads: vec![ReviewThread {
+                id: "thread-1".to_string(),
+                scope: THREAD_SCOPE_LINE.to_string(),
+                path: Some("src/main.rs".to_string()),
+                line_label: "src/main.rs:1".to_string(),
+                anchor: ReviewThreadAnchor {
+                    side: Some(SIDE_OLD.to_string()),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    placement: Some(AnchorPlacement::Exact),
+                    line_placements: Vec::new(),
+                },
+                resolved: true,
+                resolved_head_oid: Some("head-1".to_string()),
+                collapsed: false,
+                comments: Vec::new(),
+            }],
+            review_threads: Vec::new(),
+            commits: Vec::new(),
+        });
+        let header = format!("{THREAD_STATUS_RESOLVED_ICON} src/main.rs:1");
+        let rendered_count = rendered
+            .lines
+            .iter()
+            .filter(|line| line.contains(&header))
+            .count();
+
+        assert_eq!(rendered_count, 1);
     }
 
     #[test]

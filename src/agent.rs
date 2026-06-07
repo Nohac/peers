@@ -336,6 +336,13 @@ async fn load_agent_session(repo_root: &Path) -> Result<AgentSession> {
         .with_context(|| format!("{NO_AGENT_SESSION_ERROR} Missing `{}`.", path.display()))?;
     let session =
         facet_json::from_str::<AgentSession>(&text).context("failed to decode agent session")?;
+    if let Some(pid) = session.server_pid
+        && !server_process_exists(pid).await
+    {
+        return Err(anyhow!(
+            "{NO_AGENT_SESSION_ERROR} Session server process `{pid}` is no longer running."
+        ));
+    }
     validate_app_server(&AgentEndpoint {
         address: session.address.clone(),
         host: session.host.clone(),
@@ -344,6 +351,21 @@ async fn load_agent_session(repo_root: &Path) -> Result<AgentSession> {
     .await
     .with_context(|| format!("{NO_AGENT_SESSION_ERROR} Session endpoint is not reachable."))?;
     Ok(session)
+}
+
+async fn server_process_exists(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return fs::try_exists(format!("/proc/{pid}"))
+            .await
+            .unwrap_or(false);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 async fn stop_child(child: &mut Child) {

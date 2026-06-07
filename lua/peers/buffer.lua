@@ -2339,6 +2339,20 @@ function M.agent_review_open_threads(buf)
   )
 end
 
+function M.agent_commit_changes(buf)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    vim.notify("Peers agent commit is only available in a Peers review buffer", vim.log.levels.WARN)
+    return
+  end
+
+  M.ask_agent(
+    buf,
+    "Please commit the current changes in this repository. Inspect `git status` and the current diff, include only the intended working tree changes, run appropriate checks for the touched code, then create a normal git commit with a concise message. Do not amend an existing commit unless explicitly requested. If anything is ambiguous or checks fail, report the blocker instead of committing."
+  )
+end
+
 function M.is_review_buffer(buf)
   return RENDER_STATES[buf or vim.api.nvim_get_current_buf()] ~= nil
 end
@@ -2485,6 +2499,13 @@ local function set_review_keymaps(buf)
   end, {
     buffer = buf,
     desc = "Collapse or expand Peers thread",
+    nowait = true,
+  })
+  vim.keymap.set("n", "X", function()
+    M.agent_commit_changes(buf)
+  end, {
+    buffer = buf,
+    desc = "Ask agent to commit current changes",
     nowait = true,
   })
   sidebar.set_review_keymaps(buf, RENDER_STATES)
