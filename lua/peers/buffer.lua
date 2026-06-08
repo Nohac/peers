@@ -297,6 +297,44 @@ local function define_diff_gutter_highlights()
     [HIGHLIGHT_FG] = thread_resolved_fg,
     [HIGHLIGHT_BOLD] = true,
   })
+  pcall(vim.api.nvim_set_hl, 0, "PeersCommitSummaryAdded", {
+    default = true,
+    [HIGHLIGHT_FG] = add_fg,
+    [HIGHLIGHT_BOLD] = true,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersCommitSummaryRemoved", {
+    default = true,
+    [HIGHLIGHT_FG] = delete_fg,
+    [HIGHLIGHT_BOLD] = true,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersCommitSummaryPositive", {
+    default = true,
+    [HIGHLIGHT_FG] = add_fg,
+    [HIGHLIGHT_BOLD] = true,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersCommitSummaryNegative", {
+    default = true,
+    [HIGHLIGHT_FG] = delete_fg,
+    [HIGHLIGHT_BOLD] = true,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersCommitSummaryNeutral", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_detached_fg,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersCommitSummaryOpen", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_fg,
+    [HIGHLIGHT_BOLD] = true,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersCommitSummaryClosed", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_resolved_fg,
+    [HIGHLIGHT_BOLD] = true,
+  })
+  pcall(vim.api.nvim_set_hl, 0, "PeersCommitSummarySeparator", {
+    default = true,
+    [HIGHLIGHT_FG] = thread_detached_fg,
+  })
   pcall(vim.api.nvim_set_hl, 0, "PeersDiffThreadHeader", {
     default = true,
     [HIGHLIGHT_FG] = normal_fg,
@@ -1687,6 +1725,8 @@ local function close_composer(state)
   state.composer_return_win = nil
   state.composer_return_sidebar_focus = nil
   state.composer_review_view = nil
+  state.composer_allow_empty = nil
+  state.composer_body_start_line = nil
   return review_win, return_win
 end
 
@@ -1706,17 +1746,18 @@ local function composer_row(review_win)
   return winline
 end
 
-local function composer_config(review_win, title)
+local function composer_config(review_win, opts)
+  opts = opts or {}
   return {
     relative = "win",
     win = review_win,
     row = composer_row(review_win),
     col = COMPOSER_GUTTER_COL,
     width = composer_width(review_win),
-    height = COMPOSER_HEIGHT,
+    height = opts.height or COMPOSER_HEIGHT,
     border = "rounded",
-    title = title or COMPOSER_TITLE,
-    footer = " <C-s> submit · Esc/q cancel ",
+    title = opts.title or COMPOSER_TITLE,
+    footer = opts.footer or " <C-s> submit · Esc/q cancel",
     footer_pos = "right",
     style = "minimal",
   }
@@ -1738,8 +1779,18 @@ function M._configure_composer_window(win)
   vim.wo[win].foldcolumn = "0"
 end
 
-local function composer_body(buf)
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+function M._apply_composer_highlights(buf, highlights)
+  for _, highlight in ipairs(highlights or {}) do
+    vim.api.nvim_buf_set_extmark(buf, NAMESPACE, highlight.line, highlight.start_col, {
+      end_col = highlight.end_col,
+      hl_group = highlight.group,
+      priority = 1000,
+    })
+  end
+end
+
+local function composer_body(buf, start_line)
+  local lines = vim.api.nvim_buf_get_lines(buf, start_line or 0, -1, false)
   return vim.trim(table.concat(lines, "\n"))
 end
 
@@ -1855,8 +1906,8 @@ local function submit_composer(review_buf, draft_buf, on_submit)
     return
   end
 
-  local body = composer_body(draft_buf)
-  if body == "" then
+  local body = composer_body(draft_buf, state.composer_body_start_line)
+  if body == "" and not state.composer_allow_empty then
     vim.notify(COMMENT_EMPTY_MESSAGE, vim.log.levels.WARN)
     return
   end
@@ -1966,11 +2017,19 @@ local function open_composer(review_buf, opts)
   vim.bo[draft_buf].swapfile = false
   vim.bo[draft_buf].filetype = COMPOSER_FILETYPE
   M._configure_composer_buffer(draft_buf)
-  vim.api.nvim_buf_set_lines(draft_buf, 0, -1, false, vim.split(opts.initial_body or COMPOSER_INITIAL_LINE, "\n", {
+  local initial_lines = vim.split(opts.initial_body or COMPOSER_INITIAL_LINE, "\n", {
     plain = true,
-  }))
+  })
+  local body_start_line = 0
+  if opts.header_lines and #opts.header_lines > 0 then
+    local lines = vim.list_extend(vim.deepcopy(opts.header_lines), initial_lines)
+    body_start_line = #opts.header_lines
+    initial_lines = lines
+  end
+  vim.api.nvim_buf_set_lines(draft_buf, 0, -1, false, initial_lines)
+  M._apply_composer_highlights(draft_buf, opts.header_highlights)
 
-  local ok, draft_win = pcall(vim.api.nvim_open_win, draft_buf, false, composer_config(review_win, opts.title))
+  local ok, draft_win = pcall(vim.api.nvim_open_win, draft_buf, false, composer_config(review_win, opts))
   if not ok or not draft_win or not vim.api.nvim_win_is_valid(draft_win) then
     if vim.api.nvim_buf_is_valid(draft_buf) then
       vim.api.nvim_buf_delete(draft_buf, { force = true })
@@ -1985,6 +2044,8 @@ local function open_composer(review_buf, opts)
   state.composer_return_win = return_win
   state.composer_return_sidebar_focus = return_sidebar_focus
   state.composer_review_view = save_win_view(review_win)
+  state.composer_allow_empty = opts.allow_empty == true
+  state.composer_body_start_line = body_start_line
 
   vim.keymap.set({ "n", "i" }, COMPOSER_SUBMIT_MAP, function()
     submit_composer(review_buf, draft_buf, opts.on_submit)
@@ -2024,6 +2085,7 @@ local function open_composer(review_buf, opts)
     end
     M._configure_composer_buffer(draft_buf)
     M._configure_composer_window(draft_win)
+    pcall(vim.api.nvim_win_set_cursor, draft_win, { body_start_line + 1, 0 })
     if opts.insert_on_open then
       pcall(vim.cmd, "startinsert")
     end
@@ -2559,6 +2621,119 @@ function M.agent_review_open_threads(buf)
   )
 end
 
+function M._signed_delta(value)
+  if value >= 0 then
+    return "+" .. tostring(value)
+  end
+  return tostring(value)
+end
+
+function M._commit_summary(state)
+  local seen_files = {}
+  local seen_threads = {}
+  local added = 0
+  local removed = 0
+  local open_threads = 0
+  local closed_threads = 0
+
+  for _, row in ipairs(state.rows or {}) do
+    if row.kind == ROW_KIND_FILE_HEADER and row.path and not seen_files[row.path] then
+      seen_files[row.path] = true
+      added = added + (row.added_lines or 0)
+      removed = removed + (row.removed_lines or 0)
+    end
+    if row.thread_id and seen_threads[row.thread_id] == nil then
+      seen_threads[row.thread_id] = true
+      if row.resolved == true then
+        closed_threads = closed_threads + 1
+      else
+        open_threads = open_threads + 1
+      end
+    end
+  end
+
+  return {
+    added = added,
+    removed = removed,
+    delta = added - removed,
+    open_threads = open_threads,
+    closed_threads = closed_threads,
+  }
+end
+
+function M._commit_summary_line(summary)
+  return M._commit_summary_header_payload(summary).lines[1]
+end
+
+function M._commit_summary_header_payload(summary, width)
+  local highlights = {}
+  local parts = {}
+  local col = 0
+
+  local function push(text, group)
+    table.insert(parts, text)
+    if group then
+      table.insert(highlights, {
+        line = 0,
+        start_col = col,
+        end_col = col + #text,
+        group = group,
+      })
+    end
+    col = col + #text
+  end
+
+  local added = "+" .. tostring(summary.added)
+  local removed = "−" .. tostring(summary.removed)
+  local delta = "Δ" .. M._signed_delta(summary.delta)
+  local delta_group = "PeersCommitSummaryNeutral"
+  if summary.delta > 0 then
+    delta_group = "PeersCommitSummaryPositive"
+  elseif summary.delta < 0 then
+    delta_group = "PeersCommitSummaryNegative"
+  end
+
+  push("  ")
+  push(added, "PeersCommitSummaryAdded")
+  push(" ")
+  push(removed, "PeersCommitSummaryRemoved")
+  push(" ")
+  push(delta, delta_group)
+  push(" · ")
+  push("● " .. tostring(summary.open_threads) .. " open", "PeersCommitSummaryOpen")
+  push(" · ")
+  push("✓ " .. tostring(summary.closed_threads) .. " closed", "PeersCommitSummaryClosed")
+
+  local separator = string.rep("─", width or 0)
+  if separator ~= "" then
+    table.insert(highlights, {
+      line = 1,
+      start_col = 0,
+      end_col = #separator,
+      group = "PeersCommitSummarySeparator",
+    })
+  end
+
+  return {
+    lines = { table.concat(parts), separator },
+    highlights = highlights,
+  }
+end
+
+function M._commit_summary_header(state, review_win)
+  return M._commit_summary_header_payload(M._commit_summary(state), composer_width(review_win))
+end
+
+function M._commit_agent_prompt(notes)
+  notes = vim.trim(notes or "")
+  local prompt =
+    "Please commit the current changes in this repository. Inspect `git status` and the current diff, include only the intended working tree changes, run appropriate checks for the touched code, then create a normal git commit with a concise message. Do not amend an existing commit unless explicitly requested. If anything is ambiguous or checks fail, report the blocker instead of committing."
+  if notes ~= "" then
+    prompt = prompt .. "\n\nFinal notes from the user:\n" .. notes
+  end
+  return prompt
+end
+
 function M.agent_commit_changes(buf)
   buf = buf or vim.api.nvim_get_current_buf()
   local state = RENDER_STATES[buf]
@@ -2567,10 +2742,27 @@ function M.agent_commit_changes(buf)
     return
   end
 
-  M.ask_agent(
-    buf,
-    "Please commit the current changes in this repository. Inspect `git status` and the current diff, include only the intended working tree changes, run appropriate checks for the touched code, then create a normal git commit with a concise message. Do not amend an existing commit unless explicitly requested. If anything is ambiguous or checks fail, report the blocker instead of committing."
-  )
+  local review_win = review_window_for(buf)
+  if not review_win then
+    vim.notify("Peers agent commit is only available in a visible Peers review buffer", vim.log.levels.WARN)
+    return
+  end
+  local return_win = vim.api.nvim_get_current_win()
+  local header = M._commit_summary_header(state, review_win)
+  open_composer(buf, {
+    title = " Commit summary ",
+    footer = " <C-s> send · Esc/q cancel",
+    header_lines = header.lines,
+    header_highlights = header.highlights,
+    allow_empty = true,
+    insert_on_open = true,
+    review_win = review_win,
+    return_win = return_win,
+    on_submit = function(composer_state, notes)
+      close_composer(composer_state)
+      M.ask_agent(buf, M._commit_agent_prompt(notes))
+    end,
+  })
 end
 
 function M.is_review_buffer(buf)
@@ -2721,11 +2913,11 @@ local function set_review_keymaps(buf)
     desc = "Collapse or expand Peers thread",
     nowait = true,
   })
-  vim.keymap.set("n", "X", function()
+  vim.keymap.set("n", "S", function()
     M.agent_commit_changes(buf)
   end, {
     buffer = buf,
-    desc = "Ask agent to commit current changes",
+    desc = "Show Peers commit summary and ask agent to commit",
     nowait = true,
   })
   sidebar.set_review_keymaps(buf, RENDER_STATES)
