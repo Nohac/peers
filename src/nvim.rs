@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -459,6 +460,9 @@ impl LanguageServer for PeersDiffLanguageServer {
     }
 
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        if !is_review_uri(&params.text_document_position_params.text_document.uri) {
+            return Ok(None);
+        }
         let summary = self.review_summary().await;
         let line = params.text_document_position_params.position.line + 1;
         let character = params.text_document_position_params.position.character + 1;
@@ -485,6 +489,17 @@ impl LanguageServer for PeersDiffLanguageServer {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
+        if let Some(actions) = source_code_actions_for_range(
+            self.provider.repo_root(),
+            &params.text_document.uri,
+            params.range,
+        ) {
+            return Ok(Some(actions));
+        }
+        if !is_review_uri(&params.text_document.uri) {
+            return Ok(Some(Vec::new()));
+        }
+
         let review = self
             .provider
             .get_review()
@@ -513,6 +528,9 @@ impl LanguageServer for PeersDiffLanguageServer {
         params: DocumentSymbolParams,
     ) -> LspResult<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
+        if !is_review_uri(&uri) {
+            return Ok(None);
+        }
         let review = self
             .provider
             .get_review()
@@ -570,6 +588,7 @@ struct RenderedReview {
     lines: Vec<String>,
     rows: Vec<RenderedRow>,
     highlights: Vec<RenderedHighlight>,
+    source_decorations: Vec<SourceDecoration>,
     symbols: Vec<RenderedSymbol>,
     sidebar: RenderedSidebar,
     sidebar_counts: RenderedSidebarCounts,
@@ -609,6 +628,7 @@ struct RenderedReviewPayload {
     lines: Vec<String>,
     rows: Vec<RenderedRow>,
     highlights: Vec<RenderedHighlight>,
+    source_decorations: Vec<SourceDecoration>,
     sidebar: RenderedSidebar,
     sidebar_counts: RenderedSidebarCounts,
 }
@@ -619,6 +639,7 @@ impl From<RenderedReview> for RenderedReviewPayload {
             lines: rendered.lines,
             rows: rendered.rows,
             highlights: rendered.highlights,
+            source_decorations: rendered.source_decorations,
             sidebar: rendered.sidebar,
             sidebar_counts: rendered.sidebar_counts,
         }
@@ -685,6 +706,7 @@ fn render_thread_patch(
         lines: Vec::new(),
         rows: Vec::new(),
         highlights: Vec::new(),
+        source_decorations: Vec::new(),
         symbols: Vec::new(),
         sidebar: RenderedSidebar::default(),
         sidebar_counts: RenderedSidebarCounts::default(),
@@ -1040,6 +1062,15 @@ struct RenderedHighlight {
     group: &'static str,
 }
 
+#[derive(Clone, Debug, Facet)]
+struct SourceDecoration {
+    path: String,
+    line: u32,
+    thread_id: String,
+    resolved: bool,
+    group: &'static str,
+}
+
 #[derive(Debug)]
 struct RenderedSymbol {
     name: String,
@@ -1055,11 +1086,13 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
         lines: Vec::new(),
         rows: Vec::new(),
         highlights: Vec::new(),
+        source_decorations: Vec::new(),
         symbols: Vec::new(),
         sidebar: RenderedSidebar::default(),
         sidebar_counts: RenderedSidebarCounts::default(),
     };
     let mut rendered_thread_ids = BTreeSet::<String>::new();
+    rendered.source_decorations = source_decorations(&review);
 
     if !review.files.iter().any(review_file_is_visible) {
         render_empty_review(&mut rendered);
@@ -1266,6 +1299,68 @@ fn render_review_payload(review: ReviewProjection) -> RenderedReview {
 
     rendered.sidebar = render_sidebar(&rendered.rows);
     rendered
+}
+
+fn source_decorations(review: &ReviewProjection) -> Vec<SourceDecoration> {
+    let mut decorations = Vec::new();
+    let visible_paths: BTreeSet<_> = review
+        .files
+        .iter()
+        .filter(|file| review_file_is_visible(file))
+        .map(|file| file.path.as_str())
+        .collect();
+
+    for thread in review
+        .threads
+        .iter()
+        .filter(|thread| review_thread_visible_in_default_projection(thread, review))
+    {
+        let Some(path) = thread.path.as_ref() else {
+            continue;
+        };
+        if !visible_paths.contains(path.as_str()) {
+            continue;
+        }
+        if thread.anchor.side.as_deref() != Some(SIDE_NEW) {
+            continue;
+        }
+
+        let group = thread_source_decoration_highlight(thread);
+        let mut seen_lines = BTreeSet::new();
+        for placement in &thread.anchor.line_placements {
+            let Some(line) = placement.current_line else {
+                continue;
+            };
+            if seen_lines.insert(line) {
+                decorations.push(SourceDecoration {
+                    path: path.clone(),
+                    line,
+                    thread_id: thread.id.clone(),
+                    resolved: thread.resolved,
+                    group: thread_line_source_decoration_highlight(thread, line),
+                });
+            }
+        }
+        if !seen_lines.is_empty() {
+            continue;
+        }
+
+        let Some(start_line) = thread.anchor.start_line else {
+            continue;
+        };
+        let end_line = thread.anchor.end_line.unwrap_or(start_line);
+        for line in start_line.min(end_line)..=start_line.max(end_line) {
+            decorations.push(SourceDecoration {
+                path: path.clone(),
+                line,
+                thread_id: thread.id.clone(),
+                resolved: thread.resolved,
+                group,
+            });
+        }
+    }
+
+    decorations
 }
 
 fn review_file_is_visible(file: &crate::diff::ReviewFile) -> bool {
@@ -2388,6 +2483,41 @@ fn thread_line_rail_highlight(thread: &ReviewThread, current_line: u32) -> &'sta
     }
 }
 
+fn thread_source_decoration_highlight(thread: &ReviewThread) -> &'static str {
+    if thread.resolved {
+        HIGHLIGHT_THREAD_RESOLVED
+    } else {
+        thread_border_highlight(thread)
+    }
+}
+
+fn thread_line_source_decoration_highlight(
+    thread: &ReviewThread,
+    current_line: u32,
+) -> &'static str {
+    if thread.resolved {
+        return HIGHLIGHT_THREAD_RESOLVED;
+    }
+
+    let placement = thread
+        .anchor
+        .line_placements
+        .iter()
+        .find(|line| line.current_line == Some(current_line))
+        .map(|line| line.placement);
+    match placement {
+        Some(AnchorLinePlacement::Exact | AnchorLinePlacement::Content) => HIGHLIGHT_THREAD_BORDER,
+        Some(AnchorLinePlacement::Context | AnchorLinePlacement::Changed) => {
+            HIGHLIGHT_THREAD_BORDER_CONTEXT
+        }
+        Some(AnchorLinePlacement::LineFallback) => HIGHLIGHT_THREAD_BORDER_STALE,
+        Some(
+            AnchorLinePlacement::Gap | AnchorLinePlacement::Missing | AnchorLinePlacement::Detached,
+        ) => HIGHLIGHT_THREAD_BORDER_DETACHED,
+        _ => thread_border_highlight(thread),
+    }
+}
+
 fn thread_location_note(thread: &ReviewThread) -> &'static str {
     placement_location_note(thread.anchor.placement)
 }
@@ -2568,6 +2698,60 @@ fn code_actions_for_range(rendered: &RenderedReview, range: Range) -> CodeAction
     }
 
     actions
+}
+
+fn source_code_actions_for_range(
+    repo_root: &Path,
+    uri: &Uri,
+    range: Range,
+) -> Option<CodeActionResponse> {
+    let path = source_uri_repo_path(repo_root, uri)?;
+    let start_line = range.start.line.min(normalized_range_end(range)) + 1;
+    let end_line = range.start.line.max(normalized_range_end(range)) + 1;
+    let anchor = LineCommentAnchor {
+        path: path.as_str(),
+        side: SIDE_NEW,
+        start_line,
+        end_line,
+    };
+    let title = if start_line == end_line {
+        ACTION_ADD_LINE_COMMENT.to_string()
+    } else {
+        format!("{ACTION_ADD_RANGE_COMMENT_PREFIX} {start_line}..{end_line}")
+    };
+    Some(vec![command_action(
+        title,
+        COMMAND_ADD_COMMENT,
+        Some(vec![line_anchor_arg(&anchor)]),
+    )])
+}
+
+fn is_review_uri(uri: &Uri) -> bool {
+    uri.to_string().starts_with("peers://")
+}
+
+fn source_uri_repo_path(repo_root: &Path, uri: &Uri) -> Option<String> {
+    if is_review_uri(uri) {
+        return None;
+    }
+    let path = file_uri_path(uri)?;
+    let relative = path.strip_prefix(repo_root).ok()?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return None;
+    }
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn file_uri_path(uri: &Uri) -> Option<PathBuf> {
+    uri.to_string()
+        .starts_with("file://")
+        .then(|| uri.to_file_path())?
+        .map(|path| path.into_owned())
 }
 
 fn comment_row_actions(row: &RenderedRow) -> CodeActionResponse {
@@ -3164,6 +3348,7 @@ mod tests {
                 RenderedRow::source(ROW_KIND_CONTEXT, "src/main.rs", SIDE_NEW, 1),
             ],
             highlights: Vec::new(),
+            source_decorations: Vec::new(),
             symbols: Vec::new(),
             sidebar: RenderedSidebar::default(),
             sidebar_counts: RenderedSidebarCounts::default(),
@@ -3186,6 +3371,29 @@ mod tests {
 
         assert!(comment_titles.contains(&ACTION_RESPOND_TO_THREAD.to_string()));
         assert!(!source_titles.contains(&ACTION_RESPOND_TO_THREAD.to_string()));
+    }
+
+    #[test]
+    fn source_file_code_actions_create_line_comment_anchor() {
+        let repo_root = Path::new("/repo");
+        let uri = "file:///repo/src/main.rs".parse::<Uri>().unwrap();
+        let actions = source_code_actions_for_range(
+            repo_root,
+            &uri,
+            Range {
+                start: Position::new(4, 0),
+                end: Position::new(6, 0),
+            },
+        )
+        .expect("repo source file should offer Peers comment actions");
+
+        let CodeActionOrCommand::Command(command) = &actions[0] else {
+            panic!("expected source code action command");
+        };
+        assert_eq!(command.title, "Peers: Add comment on lines 5..6");
+        assert_eq!(command.command, COMMAND_ADD_COMMENT);
+        let args = command.arguments.as_ref().expect("anchor argument");
+        assert!(format!("{:?}", args[0]).contains("src/main.rs"));
     }
 
     #[test]
@@ -3695,59 +3903,97 @@ mod tests {
                     }],
                 },
             )]),
-            threads: vec![ReviewThread {
-                id: "thread-1".to_string(),
-                scope: THREAD_SCOPE_LINE.to_string(),
-                path: Some("src/main.rs".to_string()),
-                line_label: "src/main.rs:1-4".to_string(),
-                anchor: ReviewThreadAnchor {
-                    side: Some(SIDE_NEW.to_string()),
-                    start_line: Some(1),
-                    end_line: Some(4),
-                    placement: Some(AnchorPlacement::Window),
-                    line_placements: vec![
-                        ReviewThreadLinePlacement {
-                            original_line: Some(1),
-                            current_line: Some(1),
-                            placement: AnchorLinePlacement::Content,
-                        },
-                        ReviewThreadLinePlacement {
-                            original_line: None,
-                            current_line: Some(2),
-                            placement: AnchorLinePlacement::Gap,
-                        },
-                        ReviewThreadLinePlacement {
-                            original_line: Some(2),
-                            current_line: Some(3),
-                            placement: AnchorLinePlacement::Changed,
-                        },
-                        ReviewThreadLinePlacement {
-                            original_line: Some(3),
-                            current_line: Some(4),
-                            placement: AnchorLinePlacement::Content,
-                        },
-                    ],
-                },
-                resolved: false,
-                resolved_head_oid: None,
-                collapsed: false,
-                comments: vec![ReviewComment {
-                    comment: Comment {
-                        id: CommentId::from_raw("cmt_test"),
-                        thread_id: ThreadId::from_raw("thr_test"),
-                        author: Author {
-                            kind: AuthorKind::Human,
-                            display_name: "jonas".to_string(),
-                            email: None,
-                        },
-                        body: "mixed context".to_string(),
-                        created_at: PeersTimestamp::from_rfc3339_unchecked("2026-05-28T12:00:00Z"),
-                        edited_at: None,
-                        deleted_at: None,
+            threads: vec![
+                ReviewThread {
+                    id: "thread-1".to_string(),
+                    scope: THREAD_SCOPE_LINE.to_string(),
+                    path: Some("src/main.rs".to_string()),
+                    line_label: "src/main.rs:1-4".to_string(),
+                    anchor: ReviewThreadAnchor {
+                        side: Some(SIDE_NEW.to_string()),
+                        start_line: Some(1),
+                        end_line: Some(4),
+                        placement: Some(AnchorPlacement::Window),
+                        line_placements: vec![
+                            ReviewThreadLinePlacement {
+                                original_line: Some(1),
+                                current_line: Some(1),
+                                placement: AnchorLinePlacement::Content,
+                            },
+                            ReviewThreadLinePlacement {
+                                original_line: None,
+                                current_line: Some(2),
+                                placement: AnchorLinePlacement::Gap,
+                            },
+                            ReviewThreadLinePlacement {
+                                original_line: Some(2),
+                                current_line: Some(3),
+                                placement: AnchorLinePlacement::Changed,
+                            },
+                            ReviewThreadLinePlacement {
+                                original_line: Some(3),
+                                current_line: Some(4),
+                                placement: AnchorLinePlacement::Content,
+                            },
+                        ],
                     },
-                    can_edit: true,
-                }],
-            }],
+                    resolved: false,
+                    resolved_head_oid: None,
+                    collapsed: false,
+                    comments: vec![ReviewComment {
+                        comment: Comment {
+                            id: CommentId::from_raw("cmt_test"),
+                            thread_id: ThreadId::from_raw("thr_test"),
+                            author: Author {
+                                kind: AuthorKind::Human,
+                                display_name: "jonas".to_string(),
+                                email: None,
+                            },
+                            body: "mixed context".to_string(),
+                            created_at: PeersTimestamp::from_rfc3339_unchecked(
+                                "2026-05-28T12:00:00Z",
+                            ),
+                            edited_at: None,
+                            deleted_at: None,
+                        },
+                        can_edit: true,
+                    }],
+                },
+                ReviewThread {
+                    id: "thread-2".to_string(),
+                    scope: THREAD_SCOPE_LINE.to_string(),
+                    path: Some("src/main.rs".to_string()),
+                    line_label: "src/main.rs:4".to_string(),
+                    anchor: ReviewThreadAnchor {
+                        side: Some(SIDE_NEW.to_string()),
+                        start_line: Some(4),
+                        end_line: Some(4),
+                        placement: Some(AnchorPlacement::Exact),
+                        line_placements: Vec::new(),
+                    },
+                    resolved: true,
+                    resolved_head_oid: Some("head-1".to_string()),
+                    collapsed: false,
+                    comments: vec![ReviewComment {
+                        comment: Comment {
+                            id: CommentId::from_raw("cmt_resolved"),
+                            thread_id: ThreadId::from_raw("thr_resolved"),
+                            author: Author {
+                                kind: AuthorKind::Human,
+                                display_name: "jonas".to_string(),
+                                email: None,
+                            },
+                            body: "resolved exact".to_string(),
+                            created_at: PeersTimestamp::from_rfc3339_unchecked(
+                                "2026-05-28T12:00:00Z",
+                            ),
+                            edited_at: None,
+                            deleted_at: None,
+                        },
+                        can_edit: true,
+                    }],
+                },
+            ],
             review_threads: Vec::new(),
             commits: Vec::new(),
         });
@@ -3766,6 +4012,20 @@ mod tests {
                 .highlights
                 .iter()
                 .any(|highlight| { highlight.group == HIGHLIGHT_THREAD_BORDER_CONTEXT })
+        );
+        assert_eq!(
+            rendered
+                .source_decorations
+                .iter()
+                .map(|decoration| (decoration.line, decoration.group))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, HIGHLIGHT_THREAD_BORDER),
+                (2, HIGHLIGHT_THREAD_BORDER_DETACHED),
+                (3, HIGHLIGHT_THREAD_BORDER_CONTEXT),
+                (4, HIGHLIGHT_THREAD_BORDER),
+                (4, HIGHLIGHT_THREAD_RESOLVED),
+            ]
         );
     }
 

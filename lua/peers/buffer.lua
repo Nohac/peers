@@ -1,5 +1,6 @@
 local lsp = require("peers.lsp")
 local sidebar = require("peers.sidebar")
+local source_decorations = require("peers.source_decorations")
 local timing = require("peers.timing")
 
 local M = {}
@@ -2178,6 +2179,10 @@ function apply_render(root, buf, render, client_id, opts)
   apply_diagnostics(buf, render.diagnostics)
   local diagnostics_ms = timing.ms(stage_start)
 
+  stage_start = timing.now()
+  source_decorations.apply(root, render.source_decorations)
+  local source_decorations_ms = timing.ms(stage_start)
+
   RENDER_STATES[buf] = {
     root = root,
     client_id = client_id,
@@ -2185,6 +2190,7 @@ function apply_render(root, buf, render, client_id, opts)
     rows = render.rows or {},
     sidebar = render.sidebar or {},
     sidebar_counts = render.sidebar_counts or {},
+    source_decorations = render.source_decorations or {},
     source_buffers = existing and existing.source_buffers or {},
     source_lsp_buffers = existing and existing.source_lsp_buffers or {},
     source_segments = existing and existing.source_segments or {},
@@ -2225,12 +2231,13 @@ function apply_render(root, buf, render, client_id, opts)
   local mirror_ms = timing.ms(stage_start)
 
   timing.log(root, "buffer", string.format(
-    "apply_render prepare=%.1fms mask=%.1fms lines=%.1fms highlights=%.1fms diagnostics=%.1fms restore=%.1fms sidebar=%.1fms autocmd=%.1fms mirror_schedule=%.1fms total=%.1fms rows=%d lines=%d buf=%s",
+    "apply_render prepare=%.1fms mask=%.1fms lines=%.1fms highlights=%.1fms diagnostics=%.1fms source_decorations=%.1fms restore=%.1fms sidebar=%.1fms autocmd=%.1fms mirror_schedule=%.1fms total=%.1fms rows=%d lines=%d buf=%s",
     prepare_ms,
     mask_ms,
     set_lines_ms,
     highlights_ms,
     diagnostics_ms,
+    source_decorations_ms,
     restore_ms,
     sidebar_ms,
     autocmd_ms,
@@ -2286,6 +2293,39 @@ function M.comment_current(buf, anchor)
   end
 
   create_thread_for_row(buf, current_review_row(buf))
+end
+
+function M.review_buffer_for_client(client_id)
+  for buf, state in pairs(RENDER_STATES) do
+    if state.client_id == client_id and vim.api.nvim_buf_is_valid(buf) then
+      return buf
+    end
+  end
+  return nil
+end
+
+function M.apply_source_decorations_for_source(buf, root)
+  for _, state in pairs(RENDER_STATES) do
+    if state.root == root then
+      source_decorations.apply_buffer(root, buf, state.source_decorations)
+      return
+    end
+  end
+end
+
+function M.comment_from_code_action(buf, anchor, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  opts = opts or {}
+  if RENDER_STATES[buf] then
+    M.comment_current(buf, anchor)
+    return
+  end
+  local review_buf = M.review_buffer_for_client(opts.client_id)
+  if not review_buf then
+    vim.notify(COMMENT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  M.comment_current(review_buf, anchor)
 end
 
 function M.comment_visual_selection(buf)
@@ -2953,6 +2993,7 @@ function M.open(root, review_id, session)
   })
 
   lsp.attach_when_ready(buf, root, session, function(client_id)
+    lsp.attach_repo_sources(root, session)
     lsp.render(client_id, buf, function(render)
       apply_render(root, buf, render, client_id)
     end)
