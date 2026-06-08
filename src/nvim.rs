@@ -3,6 +3,10 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use dprint_plugin_markdown::configuration::{
+    ConfigurationBuilder, EmphasisKind, StrongKind, TextWrap,
+};
+use dprint_plugin_markdown::format_text as format_markdown_text;
 use facet::Facet;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::net::{TcpListener, TcpStream};
@@ -150,6 +154,7 @@ const THREAD_CARD_WIDTH: usize = 86;
 const THREAD_CARD_MARGIN: &str = "  ";
 const THREAD_HEADER_PREFIX: &str = "╭─ ";
 const THREAD_BODY_PREFIX: &str = "│ ";
+const THREAD_REPLY_META_PREFIX: &str = "├╴";
 const THREAD_FOOTER: &str = "╰─";
 const THREAD_COMMENT_ELISION_PREFIX: &str = "│ ";
 const THREAD_STATUS_OPEN_ICON: &str = "●";
@@ -854,6 +859,7 @@ struct RenderedRow {
     thread_id: Option<String>,
     comment_id: Option<String>,
     comment_body: Option<String>,
+    comment_body_line: Option<String>,
     comment_meta: Option<String>,
     can_edit: Option<bool>,
     invalidates_later_activity: Option<bool>,
@@ -881,6 +887,7 @@ impl RenderedRow {
             thread_id: None,
             comment_id: None,
             comment_body: None,
+            comment_body_line: None,
             comment_meta: None,
             can_edit: None,
             invalidates_later_activity: None,
@@ -908,6 +915,7 @@ impl RenderedRow {
             thread_id: None,
             comment_id: None,
             comment_body: None,
+            comment_body_line: None,
             comment_meta: None,
             can_edit: None,
             invalidates_later_activity: None,
@@ -935,6 +943,7 @@ impl RenderedRow {
             thread_id: None,
             comment_id: None,
             comment_body: None,
+            comment_body_line: None,
             comment_meta: None,
             can_edit: None,
             invalidates_later_activity: None,
@@ -962,6 +971,7 @@ impl RenderedRow {
             thread_id: None,
             comment_id: None,
             comment_body: None,
+            comment_body_line: None,
             comment_meta: None,
             can_edit: None,
             invalidates_later_activity: None,
@@ -977,6 +987,7 @@ impl RenderedRow {
     fn comment(
         thread: &ReviewThread,
         comment: Option<&ReviewComment>,
+        comment_body_line: Option<String>,
         invalidates_later_activity: bool,
     ) -> Self {
         Self {
@@ -993,6 +1004,7 @@ impl RenderedRow {
             thread_id: Some(thread.id.clone()),
             comment_id: comment.map(|comment| comment.comment.id.to_string()),
             comment_body: comment.map(|comment| comment.comment.body.clone()),
+            comment_body_line,
             comment_meta: comment.map(comment_meta),
             can_edit: comment.map(|comment| comment.can_edit),
             invalidates_later_activity: comment.map(|_| invalidates_later_activity),
@@ -2060,6 +2072,7 @@ fn render_comment_thread(
         header,
         thread,
         None,
+        None,
         false,
         HIGHLIGHT_THREAD_HEADER,
     );
@@ -2078,7 +2091,13 @@ fn render_comment_thread(
         let comment = &thread.comments[comment_index];
         let invalidates_later_activity =
             comment_index + 1 < thread.comments.len() || thread.resolved;
-        push_thread_comment(rendered, thread, comment, invalidates_later_activity);
+        push_thread_comment(
+            rendered,
+            thread,
+            comment,
+            visible_index > 0,
+            invalidates_later_activity,
+        );
     }
 
     push_thread_footer(rendered, thread);
@@ -2145,24 +2164,44 @@ fn push_thread_comment(
     rendered: &mut RenderedReview,
     thread: &ReviewThread,
     comment: &ReviewComment,
+    is_reply: bool,
     invalidates_later_activity: bool,
 ) {
-    let meta = format!("{THREAD_BODY_PREFIX}{}", comment_meta(comment));
+    if is_reply {
+        push_thread_line(
+            rendered,
+            THREAD_BODY_PREFIX.to_string(),
+            thread,
+            None,
+            None,
+            false,
+            HIGHLIGHT_THREAD_BODY,
+        );
+    }
+
+    let meta_prefix = if is_reply {
+        THREAD_REPLY_META_PREFIX
+    } else {
+        THREAD_BODY_PREFIX
+    };
+    let meta = format!("{meta_prefix}{}", comment_meta(comment));
     push_thread_line(
         rendered,
         meta,
         thread,
         Some(comment),
+        None,
         invalidates_later_activity,
         HIGHLIGHT_THREAD_META,
     );
 
-    for line in wrap_comment_body(&comment.comment.body) {
+    for line in formatted_comment_body_lines(&comment.comment.body) {
         push_thread_line(
             rendered,
             format!("{THREAD_BODY_PREFIX}{line}"),
             thread,
             Some(comment),
+            Some(line),
             invalidates_later_activity,
             HIGHLIGHT_THREAD_BODY,
         );
@@ -2177,6 +2216,7 @@ fn push_thread_elision(rendered: &mut RenderedReview, thread: &ReviewThread, hid
         ),
         thread,
         None,
+        None,
         false,
         HIGHLIGHT_THREAD_BODY,
     );
@@ -2187,7 +2227,7 @@ fn push_collapsed_thread_footer(rendered: &mut RenderedReview, thread: &ReviewTh
     let line_text = format!("{THREAD_FOOTER} {meta}");
     let line = rendered.push_line(
         truncate_display_line(thread_card_line(&line_text)),
-        RenderedRow::comment(thread, None, false),
+        RenderedRow::comment(thread, None, None, false),
     );
     let border_start = thread_card_start_col();
     let border_end = border_start + THREAD_FOOTER.len() as u32;
@@ -2214,12 +2254,18 @@ fn push_thread_line(
     line_text: String,
     thread: &ReviewThread,
     comment: Option<&ReviewComment>,
+    comment_body_line: Option<String>,
     invalidates_later_activity: bool,
     group: &'static str,
 ) {
     let line = rendered.push_line(
         truncate_display_line(thread_card_line(&line_text)),
-        RenderedRow::comment(thread, comment, invalidates_later_activity),
+        RenderedRow::comment(
+            thread,
+            comment,
+            comment_body_line,
+            invalidates_later_activity,
+        ),
     );
     let end_col = rendered.lines[line as usize].len() as u32;
     let border_start = thread_card_start_col();
@@ -2246,7 +2292,7 @@ fn push_thread_footer(rendered: &mut RenderedReview, thread: &ReviewThread) {
     let line_text = format!("{THREAD_FOOTER} {note}");
     let line = rendered.push_line(
         truncate_display_line(thread_card_line(&line_text)),
-        RenderedRow::comment(thread, None, false),
+        RenderedRow::comment(thread, None, None, false),
     );
     let border_start = thread_card_start_col();
     let border_end = border_start + THREAD_FOOTER.len() as u32;
@@ -2286,6 +2332,8 @@ fn thread_border_end_col(line_text: &str) -> u32 {
         THREAD_HEADER_PREFIX.len() + THREAD_STATUS_OPEN_ICON.len() + 1
     } else if line_text.starts_with(THREAD_BODY_PREFIX) {
         THREAD_BODY_PREFIX.len()
+    } else if line_text.starts_with(THREAD_REPLY_META_PREFIX) {
+        THREAD_REPLY_META_PREFIX.len()
     } else if line_text.starts_with(THREAD_FOOTER) {
         THREAD_FOOTER.len()
     } else {
@@ -2408,38 +2456,32 @@ fn first_sentence(body: &str) -> String {
     body
 }
 
-fn wrap_comment_body(body: &str) -> Vec<String> {
+fn formatted_comment_body_lines(body: &str) -> Vec<String> {
     let width = THREAD_CARD_WIDTH
         .saturating_sub(THREAD_CARD_MARGIN.chars().count())
         .saturating_sub(THREAD_BODY_PREFIX.chars().count())
-        .max(1);
-    let mut lines = Vec::new();
-    for paragraph in body.lines() {
-        if paragraph.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-
-        let mut current = String::new();
-        for word in paragraph.split_whitespace() {
-            let separator = usize::from(!current.is_empty());
-            if !current.is_empty() && current.len() + separator + word.len() > width {
-                lines.push(current);
-                current = String::new();
-            }
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
-        }
-        if !current.is_empty() {
-            lines.push(current);
-        }
-    }
+        .max(10) as u32;
+    let mut builder = ConfigurationBuilder::new();
+    let config = builder
+        .line_width(width)
+        .text_wrap(TextWrap::Always)
+        .emphasis_kind(EmphasisKind::Asterisks)
+        .strong_kind(StrongKind::Asterisks)
+        .build();
+    let formatted =
+        format_markdown_text(body, &config, |_, _, _| -> anyhow::Result<Option<String>> {
+            Ok(None)
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| body.to_string());
+    let formatted = formatted.trim_end_matches(['\r', '\n']);
+    let lines: Vec<_> = formatted.lines().map(str::to_string).collect();
     if lines.is_empty() {
-        lines.push(String::new());
+        vec![String::new()]
+    } else {
+        lines
     }
-    lines
 }
 
 fn truncate_display_line(line: String) -> String {
@@ -3077,6 +3119,37 @@ mod tests {
                 CodeActionOrCommand::CodeAction(action) => action.title,
             })
             .collect()
+    }
+
+    #[test]
+    fn formats_markdown_comment_body_for_card_width() {
+        let body = concat!(
+            "This is a **markdown** comment with enough words to need wrapping inside the ",
+            "comment card instead of relying on Neovim markdown textwidth behavior.",
+            "\n\n",
+            "```ts\n",
+            "const test = \"1234\"\n",
+            "```",
+        );
+        let lines = formatted_comment_body_lines(body);
+        let body_width = THREAD_CARD_WIDTH
+            .saturating_sub(THREAD_CARD_MARGIN.chars().count())
+            .saturating_sub(THREAD_BODY_PREFIX.chars().count());
+        let fence_start = lines
+            .iter()
+            .position(|line| line == "```ts")
+            .expect("formatted markdown should keep the opening code fence");
+
+        assert!(fence_start > 1, "long prose should wrap before the fence");
+        assert_eq!(lines[fence_start + 1], "const test = \"1234\"");
+        assert_eq!(lines[fence_start + 2], "```");
+        assert!(
+            lines[..fence_start]
+                .iter()
+                .filter(|line| !line.is_empty())
+                .all(|line| line.chars().count() <= body_width),
+            "wrapped prose lines should fit the rendered comment body width"
+        );
     }
 
     #[test]

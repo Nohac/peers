@@ -4,6 +4,8 @@ local timing = require("peers.timing")
 
 local M = {}
 
+M._MARKDOWN_NAMESPACE = vim.api.nvim_create_namespace("peers-review-markdown")
+
 local BUFFER_PREFIX = "peers://review/"
 local FILETYPE = "peersdiff"
 local NAMESPACE = vim.api.nvim_create_namespace("peers-review")
@@ -95,7 +97,7 @@ local DIRTY_FILE_DIAGNOSTIC_SOURCE = "peers"
 local DIRTY_FILE_DIAGNOSTIC_MESSAGE = "Peers review diff hidden because this file has unsaved Neovim changes"
 local DIRTY_FILE_INDENT = "  "
 local SOURCE_PROXY_UNAVAILABLE = "Peers source LSP proxy is only available on current-side added or context lines"
-local COMPOSER_TITLE = " Peers comment "
+local COMPOSER_TITLE = " Comment "
 local COMPOSER_FILETYPE = "markdown"
 local COMPOSER_INITIAL_LINE = ""
 local COMPOSER_SUBMIT_MAP = "<C-s>"
@@ -488,14 +490,16 @@ local function mask_dirty_file_diffs(root, render)
   return masked
 end
 
-local function apply_structural_highlights(buf, highlights)
+local function apply_structural_highlights(buf, highlights, rows)
   vim.api.nvim_buf_clear_namespace(buf, NAMESPACE, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buf, M._MARKDOWN_NAMESPACE, 0, -1)
   for _, highlight in ipairs(highlights or {}) do
     vim.api.nvim_buf_set_extmark(buf, NAMESPACE, highlight.line, highlight.start_col, {
       end_col = highlight.end_col,
       hl_group = highlight.group,
     })
   end
+  M._apply_comment_markdown_highlights(buf, rows, highlights)
 end
 
 local function apply_diagnostics(buf, diagnostics)
@@ -682,6 +686,110 @@ local function source_line_segments(source_buf, source_line, groups_at)
   return segments
 end
 
+function M._markdown_source_buffer(lines)
+  local buf = M._markdown_buf
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    buf = vim.api.nvim_create_buf(false, true)
+    M._markdown_buf = buf
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "hide"
+    vim.bo[buf].buflisted = false
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = COMPOSER_FILETYPE
+    vim.bo[buf].textwidth = 0
+    vim.bo[buf].wrapmargin = 0
+    vim.bo[buf].formatoptions = (vim.bo[buf].formatoptions or ""):gsub("[tcroa]", "")
+    ensure_source_runtime(buf, "comment.md")
+  end
+
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modified = false
+  vim.bo[buf].modifiable = false
+  ensure_highlighter(buf)
+  return buf
+end
+
+function M._comment_body_start_col(line)
+  local _, prefix_end = line:find("│ ", 1, true)
+  return prefix_end or 0
+end
+
+function M._highlight_groups_by_line(highlights, line_offset)
+  local by_line = {}
+  line_offset = line_offset or 0
+  for _, highlight in ipairs(highlights or {}) do
+    local line = line_offset + highlight.line
+    by_line[line] = by_line[line] or {}
+    by_line[line][highlight.group] = true
+    if highlight.group == "PeersDiffThreadBody" then
+      by_line[line].body_start_col = highlight.start_col
+      by_line[line].body_end_col = highlight.end_col
+    end
+  end
+  return by_line
+end
+
+function M._comment_markdown_blocks(buf, rows, highlights, line_offset)
+  local by_line = M._highlight_groups_by_line(highlights, line_offset)
+  local blocks = {}
+  local by_comment = {}
+  for row_index, row in ipairs(rows or {}) do
+    local line = (line_offset or 0) + row_index - 1
+    if row.kind == ROW_KIND_COMMENT and row.comment_id and row.comment_body_line ~= nil then
+      local text = vim.api.nvim_buf_get_lines(buf, line, line + 1, false)[1] or ""
+      local start_col = by_line[line] and by_line[line].body_start_col or M._comment_body_start_col(text)
+      local end_col = by_line[line] and by_line[line].body_end_col or math.min(#text, start_col + #row.comment_body_line)
+      local block = by_comment[row.comment_id]
+      if not block then
+        block = {
+          entries = {},
+          lines = {},
+        }
+        by_comment[row.comment_id] = block
+        table.insert(blocks, block)
+      end
+      table.insert(block.entries, {
+        line = line,
+        start_col = start_col,
+        end_col = end_col,
+      })
+      table.insert(block.lines, row.comment_body_line)
+    end
+  end
+  return blocks
+end
+
+function M._apply_comment_markdown_block(buf, block)
+  if not block or #block.entries == 0 then
+    return
+  end
+  local source = M._markdown_source_buffer(block.lines)
+  local priority = 5000
+  for index, entry in ipairs(block.entries) do
+    local segments = source_line_segments(source, index, inspected_source_groups_at)
+    for _, segment in ipairs(segments) do
+      local segment_start = math.min(entry.end_col, entry.start_col + segment.start_col)
+      local segment_end = math.min(entry.end_col, entry.start_col + segment.end_col)
+      if segment_start < segment_end then
+        for priority_offset, group in ipairs(segment.groups or {}) do
+          vim.api.nvim_buf_set_extmark(buf, M._MARKDOWN_NAMESPACE, entry.line, segment_start, {
+            end_col = segment_end,
+            hl_group = group,
+            priority = priority + priority_offset,
+          })
+        end
+      end
+    end
+  end
+end
+
+function M._apply_comment_markdown_highlights(buf, rows, highlights, line_offset)
+  for _, block in ipairs(M._comment_markdown_blocks(buf, rows, highlights, line_offset)) do
+    M._apply_comment_markdown_block(buf, block)
+  end
+end
+
 local function row_is_mirrorable(row)
   return row
     and row.side == ROW_SIDE_NEW
@@ -733,6 +841,74 @@ local function thread_line_label(row)
     return string.format("%s:%d", path, start_line)
   end
   return path
+end
+
+function M._source_range_label(path, start_line, end_line)
+  path = path or "review"
+  if start_line and end_line and start_line ~= end_line then
+    return string.format("%s:%d-%d", path, start_line, end_line)
+  end
+  if end_line then
+    return string.format("%s:%d", path, end_line)
+  end
+  if start_line then
+    return string.format("%s:%d", path, start_line)
+  end
+  return path
+end
+
+function M._composer_title(kind, target)
+  if target and target ~= "" then
+    return string.format(" %s · %s ", kind, target)
+  end
+  return string.format(" %s ", kind)
+end
+
+function M._composer_line_title(action, path, start_line, end_line)
+  local kind = "Line " .. action
+  if start_line and end_line and start_line ~= end_line then
+    kind = "Range " .. action
+  end
+  return M._composer_title(kind, M._source_range_label(path, start_line, end_line))
+end
+
+function M._composer_row_title(action, row)
+  if not row then
+    return M._composer_title(action)
+  end
+  if row.kind == ROW_KIND_FILE_HEADER then
+    return M._composer_title("File " .. action, row.path)
+  end
+  return M._composer_line_title(
+    action,
+    row.path,
+    row.source_start_line or row.source_line,
+    row.source_line or row.source_start_line
+  )
+end
+
+function M._composer_reply_title(row)
+  if not row then
+    return M._composer_title("Reply")
+  end
+  return M._composer_title(
+    "Reply",
+    M._source_range_label(
+      row.path,
+      row.source_start_line or row.source_line,
+      row.source_line or row.source_start_line
+    )
+  )
+end
+
+function M._composer_anchor_title(action, anchor)
+  if not anchor then
+    return M._composer_title(action)
+  end
+  if anchor.scope == ROW_SCOPE_FILE then
+    return M._composer_title("File " .. action, anchor.path)
+  end
+  return M._composer_line_title(action, anchor.path, anchor.start_line, anchor.end_line)
 end
 
 local function thread_scope_for_row(row)
@@ -1540,8 +1716,26 @@ local function composer_config(review_win, title)
     height = COMPOSER_HEIGHT,
     border = "rounded",
     title = title or COMPOSER_TITLE,
+    footer = " <C-s> submit · Esc/q cancel ",
+    footer_pos = "right",
     style = "minimal",
   }
+end
+
+function M._configure_composer_buffer(buf)
+  vim.bo[buf].textwidth = 0
+  vim.bo[buf].wrapmargin = 0
+  vim.bo[buf].formatoptions = (vim.bo[buf].formatoptions or ""):gsub("[tcroa]", "")
+end
+
+function M._configure_composer_window(win)
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+  vim.wo[win].breakindent = true
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].signcolumn = "no"
+  vim.wo[win].foldcolumn = "0"
 end
 
 local function composer_body(buf)
@@ -1591,6 +1785,7 @@ apply_thread_patch = function(state, review_buf, patch)
   local last_row_exclusive = last
   vim.api.nvim_buf_clear_namespace(review_buf, NAMESPACE, first_row, last_row_exclusive)
   vim.api.nvim_buf_clear_namespace(review_buf, SOURCE_NAMESPACE, first_row, last_row_exclusive)
+  vim.api.nvim_buf_clear_namespace(review_buf, M._MARKDOWN_NAMESPACE, first_row, last_row_exclusive)
   set_line_range(review_buf, first_row, last_row_exclusive, patch.lines)
   for _, highlight in ipairs(patch.highlights or {}) do
     vim.api.nvim_buf_set_extmark(review_buf, NAMESPACE, first_row + highlight.line, highlight.start_col, {
@@ -1598,6 +1793,7 @@ apply_thread_patch = function(state, review_buf, patch)
       hl_group = highlight.group,
     })
   end
+  M._apply_comment_markdown_highlights(review_buf, patch.rows, patch.highlights, first_row)
 
   state.lines = splice_list(state.lines or {}, first, last, patch.lines)
   state.rows = splice_list(state.rows or {}, first, last, patch.rows)
@@ -1769,6 +1965,7 @@ local function open_composer(review_buf, opts)
   vim.bo[draft_buf].buflisted = false
   vim.bo[draft_buf].swapfile = false
   vim.bo[draft_buf].filetype = COMPOSER_FILETYPE
+  M._configure_composer_buffer(draft_buf)
   vim.api.nvim_buf_set_lines(draft_buf, 0, -1, false, vim.split(opts.initial_body or COMPOSER_INITIAL_LINE, "\n", {
     plain = true,
   }))
@@ -1781,6 +1978,7 @@ local function open_composer(review_buf, opts)
     vim.notify(COMMENT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
     return
   end
+  M._configure_composer_window(draft_win)
   state.composer_buf = draft_buf
   state.composer_win = draft_win
   state.composer_review_win = review_win
@@ -1824,7 +2022,11 @@ local function open_composer(review_buf, opts)
       end
       return
     end
-    pcall(vim.cmd, "startinsert")
+    M._configure_composer_buffer(draft_buf)
+    M._configure_composer_window(draft_win)
+    if opts.insert_on_open then
+      pcall(vim.cmd, "startinsert")
+    end
   end)
 end
 
@@ -1835,17 +2037,20 @@ local function create_thread_for_row(buf, row, composer_opts)
   end
 
   if row and row.kind == ROW_KIND_FILE_HEADER and row.path then
-    open_composer(buf, vim.tbl_extend("force", composer_opts or {}, {
-      on_submit = function(state, body)
-        lsp.create_thread(state.client_id, buf, {
-          scope = ROW_SCOPE_FILE,
-          path = row.path,
-          body = body,
-        }, function(render)
-          apply_mutation_render(state, buf, render)
-        end)
-      end,
-    }))
+    open_composer(
+      buf,
+      vim.tbl_extend("force", { title = M._composer_row_title("comment", row), insert_on_open = true }, composer_opts or {}, {
+        on_submit = function(state, body)
+          lsp.create_thread(state.client_id, buf, {
+            scope = ROW_SCOPE_FILE,
+            path = row.path,
+            body = body,
+          }, function(render)
+            apply_mutation_render(state, buf, render)
+          end)
+        end,
+      })
+    )
     return
   end
 
@@ -1854,20 +2059,23 @@ local function create_thread_for_row(buf, row, composer_opts)
     return
   end
 
-  open_composer(buf, vim.tbl_extend("force", composer_opts or {}, {
-    on_submit = function(state, body)
-      lsp.create_thread(state.client_id, buf, {
-        scope = row.scope or ROW_SCOPE_LINE,
-        path = row.path,
-        side = row.side,
-        start_line = row.start_line or row.source_line,
-        end_line = row.end_line or row.source_line,
-        body = body,
-      }, function(render)
-        apply_mutation_render(state, buf, render)
-      end)
-    end,
-  }))
+  open_composer(
+    buf,
+    vim.tbl_extend("force", { title = M._composer_row_title("comment", row), insert_on_open = true }, composer_opts or {}, {
+      on_submit = function(state, body)
+        lsp.create_thread(state.client_id, buf, {
+          scope = row.scope or ROW_SCOPE_LINE,
+          path = row.path,
+          side = row.side,
+          start_line = row.start_line or row.source_line,
+          end_line = row.end_line or row.source_line,
+          body = body,
+        }, function(render)
+          apply_mutation_render(state, buf, render)
+        end)
+      end,
+    })
+  )
 end
 
 function apply_render(root, buf, render, client_id, opts)
@@ -1901,7 +2109,7 @@ function apply_render(root, buf, render, client_id, opts)
   local set_lines_ms = timing.ms(stage_start)
 
   stage_start = timing.now()
-  apply_structural_highlights(buf, render.highlights)
+  apply_structural_highlights(buf, render.highlights, render.rows)
   local highlights_ms = timing.ms(stage_start)
 
   stage_start = timing.now()
@@ -1980,6 +2188,8 @@ function M.comment_current(buf, anchor)
 
   if anchor and anchor.scope == ROW_SCOPE_FILE and anchor.path then
     open_composer(buf, {
+      title = M._composer_anchor_title("comment", anchor),
+      insert_on_open = true,
       on_submit = function(state, body)
         lsp.create_thread(state.client_id, buf, {
           scope = anchor.scope,
@@ -1995,6 +2205,8 @@ function M.comment_current(buf, anchor)
 
   if anchor and anchor.scope == ROW_SCOPE_LINE and anchor.path and anchor.side and anchor.start_line then
     open_composer(buf, {
+      title = M._composer_anchor_title("comment", anchor),
+      insert_on_open = true,
       on_submit = function(state, body)
         lsp.create_thread(state.client_id, buf, {
           scope = anchor.scope,
@@ -2031,16 +2243,19 @@ function M.reply_to_thread(buf, input, composer_opts)
     return
   end
 
-  open_composer(buf, vim.tbl_extend("force", composer_opts or {}, {
-    on_submit = function(state, body)
-      lsp.reply_to_thread(state.client_id, buf, {
-        thread_id = input.thread_id,
-        body = body,
-      }, function(render)
-        apply_mutation_render(state, buf, render)
-      end)
-    end,
-  }))
+  open_composer(
+    buf,
+    vim.tbl_extend("force", { title = M._composer_reply_title(input.row), insert_on_open = true }, composer_opts or {}, {
+      on_submit = function(state, body)
+        lsp.reply_to_thread(state.client_id, buf, {
+          thread_id = input.thread_id,
+          body = body,
+        }, function(render)
+          apply_mutation_render(state, buf, render)
+        end)
+      end,
+    })
+  )
 end
 
 function M.edit_comment(buf, input)
@@ -2052,6 +2267,7 @@ function M.edit_comment(buf, input)
 
   open_composer(buf, {
     initial_body = input.body or "",
+    title = M._composer_title("Edit comment"),
     on_submit = function(state, body)
       if
         not confirm_invalidating({
@@ -2162,7 +2378,7 @@ function M.comment_or_reply(buf, row, line, opts)
   end
   row = row or current_review_row(buf)
   if row and row.thread_id then
-    M.reply_to_thread(buf, { thread_id = row.thread_id }, composer_opts)
+    M.reply_to_thread(buf, { thread_id = row.thread_id, row = row }, composer_opts)
     return
   end
   create_thread_for_row(buf, row, composer_opts)
