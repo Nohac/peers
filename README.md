@@ -19,7 +19,6 @@ This project is in early development. See [spec.md](./spec.md) for the full impl
 - Tokio async runtime
 - Clap derive for the CLI
 - gitoxide / `gix` for Git operations
-- Vox for local RPC
 - `tower-lsp-server` for the planned Neovim `peersdiff` LSP
 - `facet` and `facet-json` for serialization
 - Arborium for server-side syntax highlighting
@@ -32,21 +31,14 @@ Learn the agent workflow:
 peers skill
 ```
 
-Review current changes:
+Check review state:
 
 ```bash
-peers diff
-peers diff --cached
-peers diff --all
+peers thread list
 ```
 
-Review a branch against a base branch:
+The bundled Neovim plugin starts hidden Peers session commands for current changes or branch reviews.
 
-```bash
-peers review
-peers review --base main
-peers review --base origin/main
-```
 
 Create and manage threads:
 
@@ -65,21 +57,13 @@ Agent-oriented usage:
 
 ```bash
 peers agent codex
+peers agent -- codex --remote %addr
 peers thread --agent "Codex (GPT-5)" add --path src/foo.rs --side new --lines 42:47 --body-file -
 ```
 
 Inside Neovim, `:PeersAgent <prompt>` sends a prompt to the active Codex app-server session recorded in `.peers/agent-session.json`.
 
-Neovim session usage:
-
-```bash
-peers diff
-peers diff --cached
-peers diff --all
-peers review --base main --head HEAD
-```
-
-This starts the local Peers session for a repo-scoped projection and prints the Vox and `peersdiff` LSP endpoints that the Neovim integration can attach to.
+Neovim session usage starts a local Peers session for a repo-scoped projection and writes the `peersdiff` LSP endpoint that the Neovim integration can attach to.
 The same connection details are written to `.peers/session.json` while the session is running.
 
 Neovim plugin usage:

@@ -8,5 +8,4 @@ pub mod nvim;
 pub mod realtime;
 pub mod review;
 pub mod review_provider;
-pub mod rpc;
 pub mod server;

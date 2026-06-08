@@ -175,7 +175,7 @@ fn normalize_request(mut request: AgentLaunchRequest) -> AgentLaunchRequest {
     if matches!(request.command.first().map(String::as_str), Some("--")) {
         request.command.remove(0);
     }
-    if request.command.is_empty() || request.command == [AGENT_KIND_CODEX.to_string()] {
+    if request.command == [AGENT_KIND_CODEX.to_string()] {
         request.command = vec![
             AGENT_KIND_CODEX.to_string(),
             "--remote".to_string(),

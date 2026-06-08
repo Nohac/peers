@@ -15,6 +15,7 @@ local BINARY_NOT_EXECUTABLE_ERROR = "Peers binary is not executable"
 local CARGO_BINARY = "cargo"
 local CARGO_MANIFEST_FILE = "Cargo.toml"
 local CARGO_RUN_ARGS = { "run", "--manifest-path" }
+local COMMAND_SESSION = "session"
 local COMMAND_DIFF = "diff"
 local COMMAND_REVIEW = "review"
 local ARG_NVIM_LISTEN = "--nvim-listen"
@@ -69,7 +70,7 @@ local function command_for_launch(config, root, launch)
   end
 
   if launch.mode == COMMAND_REVIEW then
-    vim.list_extend(command, { COMMAND_REVIEW })
+    vim.list_extend(command, { COMMAND_SESSION, COMMAND_REVIEW })
     if launch.base then
       vim.list_extend(command, { ARG_BASE, launch.base })
     end
@@ -77,7 +78,7 @@ local function command_for_launch(config, root, launch)
       vim.list_extend(command, { ARG_HEAD, launch.head })
     end
   else
-    vim.list_extend(command, { COMMAND_DIFF })
+    vim.list_extend(command, { COMMAND_SESSION, COMMAND_DIFF })
     if launch.cached then
       vim.list_extend(command, { ARG_CACHED })
     end

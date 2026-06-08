@@ -508,7 +508,7 @@ mod tests {
 
     use super::*;
 
-    const TEST_FILE: &str = "src/rpc.rs";
+    const TEST_FILE: &str = "src/cli.rs";
     const TEST_EVENTS: &str = ".peers/events.jsonl";
     const TEST_WATCHER_STARTUP_MS: u64 = 1000;
 

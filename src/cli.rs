@@ -12,20 +12,30 @@ use crate::diff::{CommentAnchor, FileSide, ReviewTarget};
 use crate::logging;
 use crate::realtime::ReviewUpdateBroadcaster;
 use crate::review::{
-    AuthorOverride, append_peers_event, discover_repo, load_peers_state, load_thread_payload,
-    now_rfc3339, peers_paths, write_thread_payload,
+    AuthorOverride, append_peers_event, current_head_oid, discover_repo, load_peers_state,
+    load_thread_payload, now_rfc3339, peers_paths, write_thread_payload,
 };
 use crate::review_provider::{
     CreateThreadRequest, EditCommentRequest, ReviewProvider, ThreadBodyRequest, ThreadRequest,
+    thread_visible_in_default_projection,
 };
 
-const VOX_RPC_LABEL: &str = "Vox RPC";
 const NEOVIM_LSP_LABEL: &str = "Neovim LSP";
 const SESSION_STOP_HINT: &str = "Press Ctrl-C to stop the local Peers session.";
 const REVIEW_LABEL: &str = "Review";
 const TARGET_LABEL: &str = "Target";
 const THREADS_LABEL: &str = "Threads";
 const THREAD_LABEL: &str = "Thread";
+const AGENT_HELP: &str = r#"Usage: peers agent <COMMAND>
+       peers agent -- <COMMAND> [ARGS]...
+
+Commands:
+  codex              Start Codex with a Peers app-server session
+  attach --addr URL  Attach an existing Codex app-server session
+
+Passthrough:
+  -- <COMMAND>       Start a Peers app-server session and launch a templated command
+"#;
 const ANCHOR_LABEL: &str = "Anchor";
 const UPDATED_LABEL: &str = "Updated";
 const EDITED_LABEL: &str = "edited";
@@ -39,7 +49,7 @@ const PEERS_SKILL_TEXT: &str = r#"Peers is a local Git review tool. It stores re
 inside the reviewed repository so humans and agents can share the same review state.
 
 Agent workflow:
-1. Run `peers thread list --status open --context` to see unresolved review threads with source context.
+1. Run `peers thread list --status open --context` to see unresolved relevant review threads with source context.
 2. Use each thread anchor to inspect the referenced file and line/range.
 3. Make the requested code changes in the working tree.
 4. Run the relevant project checks.
@@ -48,12 +58,9 @@ Agent workflow:
 7. If a thread cannot be addressed, reply with the blocker without `--resolve`.
 
 Core commands:
-- `peers diff`
-- `peers diff --cached`
-- `peers diff --all`
-- `peers review --base main --head HEAD`
 - `peers thread list --status open --context`
 - `peers thread list --status open --context 5`
+- `peers thread list --all` to include hidden or no-longer-relevant threads
 - `peers thread show <thread-id> --context 8`
 - `peers thread --human add --path src/foo.rs --side new --lines 42:47 --body "..."`
 - `peers thread --agent "Codex (GPT-5)" reply <thread-id> --body "Done: ..."`
@@ -61,9 +68,11 @@ Core commands:
 - `peers thread --agent "Codex (GPT-5)" resolve <thread-id>` for manual resolve-only actions
 - `peers clean --dry-run`
 - `peers agent codex`
+- `peers agent -- <command> [args...]` for a templated external agent command
 
 Notes:
 - Prefer the CLI over editing `.peers/events.jsonl` or payload files manually.
+- `peers thread list` follows current visibility rules by default.
 - Comment ids start with `cmt_`; thread ids start with `thr_`.
 - Open means unresolved. Complete means resolved.
 - Thread mutations require exactly one explicit author flag: `--human` or `--agent <identity>`.
@@ -92,8 +101,12 @@ pub struct Cli {
 enum Command {
     /// Print an agent workflow overview for using Peers.
     Skill,
+    #[command(hide = true)]
     Diff(DiffArgs),
+    #[command(hide = true)]
     Review(ReviewArgs),
+    #[command(hide = true)]
+    Session(SessionArgs),
     #[command(alias = "comment")]
     Thread(ThreadArgs),
     Clean(CleanArgs),
@@ -117,11 +130,37 @@ struct ReviewArgs {
 }
 
 #[derive(Args)]
+struct SessionArgs {
+    #[command(subcommand)]
+    command: SessionCommand,
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    Diff(DiffArgs),
+    Review(ReviewArgs),
+}
+
+#[derive(Args)]
 struct AgentArgs {
     #[arg(long, default_value = "ws")]
     listen: String,
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    command: Vec<String>,
+    #[command(subcommand)]
+    command: Option<AgentCommand>,
+    #[arg(last = true, num_args = 1.., allow_hyphen_values = true)]
+    passthrough: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    Codex,
+    Attach(AgentAttachArgs),
+}
+
+#[derive(Args)]
+struct AgentAttachArgs {
+    #[arg(long)]
+    addr: String,
 }
 
 #[derive(Args)]
@@ -152,6 +191,9 @@ struct ListCommentsArgs {
     status: CommentListStatus,
     #[arg(long, value_enum, default_value = "repo")]
     scope: CommentListScope,
+    /// Include hidden, stale resolved, archived, and pruned threads.
+    #[arg(long)]
+    all: bool,
     #[arg(
         long,
         alias = "conext",
@@ -358,6 +400,24 @@ pub async fn run() -> Result<()> {
             )
             .await?;
         }
+        Command::Session(args) => match args.command {
+            SessionCommand::Diff(args) => {
+                open_review_session(&repo.root, diff_target(args), repo.author, nvim_listen)
+                    .await?;
+            }
+            SessionCommand::Review(args) => {
+                open_review_session(
+                    &repo.root,
+                    ReviewTarget::Branch {
+                        base: args.base,
+                        head: args.head,
+                    },
+                    repo.author,
+                    nvim_listen,
+                )
+                .await?;
+            }
+        },
         Command::Thread(args) => handle_thread(args, &repo.root, repo.author).await?,
         Command::Clean(args) => handle_clean(args, &repo.root, repo.author).await?,
         Command::Agent(args) => handle_agent(args, &repo.root).await?,
@@ -367,43 +427,39 @@ pub async fn run() -> Result<()> {
 }
 
 async fn handle_agent(args: AgentArgs, repo_root: &Path) -> Result<()> {
-    let mut command = args.command;
-    if matches!(command.first().map(String::as_str), Some("attach")) {
-        command.remove(0);
-        let address = parse_agent_attach_address(&command)?;
-        crate::agent::attach_agent(repo_root, &address).await?;
-        println!("Attached agent session at {address}.");
-        println!("{}", peers_paths(repo_root).agent_session.display());
-        return Ok(());
+    if !args.passthrough.is_empty() {
+        return crate::agent::launch_agent(
+            repo_root,
+            AgentLaunchRequest {
+                listen: args.listen,
+                command: args.passthrough,
+            },
+        )
+        .await;
     }
 
-    crate::agent::launch_agent(
-        repo_root,
-        AgentLaunchRequest {
-            listen: args.listen,
-            command,
-        },
-    )
-    .await
-}
-
-fn parse_agent_attach_address(args: &[String]) -> Result<String> {
-    let mut address = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--addr" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err(anyhow!("`peers agent attach --addr` requires a value"));
-                };
-                address = Some(value.clone());
-                index += 2;
-            }
-            value => return Err(anyhow!("unexpected agent attach argument `{value}`")),
+    match args.command {
+        Some(AgentCommand::Codex) => {
+            crate::agent::launch_agent(
+                repo_root,
+                AgentLaunchRequest {
+                    listen: args.listen,
+                    command: vec!["codex".to_string()],
+                },
+            )
+            .await
+        }
+        Some(AgentCommand::Attach(args)) => {
+            crate::agent::attach_agent(repo_root, &args.addr).await?;
+            println!("Attached agent session at {}.", args.addr);
+            println!("{}", peers_paths(repo_root).agent_session.display());
+            Ok(())
+        }
+        None => {
+            print!("{AGENT_HELP}");
+            Ok(())
         }
     }
-
-    address.ok_or_else(|| anyhow!("`peers agent attach` requires `--addr ws://host:port`"))
 }
 
 fn diff_target(args: DiffArgs) -> ReviewTarget {
@@ -425,7 +481,6 @@ async fn open_review_session(
     let server =
         crate::server::LocalServer::bind(repo_root.to_path_buf(), target, author, nvim_listen)
             .await?;
-    println!("{VOX_RPC_LABEL}: {}", server.vox_url());
     println!("{NEOVIM_LSP_LABEL}: {}", server.nvim_lsp_url());
     println!("{SESSION_STOP_HINT}");
     server.run_until_shutdown().await
@@ -442,7 +497,7 @@ async fn handle_thread(
     } = args;
 
     match command {
-        ThreadCommand::List(args) => handle_thread_list(args, repo_root).await,
+        ThreadCommand::List(args) => handle_thread_list(args, repo_root, author.clone()).await,
         ThreadCommand::Show(args) => handle_thread_show(args, repo_root, author.clone()).await,
         command => {
             let selection = comment_author_args.selection()?;
@@ -569,14 +624,26 @@ async fn handle_thread_mutation(
     Ok(())
 }
 
-async fn handle_thread_list(args: ListCommentsArgs, repo_root: &Path) -> Result<()> {
+async fn handle_thread_list(
+    args: ListCommentsArgs,
+    repo_root: &Path,
+    author: crate::comments::Author,
+) -> Result<()> {
     let state = load_peers_state(repo_root).await?;
+    let current_head_oid = if args.all {
+        None
+    } else {
+        current_head_oid(repo_root).await?
+    };
     print_comment_list(
         &state,
         args.status,
         args.scope,
         repo_root,
+        author,
         args.context.map(|lines| CommentListContext { lines }),
+        current_head_oid.as_deref(),
+        args.all,
     )
     .await?;
     Ok(())
@@ -618,22 +685,39 @@ async fn print_comment_list(
     status_filter: CommentListStatus,
     _scope: CommentListScope,
     repo_root: &Path,
+    author: crate::comments::Author,
     context: Option<CommentListContext>,
+    current_head_oid: Option<&str>,
+    include_all: bool,
 ) -> Result<()> {
-    println!("{REVIEW_LABEL}: repo");
-    println!("{TARGET_LABEL}: repo-scoped");
-    println!(
-        "{THREADS_LABEL}: {}, {} unresolved",
-        state.threads.len(),
-        state.unresolved_threads().count()
-    );
-
     let visible_threads: Vec<_> = state
         .threads
         .values()
         .filter(|thread| comment_list_status_matches(thread, &status_filter))
-        .filter(|thread| thread.pruned_at.is_none() && thread.archived_at.is_none())
+        .filter(|thread| {
+            if include_all {
+                true
+            } else {
+                thread.archived_at.is_none()
+                    && thread.pruned_at.is_none()
+                    && thread_visible_in_default_projection(
+                        thread.resolved,
+                        thread.resolved_head_oid.as_deref(),
+                        current_head_oid,
+                    )
+            }
+        })
         .collect();
+    println!("{REVIEW_LABEL}: repo");
+    println!("{TARGET_LABEL}: repo-scoped");
+    println!(
+        "{THREADS_LABEL}: {}, {} unresolved",
+        visible_threads.len(),
+        visible_threads
+            .iter()
+            .filter(|thread| !thread.resolved)
+            .count()
+    );
 
     if visible_threads.is_empty() {
         println!("{NO_THREADS_MESSAGE}");
@@ -641,7 +725,15 @@ async fn print_comment_list(
     }
 
     for thread in visible_threads {
-        print_comment_thread(thread, None);
+        let projected_anchor = if include_all || context.is_none() {
+            None
+        } else {
+            Some(projected_anchor_status(repo_root, author.clone(), thread.id.as_str()).await?)
+        };
+        print_comment_thread(
+            thread,
+            projected_anchor.and_then(|status| status.location_note),
+        );
         if let Some(context) = context {
             print_comment_context(repo_root, thread, context).await?;
         }

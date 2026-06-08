@@ -1,10 +1,8 @@
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use facet::Facet;
 use tokio::fs;
-use tokio::net::TcpListener;
 
 use crate::comments::Author;
 use crate::diff::ReviewTarget;
@@ -12,22 +10,14 @@ use crate::nvim::NvimLspServer;
 use crate::realtime::{ReviewUpdateBroadcaster, run_realtime_watcher};
 use crate::review::{ensure_storage, now_rfc3339, peers_paths};
 use crate::review_provider::ReviewProvider;
-use crate::rpc::{PeersReviewDispatcher, ReviewApi};
 
-const LOOPBACK_BIND_HOST: &str = "127.0.0.1";
-const LOCALHOST: &str = "localhost";
-const VOX_SCHEME: &str = "ws";
-const VOX_BIND_ERROR: &str = "failed to bind local Peers Vox server";
 const SESSION_ENCODE_ERROR: &str = "failed to encode Peers session info";
 const SIGTERM_HANDLER_ERROR: &str = "failed to install SIGTERM handler";
 const CTRL_C_LISTEN_ERROR: &str = "failed to listen for Ctrl-C";
 const REALTIME_WATCHER_ERROR: &str = "Peers realtime watcher stopped";
 
 pub struct LocalServer {
-    listener: TcpListener,
-    addr: SocketAddr,
     nvim_lsp: NvimLspServer,
-    token: String,
     nvim_listen: Option<String>,
     provider: ReviewProvider,
 }
@@ -40,26 +30,15 @@ impl LocalServer {
         nvim_listen: Option<String>,
     ) -> Result<Self> {
         ensure_storage(&repo_root).await?;
-        let listener = TcpListener::bind((LOOPBACK_BIND_HOST, 0))
-            .await
-            .context(VOX_BIND_ERROR)?;
-        let addr = listener.local_addr()?;
         let updates = ReviewUpdateBroadcaster::new();
         let provider = ReviewProvider::new(repo_root, target, author, updates);
         let nvim_lsp = NvimLspServer::bind(provider.clone()).await?;
 
         Ok(Self {
-            listener,
-            addr,
             nvim_lsp,
-            token: new_token(),
             nvim_listen,
             provider,
         })
-    }
-
-    pub fn vox_url(&self) -> String {
-        format!("{VOX_SCHEME}://{LOCALHOST}:{}", self.addr.port())
     }
 
     pub fn nvim_lsp_url(&self) -> String {
@@ -68,12 +47,9 @@ impl LocalServer {
 
     pub async fn run_until_shutdown(self) -> Result<()> {
         let Self {
-            listener,
             nvim_lsp,
-            token,
             nvim_listen,
             provider,
-            ..
         } = self;
         let session_path = peers_paths(provider.repo_root()).session;
         let session_info = ReviewSessionInfo {
@@ -81,29 +57,17 @@ impl LocalServer {
             repo_root: provider.repo_root().display().to_string(),
             target_label: provider.target().label(),
             view_kind: session_view_kind(provider.target()).to_string(),
-            vox_url: format!(
-                "{VOX_SCHEME}://{LOCALHOST}:{}",
-                listener.local_addr()?.port()
-            ),
             nvim_lsp_url: nvim_lsp.url(),
-            frontend_url: None,
-            token: token.clone(),
             realtime: true,
             nvim_listen: nvim_listen.clone(),
             started_at: now_rfc3339()?.to_string(),
         };
         write_session_info(&session_path, &session_info).await?;
 
-        let ws_listener = vox::WsListener::from_tcp(listener);
-        let api = ReviewApi::new(provider.clone(), token);
-        let server = vox::serve_listener(ws_listener, PeersReviewDispatcher::new(api));
         let lsp_server = nvim_lsp.run();
         spawn_realtime_watcher(provider.repo_root().to_path_buf(), provider.updates());
 
         let result = tokio::select! {
-            result = server => {
-                result.map_err(|error| anyhow!("{error}"))
-            }
             result = lsp_server => {
                 result
             }
@@ -129,10 +93,7 @@ struct ReviewSessionInfo {
     repo_root: String,
     target_label: String,
     view_kind: String,
-    vox_url: String,
     nvim_lsp_url: String,
-    frontend_url: Option<String>,
-    token: String,
     realtime: bool,
     nvim_listen: Option<String>,
     started_at: String,
@@ -176,12 +137,4 @@ async fn shutdown_signal() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn new_token() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("{:x}{:x}", std::process::id(), nanos)
 }

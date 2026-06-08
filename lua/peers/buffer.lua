@@ -2983,7 +2983,6 @@ function M.open(root, review_id, session)
   set_lines(buf, {
     "Peers review " .. review_id,
     "",
-    "Vox: " .. session.vox_url,
     "LSP: " .. session.nvim_lsp_url,
     "",
     "Try:",
