@@ -144,6 +144,11 @@ impl ReviewProvider {
     }
 
     pub async fn create_thread(&self, request: CreateThreadRequest) -> Result<ReviewProjection> {
+        self.create_thread_state(request).await?;
+        self.get_review().await
+    }
+
+    pub async fn create_thread_state(&self, request: CreateThreadRequest) -> Result<CommentThread> {
         let anchor = self
             .capture_anchor_evidence(request.clone().into_anchor()?)
             .await?;
@@ -151,39 +156,33 @@ impl ReviewProvider {
         let thread_id = new_thread_id();
         let comment_id = new_comment_id();
         let now = now_rfc3339()?;
-        write_thread_payload(
-            &self.repo_root,
-            &ThreadPayload {
-                id: thread_id.clone(),
-                status: ThreadStatus::Open,
-                anchor,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-                provenance: CreationProvenance::from_target(&self.target),
-                resolved_head_oid: None,
-                collapsed: false,
-                archived_at: None,
-                pruned_at: None,
-            },
-        )
-        .await?;
-        write_comment_payload(
-            &self.repo_root,
-            &Comment {
-                id: comment_id.clone(),
-                thread_id: thread_id.clone(),
-                author: self.author.clone(),
-                body,
-                created_at: now.clone(),
-                edited_at: None,
-                deleted_at: None,
-            },
-        )
-        .await?;
+        let thread_payload = ThreadPayload {
+            id: thread_id.clone(),
+            status: ThreadStatus::Open,
+            anchor,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            provenance: CreationProvenance::from_target(&self.target),
+            resolved_head_oid: None,
+            collapsed: false,
+            archived_at: None,
+            pruned_at: None,
+        };
+        let comment = Comment {
+            id: comment_id.clone(),
+            thread_id: thread_id.clone(),
+            author: self.author.clone(),
+            body,
+            created_at: now.clone(),
+            edited_at: None,
+            deleted_at: None,
+        };
+        write_thread_payload(&self.repo_root, &thread_payload).await?;
+        write_comment_payload(&self.repo_root, &comment).await?;
         append_peers_event(
             &self.repo_root,
             &PeersEvent::ThreadCreated {
-                thread_id,
+                thread_id: thread_id.clone(),
                 comment_id,
                 created_at: now,
                 author: self.author.clone(),
@@ -191,9 +190,19 @@ impl ReviewProvider {
             Some(&self.target),
         )
         .await?;
-        let review = self.get_review().await?;
         self.updates.mark_local_review_changed();
-        Ok(review)
+        Ok(CommentThread {
+            id: thread_id,
+            anchor: thread_payload.anchor,
+            comments: vec![comment],
+            resolved: false,
+            resolved_head_oid: None,
+            collapsed: false,
+            created_at: thread_payload.created_at,
+            updated_at: thread_payload.updated_at,
+            archived_at: None,
+            pruned_at: None,
+        })
     }
 
     async fn capture_anchor_evidence(&self, anchor: CommentAnchor) -> Result<CommentAnchor> {
@@ -207,13 +216,17 @@ impl ReviewProvider {
             start_line: Some(line.start_line),
             end_line: Some(line.end_line),
         };
-        let diff =
-            load_review_diff_with_contexts(&self.repo_root, &self.target, &[context]).await?;
+        let diff = load_review_diff_for_context(&self.repo_root, &self.target, &context).await?;
         capture_line_anchor_for_diff(&mut line, &diff);
         Ok(CommentAnchor::Line { line })
     }
 
     pub async fn reply_to_thread(&self, request: ThreadBodyRequest) -> Result<ReviewProjection> {
+        self.reply_to_thread_state(request).await?;
+        self.get_review().await
+    }
+
+    pub async fn reply_to_thread_state(&self, request: ThreadBodyRequest) -> Result<CommentThread> {
         let body = required_body(request.body)?;
         let thread_id = ThreadId::new(request.thread_id)?;
         ensure_thread_exists(&self.repo_root, &thread_id).await?;
@@ -235,7 +248,7 @@ impl ReviewProvider {
         append_peers_event(
             &self.repo_root,
             &PeersEvent::CommentAdded {
-                thread_id,
+                thread_id: thread_id.clone(),
                 comment_id,
                 created_at: now,
                 author: self.author.clone(),
@@ -243,12 +256,16 @@ impl ReviewProvider {
             Some(&self.target),
         )
         .await?;
-        let review = self.get_review().await?;
         self.updates.mark_local_review_changed();
-        Ok(review)
+        self.load_comment_thread(&thread_id).await
     }
 
     pub async fn edit_comment(&self, request: EditCommentRequest) -> Result<ReviewProjection> {
+        self.edit_comment_state(request).await?;
+        self.get_review().await
+    }
+
+    pub async fn edit_comment_state(&self, request: EditCommentRequest) -> Result<CommentThread> {
         let body = required_body(request.body)?;
         let comment_id = CommentId::new(request.comment_id)?;
         let (thread_id, mut comment) = find_comment_payload(&self.repo_root, &comment_id).await?;
@@ -259,7 +276,7 @@ impl ReviewProvider {
         append_peers_event(
             &self.repo_root,
             &PeersEvent::CommentEdited {
-                thread_id,
+                thread_id: thread_id.clone(),
                 comment_id,
                 edited_at,
                 author: self.author.clone(),
@@ -267,12 +284,16 @@ impl ReviewProvider {
             Some(&self.target),
         )
         .await?;
-        let review = self.get_review().await?;
         self.updates.mark_local_review_changed();
-        Ok(review)
+        self.load_comment_thread(&thread_id).await
     }
 
     pub async fn delete_comment(&self, request: CommentRequest) -> Result<ReviewProjection> {
+        self.delete_comment_state(request).await?;
+        self.get_review().await
+    }
+
+    pub async fn delete_comment_state(&self, request: CommentRequest) -> Result<CommentThread> {
         let comment_id = CommentId::new(request.comment_id)?;
         let (thread_id, mut comment) = find_comment_payload(&self.repo_root, &comment_id).await?;
         let deleted_at = now_rfc3339()?;
@@ -281,7 +302,7 @@ impl ReviewProvider {
         append_peers_event(
             &self.repo_root,
             &PeersEvent::CommentDeleted {
-                thread_id,
+                thread_id: thread_id.clone(),
                 comment_id,
                 deleted_at,
                 author: self.author.clone(),
@@ -289,12 +310,16 @@ impl ReviewProvider {
             Some(&self.target),
         )
         .await?;
-        let review = self.get_review().await?;
         self.updates.mark_local_review_changed();
-        Ok(review)
+        self.load_comment_thread(&thread_id).await
     }
 
     pub async fn delete_thread(&self, request: ThreadRequest) -> Result<ReviewProjection> {
+        self.delete_thread_state(request).await?;
+        self.get_review().await
+    }
+
+    pub async fn delete_thread_state(&self, request: ThreadRequest) -> Result<ThreadId> {
         let thread_id = ThreadId::new(request.thread_id)?;
         let mut thread = load_thread_payload(&self.repo_root, &thread_id).await?;
         let archived_at = now_rfc3339()?;
@@ -304,7 +329,7 @@ impl ReviewProvider {
         append_peers_event(
             &self.repo_root,
             &PeersEvent::ThreadArchived {
-                thread_id,
+                thread_id: thread_id.clone(),
                 archived_at,
                 author: self.author.clone(),
                 reason: Some("deleted through RPC".to_string()),
@@ -312,12 +337,16 @@ impl ReviewProvider {
             Some(&self.target),
         )
         .await?;
-        let review = self.get_review().await?;
         self.updates.mark_local_review_changed();
-        Ok(review)
+        Ok(thread_id)
     }
 
     pub async fn resolve_thread(&self, request: ThreadRequest) -> Result<ReviewProjection> {
+        self.resolve_thread_state(request).await?;
+        self.get_review().await
+    }
+
+    pub async fn resolve_thread_state(&self, request: ThreadRequest) -> Result<CommentThread> {
         let thread_id = ThreadId::new(request.thread_id)?;
         let mut thread = load_thread_payload(&self.repo_root, &thread_id).await?;
         let resolved_at = now_rfc3339()?;
@@ -328,19 +357,23 @@ impl ReviewProvider {
         append_peers_event(
             &self.repo_root,
             &PeersEvent::ThreadResolved {
-                thread_id,
+                thread_id: thread_id.clone(),
                 resolved_at,
                 author: self.author.clone(),
             },
             Some(&self.target),
         )
         .await?;
-        let review = self.get_review().await?;
         self.updates.mark_local_review_changed();
-        Ok(review)
+        self.load_comment_thread(&thread_id).await
     }
 
     pub async fn reopen_thread(&self, request: ThreadRequest) -> Result<ReviewProjection> {
+        self.reopen_thread_state(request).await?;
+        self.get_review().await
+    }
+
+    pub async fn reopen_thread_state(&self, request: ThreadRequest) -> Result<CommentThread> {
         let thread_id = ThreadId::new(request.thread_id)?;
         let mut thread = load_thread_payload(&self.repo_root, &thread_id).await?;
         let reopened_at = now_rfc3339()?;
@@ -351,16 +384,15 @@ impl ReviewProvider {
         append_peers_event(
             &self.repo_root,
             &PeersEvent::ThreadReopened {
-                thread_id,
+                thread_id: thread_id.clone(),
                 reopened_at,
                 author: self.author.clone(),
             },
             Some(&self.target),
         )
         .await?;
-        let review = self.get_review().await?;
         self.updates.mark_local_review_changed();
-        Ok(review)
+        self.load_comment_thread(&thread_id).await
     }
 
     pub async fn toggle_thread_collapsed(
@@ -389,6 +421,10 @@ impl ReviewProvider {
         };
         append_peers_event(&self.repo_root, &event, Some(&self.target)).await?;
         self.updates.mark_local_review_changed();
+        self.load_comment_thread(&thread_id).await
+    }
+
+    async fn load_comment_thread(&self, thread_id: &ThreadId) -> Result<CommentThread> {
         let state = load_peers_state(&self.repo_root).await?;
         state.threads.get(&thread_id).cloned().ok_or_else(|| {
             ReviewProviderError::UnknownThread {

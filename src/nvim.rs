@@ -98,6 +98,7 @@ const PARAM_BODY: &str = "body";
 const PARAM_THREAD_ID: &str = "thread_id";
 const PARAM_COMMENT_ID: &str = "comment_id";
 const PARAM_CONTEXT: &str = "context";
+const PARAM_TARGET_LINE: &str = "target_line";
 const PARAM_LINE_LABEL: &str = "line_label";
 const PARAM_ANCHOR_PLACEMENT: &str = "anchor_placement";
 const PARAM_PROMPT: &str = "prompt";
@@ -269,18 +270,44 @@ impl PeersDiffLanguageServer {
         &self,
         thread_id: &str,
         replacement_rows: &[RenderedRow],
+        insert_after_line: Option<u32>,
     ) -> Option<(RenderedSidebar, RenderedSidebarCounts)> {
         let mut cache = self
             .render_cache
             .lock()
             .expect("render cache mutex poisoned");
         let cache = cache.as_mut()?;
-        let (first, last) = rendered_thread_block_range(&cache.rows, thread_id)?;
-        cache
-            .rows
-            .splice(first..=last, replacement_rows.iter().cloned());
+        if let Some((first, last)) = rendered_thread_block_range(&cache.rows, thread_id) {
+            cache
+                .rows
+                .splice(first..=last, replacement_rows.iter().cloned());
+        } else {
+            let insert_at = insert_after_line? as usize;
+            if insert_at > cache.rows.len() {
+                return None;
+            }
+            cache
+                .rows
+                .splice(insert_at..insert_at, replacement_rows.iter().cloned());
+        }
         cache.sidebar = render_sidebar(&cache.rows);
+        cache.sidebar_counts = sidebar_counts_for_rows(&cache.rows);
         Some((cache.sidebar.clone(), cache.sidebar_counts.clone()))
+    }
+
+    fn render_thread_patch_response(
+        &self,
+        thread: CommentThread,
+        context: ThreadRenderContext,
+        insert_after_line: Option<u32>,
+    ) -> LSPAny {
+        let patch = render_thread_patch(thread, self.provider.author(), context);
+        let (sidebar, sidebar_counts) = self
+            .update_cached_thread_sidebar(&patch.thread_id, &patch.rows, insert_after_line)
+            .map_or((None, None), |(sidebar, sidebar_counts)| {
+                (Some(sidebar), Some(sidebar_counts))
+            });
+        patch.into_lsp(sidebar, sidebar_counts, insert_after_line)
     }
 
     async fn review_summary(&self) -> String {
@@ -321,6 +348,16 @@ impl PeersDiffLanguageServer {
 
     async fn create_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = create_thread_request(&params)?;
+        let insert_after_line = optional_u32_param(&params, PARAM_TARGET_LINE)?;
+        if let Some(insert_after_line) = insert_after_line {
+            let context = thread_render_context(&params)?;
+            let thread = self
+                .provider
+                .create_thread_state(request)
+                .await
+                .map_err(|_| LspError::internal_error())?;
+            return Ok(self.render_thread_patch_response(thread, context, Some(insert_after_line)));
+        }
         let review = self
             .provider
             .create_thread(request)
@@ -331,62 +368,82 @@ impl PeersDiffLanguageServer {
 
     async fn reply_to_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = thread_body_request(&params)?;
-        let review = self
+        let context = thread_render_context(&params)?;
+        let thread = self
             .provider
-            .reply_to_thread(request)
+            .reply_to_thread_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(self.render_review_response(review))
+        Ok(self.render_thread_patch_response(thread, context, None))
     }
 
     async fn edit_comment(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = edit_comment_request(&params)?;
-        let review = self
+        let context = thread_render_context(&params)?;
+        let thread = self
             .provider
-            .edit_comment(request)
+            .edit_comment_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(self.render_review_response(review))
+        Ok(self.render_thread_patch_response(thread, context, None))
     }
 
     async fn delete_comment(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = comment_request(&params)?;
-        let review = self
+        let context = thread_render_context(&params)?;
+        let thread = self
             .provider
-            .delete_comment(request)
+            .delete_comment_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(self.render_review_response(review))
+        Ok(self.render_thread_patch_response(thread, context, None))
     }
 
     async fn delete_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = thread_request(&params)?;
-        let review = self
+        let thread_id = self
             .provider
-            .delete_thread(request)
+            .delete_thread_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(self.render_review_response(review))
+        let (sidebar, sidebar_counts) = self
+            .update_cached_thread_sidebar(thread_id.as_str(), &[], None)
+            .map_or((None, None), |(sidebar, sidebar_counts)| {
+                (Some(sidebar), Some(sidebar_counts))
+            });
+        Ok(lsp_payload(ThreadPatchPayload {
+            kind: "thread_patch",
+            thread_id: thread_id.to_string(),
+            collapsed: false,
+            lines: Vec::new(),
+            rows: Vec::new(),
+            highlights: Vec::new(),
+            sidebar,
+            sidebar_counts,
+            insert_after_line: None,
+        }))
     }
 
     async fn resolve_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = thread_request(&params)?;
-        let review = self
+        let context = thread_render_context(&params)?;
+        let thread = self
             .provider
-            .resolve_thread(request)
+            .resolve_thread_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(self.render_review_response(review))
+        Ok(self.render_thread_patch_response(thread, context, None))
     }
 
     async fn reopen_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = thread_request(&params)?;
-        let review = self
+        let context = thread_render_context(&params)?;
+        let thread = self
             .provider
-            .reopen_thread(request)
+            .reopen_thread_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        Ok(self.render_review_response(review))
+        Ok(self.render_thread_patch_response(thread, context, None))
     }
 
     async fn toggle_thread_collapsed(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -397,13 +454,7 @@ impl PeersDiffLanguageServer {
             .toggle_thread_collapsed_state(request)
             .await
             .map_err(|_| LspError::internal_error())?;
-        let patch = render_thread_patch(thread, self.provider.author(), context);
-        let (sidebar, sidebar_counts) = self
-            .update_cached_thread_sidebar(&patch.thread_id, &patch.rows)
-            .map_or((None, None), |(sidebar, sidebar_counts)| {
-                (Some(sidebar), Some(sidebar_counts))
-            });
-        Ok(patch.into_lsp(sidebar, sidebar_counts))
+        Ok(self.render_thread_patch_response(thread, context, None))
     }
 
     async fn ask_agent(&self, params: LSPAny) -> LspResult<LSPAny> {
@@ -751,6 +802,7 @@ impl RenderedThreadPatch {
         self,
         sidebar: Option<RenderedSidebar>,
         sidebar_counts: Option<RenderedSidebarCounts>,
+        insert_after_line: Option<u32>,
     ) -> LSPAny {
         lsp_payload(ThreadPatchPayload {
             kind: "thread_patch",
@@ -761,6 +813,7 @@ impl RenderedThreadPatch {
             highlights: self.highlights,
             sidebar,
             sidebar_counts,
+            insert_after_line,
         })
     }
 }
@@ -775,6 +828,7 @@ struct ThreadPatchPayload {
     highlights: Vec<RenderedHighlight>,
     sidebar: Option<RenderedSidebar>,
     sidebar_counts: Option<RenderedSidebarCounts>,
+    insert_after_line: Option<u32>,
 }
 
 fn review_thread_from_context(
@@ -1419,6 +1473,28 @@ fn render_sidebar(rows: &[RenderedRow]) -> RenderedSidebar {
         files: render_sidebar_files(rows),
         comments: render_sidebar_comments(rows),
     }
+}
+
+fn sidebar_counts_for_rows(rows: &[RenderedRow]) -> RenderedSidebarCounts {
+    let mut counts = RenderedSidebarCounts::default();
+    let mut files = BTreeSet::new();
+    let mut threads = BTreeSet::new();
+    for row in rows {
+        if row.kind == ROW_KIND_FILE_HEADER {
+            if let Some(path) = &row.path {
+                if files.insert(path.clone()) {
+                    counts.files += 1;
+                }
+            }
+        } else if row.kind == ROW_KIND_COMMENT {
+            if let Some(thread_id) = &row.thread_id {
+                if threads.insert(thread_id.clone()) {
+                    counts.comments += 1;
+                }
+            }
+        }
+    }
+    counts
 }
 
 fn render_sidebar_files(rows: &[RenderedRow]) -> RenderedSidebarPanel {

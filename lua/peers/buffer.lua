@@ -1026,6 +1026,9 @@ local function thread_scope_for_row(row)
 end
 
 local function thread_render_context(row)
+  if not row then
+    return nil
+  end
   return {
     scope = thread_scope_for_row(row),
     path = row.path,
@@ -1035,6 +1038,11 @@ local function thread_render_context(row)
     end_line = row.source_line or row.source_start_line,
     anchor_placement = row.anchor_placement,
   }
+end
+
+function M._input_thread_context(buf, input)
+  local row = input and input.row or current_review_row(buf)
+  return thread_render_context(row)
 end
 
 local function source_for_proxy_row(state, row)
@@ -2012,17 +2020,36 @@ local function splice_list(list, first, last, replacement)
   return next_list
 end
 
+function M._insert_list(list, after, replacement)
+  local next_list = {}
+  for index = 1, after do
+    table.insert(next_list, list[index])
+  end
+  for _, item in ipairs(replacement or {}) do
+    table.insert(next_list, item)
+  end
+  for index = after + 1, #list do
+    table.insert(next_list, list[index])
+  end
+  return next_list
+end
+
 apply_thread_patch = function(state, review_buf, patch)
   if not state or not patch or not patch.thread_id or not patch.lines or not patch.rows then
     return
   end
   local first, last = thread_block_range(state, patch.thread_id)
   if not first or not last then
-    return
+    if not patch.insert_after_line then
+      return
+    end
+    first = patch.insert_after_line + 1
+    last = patch.insert_after_line
   end
 
   local cursor_anchors = save_buffer_cursor_anchors(review_buf)
-  local first_row = first - 1
+  local inserting = last < first
+  local first_row = inserting and patch.insert_after_line or first - 1
   local last_row_exclusive = last
   vim.api.nvim_buf_clear_namespace(review_buf, NAMESPACE, first_row, last_row_exclusive)
   vim.api.nvim_buf_clear_namespace(review_buf, SOURCE_NAMESPACE, first_row, last_row_exclusive)
@@ -2036,8 +2063,13 @@ apply_thread_patch = function(state, review_buf, patch)
   end
   M._apply_comment_markdown_highlights(review_buf, patch.rows, patch.highlights, first_row)
 
-  state.lines = splice_list(state.lines or {}, first, last, patch.lines)
-  state.rows = splice_list(state.rows or {}, first, last, patch.rows)
+  if inserting then
+    state.lines = M._insert_list(state.lines or {}, patch.insert_after_line, patch.lines)
+    state.rows = M._insert_list(state.rows or {}, patch.insert_after_line, patch.rows)
+  else
+    state.lines = splice_list(state.lines or {}, first, last, patch.lines)
+    state.rows = splice_list(state.rows or {}, first, last, patch.rows)
+  end
   for _, row in ipairs(state.rows) do
     if row.thread_id == patch.thread_id then
       row.collapsed = patch.collapsed
@@ -2056,17 +2088,21 @@ apply_thread_patch = function(state, review_buf, patch)
 end
 
 local function apply_mutation_render(state, review_buf, render)
-  if render and render.kind == "thread_patch" then
-    apply_thread_patch(state, review_buf, render)
-    return
-  end
   state.pending_refresh = false
   local review_view = state.composer_review_view
   local review_win, return_win = close_composer(state)
-  apply_render(state.root, review_buf, render, state.client_id, { force = true })
-  if review_win and vim.api.nvim_win_is_valid(review_win) and review_view then
-    restore_win_view(review_win, review_view)
-    save_current_view(review_buf)
+  if render and render.kind == "thread_patch" then
+    apply_thread_patch(state, review_buf, render)
+  else
+    apply_render(state.root, review_buf, render, state.client_id, { force = true })
+  end
+  if render and review_win and vim.api.nvim_win_is_valid(review_win) and review_view then
+    if render.kind == "thread_patch" then
+      M._save_window_view(review_buf, review_win)
+    else
+      restore_win_view(review_win, review_view)
+      save_current_view(review_buf)
+    end
   end
   if return_win and vim.api.nvim_win_is_valid(return_win) then
     vim.api.nvim_set_current_win(return_win)
@@ -2285,11 +2321,12 @@ local function open_composer(review_buf, opts)
   end)
 end
 
-local function create_thread_for_row(buf, row, composer_opts)
+local function create_thread_for_row(buf, row, line, composer_opts)
   local state = RENDER_STATES[buf]
   if not state then
     return
   end
+  local context = thread_render_context(row)
 
   if row and row.kind == ROW_KIND_FILE_HEADER and row.path then
     open_composer(
@@ -2300,6 +2337,8 @@ local function create_thread_for_row(buf, row, composer_opts)
             scope = ROW_SCOPE_FILE,
             path = row.path,
             body = body,
+            context = context,
+            target_line = line,
           }, function(render)
             apply_mutation_render(state, buf, render)
           end)
@@ -2325,6 +2364,8 @@ local function create_thread_for_row(buf, row, composer_opts)
           start_line = row.start_line or row.source_line,
           end_line = row.end_line or row.source_line,
           body = body,
+          context = context,
+          target_line = line,
         }, function(render)
           apply_mutation_render(state, buf, render)
         end)
@@ -2496,7 +2537,8 @@ function M.comment_current(buf, anchor)
     return
   end
 
-  create_thread_for_row(buf, current_review_row(buf))
+  local row, line = current_review_row(buf)
+  create_thread_for_row(buf, row, line)
 end
 
 function M.review_buffer_for_client(client_id)
@@ -2548,6 +2590,7 @@ function M.reply_to_thread(buf, input, composer_opts)
     vim.notify(COMMENT_REPLY_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
     return
   end
+  local context = M._input_thread_context(buf, input)
 
   open_composer(
     buf,
@@ -2556,6 +2599,7 @@ function M.reply_to_thread(buf, input, composer_opts)
         lsp.reply_to_thread(state.client_id, buf, {
           thread_id = input.thread_id,
           body = body,
+          context = context,
         }, function(render)
           apply_mutation_render(state, buf, render)
         end)
@@ -2570,6 +2614,7 @@ function M.edit_comment(buf, input)
     vim.notify(COMMENT_EDIT_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
     return
   end
+  local context = M._input_thread_context(buf, input)
 
   open_composer(buf, {
     initial_body = input.body or "",
@@ -2587,6 +2632,7 @@ function M.edit_comment(buf, input)
       lsp.edit_comment(state.client_id, buf, {
         comment_id = input.comment_id,
         body = body,
+        context = context,
       }, function(render)
         apply_mutation_render(state, buf, render)
       end)
@@ -2612,6 +2658,7 @@ function M.delete_comment(buf, input)
   end
   lsp.delete_comment(state.client_id, buf, {
     comment_id = input.comment_id,
+    context = M._input_thread_context(buf, input),
   }, function(render)
     apply_mutation_render(state, buf, render)
   end)
@@ -2649,6 +2696,7 @@ function M.resolve_thread(buf, input)
   end
   lsp.resolve_thread(state.client_id, buf, {
     thread_id = input.thread_id,
+    context = M._input_thread_context(buf, input),
   }, function(render)
     apply_mutation_render(state, buf, render)
   end)
@@ -2663,6 +2711,7 @@ function M.reopen_thread(buf, input)
   end
   lsp.reopen_thread(state.client_id, buf, {
     thread_id = input.thread_id,
+    context = M._input_thread_context(buf, input),
   }, function(render)
     apply_mutation_render(state, buf, render)
   end)
@@ -2833,7 +2882,7 @@ function M.comment_or_reply(buf, row, line, opts)
     M.reply_to_thread(buf, { thread_id = row.thread_id, row = row }, composer_opts)
     return
   end
-  create_thread_for_row(buf, row, composer_opts)
+  create_thread_for_row(buf, row, line, composer_opts)
 end
 
 function M.delete_selected_comment(buf, row, line, opts)
@@ -2853,6 +2902,7 @@ function M.delete_selected_comment(buf, row, line, opts)
   M.delete_comment(buf, {
     comment_id = row.comment_id,
     invalidates_later_activity = true,
+    row = row,
   })
 end
 
@@ -2872,6 +2922,7 @@ function M.delete_selected_thread(buf, row, line, opts)
   end
   M.delete_thread(buf, {
     thread_id = row.thread_id,
+    row = row,
   })
 end
 
@@ -2890,9 +2941,9 @@ function M.toggle_selected_thread_resolved(buf, row, line, opts)
     return
   end
   if row.resolved == true then
-    M.reopen_thread(buf, { thread_id = row.thread_id })
+    M.reopen_thread(buf, { thread_id = row.thread_id, row = row })
   else
-    M.resolve_thread(buf, { thread_id = row.thread_id })
+    M.resolve_thread(buf, { thread_id = row.thread_id, row = row })
   end
 end
 
