@@ -8,13 +8,15 @@ local WIDTH = 36
 local MIN_REVIEW_WIDTH = 90
 local ROW_KIND_FILE_HEADER = "file_header"
 local ROW_KIND_COMMENT = "comment"
-local KEY_FOCUS_REVIEW = "d"
-local KEY_FILES = "o"
-local KEY_COMMENTS = "i"
+local KEY_FOCUS_REVIEW = "p"
+local KEY_FILES = "i"
+local KEY_COMMENTS = "o"
 local KEY_HIDE = "q"
 local KEY_OPEN = "<CR>"
 local KEY_COMMENT = "c"
-local KEY_DELETE_COMMENT = "D"
+local KEY_NEXT_THREAD = "D"
+local KEY_PREVIOUS_THREAD = "U"
+local KEY_TOGGLE_FILE_COLLAPSED = "X"
 local KEY_TOGGLE_RESOLVED = "r"
 local KEY_TOGGLE_COLLAPSED = "x"
 local NAMESPACE = vim.api.nvim_create_namespace("peers-sidebar")
@@ -30,6 +32,7 @@ local HIGHLIGHT_THREAD_META = "PeersSidebarThreadMeta"
 local HIGHLIGHT_COMMENT_ELISION = "PeersSidebarCommentElision"
 local HIGHLIGHT_THREAD_LOCATION_NOTE = "PeersSidebarThreadLocationNote"
 local HIGHLIGHT_THREAD_RESOLVED = "PeersSidebarThreadResolved"
+local HIGHLIGHT_ACTIVE_ROW = "PeersSidebarActiveRow"
 local STATUSLINE_ESCAPE_PATTERN = "([%%])"
 
 M.MODE_FILES = MODE_FILES
@@ -47,6 +50,16 @@ local function highlight_fg(groups, fallback)
   return fallback
 end
 
+local function highlight_bg(groups, fallback)
+  for _, group in ipairs(groups) do
+    local ok, highlight = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+    if ok and highlight and highlight.bg then
+      return highlight.bg
+    end
+  end
+  return fallback
+end
+
 local function define_highlights()
   local add_fg = highlight_fg({ "GitSignsAdd", "Added", "DiagnosticOk" }, 0x3fb950)
   local delete_fg = highlight_fg({ "GitSignsDelete", "Removed", "DiagnosticError" }, 0xf85149)
@@ -54,6 +67,7 @@ local function define_highlights()
   local info_fg = highlight_fg({ "DiagnosticInfo", "Identifier" }, 0x58a6ff)
   local muted_fg = highlight_fg({ "Comment", "LineNr" }, 0x8b949e)
   local warning_fg = highlight_fg({ "WarningMsg", "DiagnosticWarn" }, 0xd29922)
+  local active_bg = highlight_bg({ "Pmenu", "Folded", "TabLine" }, 0x1f2937)
   pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusAdded", { default = true, fg = add_fg, bold = true })
   pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusDeleted", { default = true, fg = delete_fg, bold = true })
   pcall(vim.api.nvim_set_hl, 0, "PeersSidebarStatusModified", { default = true, fg = change_fg, bold = true })
@@ -72,6 +86,7 @@ local function define_highlights()
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_COMMENT_ELISION, { default = true, link = "Comment" })
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_THREAD_LOCATION_NOTE, { default = true, link = "PeersDiffThreadLocationNote" })
   pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_THREAD_RESOLVED, { default = true, fg = add_fg, bold = true })
+  pcall(vim.api.nvim_set_hl, 0, HIGHLIGHT_ACTIVE_ROW, { default = true, bg = active_bg })
 end
 
 local function existing_buffer(name)
@@ -244,6 +259,25 @@ local function ensure_buffer(review_buf, state)
         sidebar_review_by_buf[buf] = nil
       end,
     })
+    vim.api.nvim_create_autocmd("CursorMoved", {
+      group = state.sidebar_augroup,
+      buffer = buf,
+      callback = function()
+        if not state.sidebar_rows then
+          return
+        end
+        local wins = vim.fn.win_findbuf(buf)
+        local win = wins[1]
+        if not win or not vim.api.nvim_win_is_valid(win) then
+          return
+        end
+        local cursor = vim.api.nvim_win_get_cursor(win)
+        local item = state.sidebar_rows[cursor[1]]
+        if item and item.thread_id then
+          state.sidebar_navigation_thread_id = item.thread_id
+        end
+      end,
+    })
   end
   return buf
 end
@@ -376,10 +410,10 @@ local function sidebar_counts(state)
   }
 end
 
-local function tab_part(mode, key, label, count, active_mode)
+local function tab_part(mode, label, count, active_mode)
   local highlight = mode == active_mode and HIGHLIGHT_TAB_ACTIVE or HIGHLIGHT_TAB_INACTIVE
   return {
-    text = string.format(" [%s] %s %d ", key, label, count),
+    text = string.format(" %s %d ", label, count),
     highlight = highlight,
   }
 end
@@ -392,8 +426,8 @@ local function sidebar_winbar(state)
   local counts = sidebar_counts(state)
   local active_mode = state.sidebar_mode or MODE_FILES
   local tabs = {
-    tab_part(MODE_COMMENTS, KEY_COMMENTS, "Comments", counts.comments, active_mode),
-    tab_part(MODE_FILES, KEY_FILES, "Files", counts.files, active_mode),
+    tab_part(MODE_FILES, "F[i]les", counts.files, active_mode),
+    tab_part(MODE_COMMENTS, "C[o]mments", counts.comments, active_mode),
   }
   local parts = {}
   for _, tab in ipairs(tabs) do
@@ -428,6 +462,50 @@ local function restore_cursor(state)
   pcall(vim.api.nvim_win_set_cursor, state.sidebar_win, { line, col })
 end
 
+local function active_review_row(review_buf, state)
+  local win = review_window(review_buf)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  return state.rows and state.rows[cursor[1]] or nil
+end
+
+local function sidebar_file_row_active(line_text, item, active_row, state)
+  if not active_row or not active_row.path or not item or item.path ~= active_row.path then
+    return false
+  end
+  local target = state.rows and state.rows[item.target_line] or nil
+  return target and target.kind == ROW_KIND_FILE_HEADER and line_text:sub(1, 2) == "  "
+end
+
+local function sidebar_comment_row_active(item, active_row)
+  return active_row and active_row.thread_id and item and item.thread_id == active_row.thread_id
+end
+
+local function apply_active_highlight(sidebar_buf, review_buf, state, lines, rows)
+  local active_row = active_review_row(review_buf, state)
+  if not active_row then
+    return
+  end
+
+  for index, item in ipairs(rows or {}) do
+    local line_text = lines[index] or ""
+    local active = false
+    if state.sidebar_mode == MODE_COMMENTS then
+      active = sidebar_comment_row_active(item, active_row)
+    else
+      active = sidebar_file_row_active(line_text, item, active_row, state)
+    end
+    if active then
+      vim.api.nvim_buf_set_extmark(sidebar_buf, NAMESPACE, index - 1, 0, {
+        line_hl_group = HIGHLIGHT_ACTIVE_ROW,
+        priority = 20,
+      })
+    end
+  end
+end
+
 local function render(review_buf, state)
   remember_cursor(state)
   local sidebar_buf = ensure_buffer(review_buf, state)
@@ -454,6 +532,7 @@ local function render(review_buf, state)
       hl_group = highlight.group,
     })
   end
+  apply_active_highlight(sidebar_buf, review_buf, state, lines, rows)
   restore_cursor(state)
 end
 
@@ -496,6 +575,12 @@ local function set_sidebar_keymaps(buf, states)
   vim.keymap.set("n", KEY_COMMENT, function()
     M.review_action(buf, states, "comment")
   end, { buffer = buf, desc = "Comment or reply in Peers review", nowait = true })
+  vim.keymap.set("n", "dd", function()
+    M.review_action(buf, states, "delete")
+  end, { buffer = buf, desc = "Delete Peers comment" })
+  vim.keymap.set("n", "dt", function()
+    M.review_action(buf, states, "delete_thread")
+  end, { buffer = buf, desc = "Delete Peers thread" })
   vim.keymap.set("n", "A", function()
     M.review_action(buf, states, "agent_review_open")
   end, { buffer = buf, desc = "Ask agent to review all open Peers threads", nowait = true })
@@ -508,9 +593,15 @@ local function set_sidebar_keymaps(buf, states)
   vim.keymap.set("n", "S", function()
     M.review_action(buf, states, "agent_commit")
   end, { buffer = buf, desc = "Show Peers commit summary and ask agent to commit", nowait = true })
-  vim.keymap.set("n", KEY_DELETE_COMMENT, function()
-    M.review_action(buf, states, "delete")
-  end, { buffer = buf, desc = "Delete Peers comment", nowait = true })
+  vim.keymap.set("n", KEY_NEXT_THREAD, function()
+    M.navigate_thread(buf, states, 1)
+  end, { buffer = buf, desc = "Jump to next Peers thread", nowait = true })
+  vim.keymap.set("n", KEY_PREVIOUS_THREAD, function()
+    M.navigate_thread(buf, states, -1)
+  end, { buffer = buf, desc = "Jump to previous Peers thread", nowait = true })
+  vim.keymap.set("n", KEY_TOGGLE_FILE_COLLAPSED, function()
+    M.review_action(buf, states, "toggle_file_collapsed")
+  end, { buffer = buf, desc = "Collapse or expand Peers file", nowait = true })
   vim.keymap.set("n", KEY_TOGGLE_RESOLVED, function()
     M.review_action(buf, states, "toggle_resolved")
   end, { buffer = buf, desc = "Resolve or reopen Peers thread", nowait = true })
@@ -640,15 +731,107 @@ function M.open_item(buf, states)
     return
   end
   state.sidebar_has_focus = false
+  local row = state.rows and state.rows[item.target_line] or nil
+  if item.thread_id and row and row.path then
+    pcall(function()
+      require("peers.buffer")._temporarily_expand_file(review_buf, row.path)
+    end)
+  end
   local line, col = clamp_cursor(review_buf, item.target_line, 0)
   vim.api.nvim_set_current_win(win)
   vim.api.nvim_win_set_cursor(win, { line, col })
   pcall(function()
     require("peers.buffer").remember_current_view(review_buf)
   end)
-  if window_valid(state) then
+  if window_valid(state) and not item.thread_id then
     state.sidebar_has_focus = true
     vim.api.nvim_set_current_win(state.sidebar_win)
+  end
+end
+
+function M.navigate_thread(buf, states, direction)
+  local review_buf, state = review_state_for(buf, states)
+  if not state or not state.sidebar_rows then
+    return
+  end
+  direction = direction or 1
+
+  if state.sidebar_mode ~= MODE_COMMENTS then
+    state.sidebar_mode = MODE_COMMENTS
+    render(review_buf, state)
+  end
+
+  local targets = {}
+  local seen = {}
+  for index, item in ipairs(state.sidebar_rows or {}) do
+    if item.thread_id and not seen[item.thread_id] then
+      seen[item.thread_id] = true
+      table.insert(targets, {
+        index = index,
+        item = item,
+      })
+    end
+  end
+  if #targets == 0 then
+    return
+  end
+
+  local current_thread_id = state.sidebar_navigation_thread_id
+  if not current_thread_id and current_window_kind(review_buf, state) == "sidebar" then
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local item = state.sidebar_rows[cursor[1]]
+    current_thread_id = item and item.thread_id or nil
+  end
+
+  local target_index = nil
+  if current_thread_id then
+    for index, target in ipairs(targets) do
+      if target.item.thread_id == current_thread_id then
+        target_index = ((index + direction - 1) % #targets) + 1
+        break
+      end
+    end
+  end
+  if not target_index then
+    local active_row = active_review_row(review_buf, state)
+    if active_row and active_row.thread_id then
+      for index, target in ipairs(targets) do
+        if target.item.thread_id == active_row.thread_id then
+          target_index = ((index + direction - 1) % #targets) + 1
+          break
+        end
+      end
+    end
+  end
+  target_index = target_index or (direction >= 0 and 1 or #targets)
+
+  local target = targets[target_index]
+  if not target or not target.item.target_line then
+    return
+  end
+
+  local win = review_window(review_buf)
+  if win and vim.api.nvim_win_is_valid(win) then
+    local row = state.rows and state.rows[target.item.target_line] or nil
+    if row and row.path then
+      pcall(function()
+        require("peers.buffer")._temporarily_expand_file(review_buf, row.path)
+      end)
+    end
+    local line, col = clamp_cursor(review_buf, target.item.target_line, 0)
+    vim.api.nvim_win_set_cursor(win, { line, col })
+    pcall(function()
+      require("peers.buffer")._save_window_view(review_buf, win)
+    end)
+  end
+
+  render(review_buf, state)
+  local cursor = { target.index, 0 }
+  state.sidebar_cursor_by_mode = state.sidebar_cursor_by_mode or {}
+  state.sidebar_cursor_by_mode[MODE_COMMENTS] = cursor
+  state.sidebar_navigation_thread_id = target.item.thread_id
+  if window_valid(state) then
+    vim.api.nvim_win_set_cursor(state.sidebar_win, cursor)
   end
 end
 
@@ -684,6 +867,10 @@ function M.review_action(buf, states, action)
     buffer.agent_comment_selected_thread(review_buf, row)
   elseif action == "delete" then
     buffer.delete_selected_comment(review_buf, row)
+  elseif action == "delete_thread" then
+    buffer.delete_selected_thread(review_buf, row)
+  elseif action == "toggle_file_collapsed" then
+    buffer.toggle_current_file_collapsed(review_buf, row, item.target_line, { focus = false })
   elseif action == "toggle_resolved" then
     buffer.toggle_selected_thread_resolved(review_buf, row)
   elseif action == "toggle_collapsed" then
@@ -705,9 +892,11 @@ function M.mark_review_active(review_buf, states)
 end
 
 function M.set_review_keymaps(buf, states)
-  vim.keymap.set("n", KEY_FOCUS_REVIEW, function()
-    M.focus_review(buf, states)
-  end, { buffer = buf, desc = "Focus Peers diff", nowait = true })
+  if sidebar_review_by_buf[buf] then
+    vim.keymap.set("n", KEY_FOCUS_REVIEW, function()
+      M.focus_review(buf, states)
+    end, { buffer = buf, desc = "Focus Peers diff", nowait = true })
+  end
   for _, key in ipairs({ KEY_FILES, string.upper(KEY_FILES) }) do
     vim.keymap.set("n", key, function()
       M.show(buf, states, MODE_FILES, true)

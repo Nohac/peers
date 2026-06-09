@@ -155,6 +155,10 @@ local SOURCE_HELPER_SIGNATURE_VAR = "peers_source_signature"
 local SOURCE_SYNTAX_READY_VAR = "peers_source_syntax_ready"
 local RENDER_STATES = {}
 
+M._UI_STATE_FILE = "nvim-ui.json"
+M._UI_STATE_COLLAPSED_FILES = "collapsed_files"
+M._FILE_COLLAPSE_UNAVAILABLE_MESSAGE = "Peers file collapse is only available on file rows"
+
 local function source_tree_priority()
   return (vim.hl and vim.hl.priorities and vim.hl.priorities.user or 200) + 10
 end
@@ -174,6 +178,21 @@ local function set_review_options(buf)
   vim.bo[buf].buflisted = true
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = FILETYPE
+end
+
+function M._configure_review_window(win)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  vim.wo[win].foldmethod = "manual"
+  vim.wo[win].foldenable = true
+  vim.wo[win].foldcolumn = "0"
+end
+
+function M._configure_review_windows(buf)
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    M._configure_review_window(win)
+  end
 end
 
 local function define_highlights()
@@ -385,6 +404,52 @@ local function set_line_range(buf, first, last, lines)
   vim.api.nvim_buf_set_lines(buf, first, last, false, lines)
   vim.bo[buf].modifiable = false
   vim.bo[buf].readonly = true
+end
+
+function M._ui_state_path(root)
+  return root .. "/.peers/" .. M._UI_STATE_FILE
+end
+
+function M._sorted_keys(map)
+  local keys = {}
+  for key, value in pairs(map or {}) do
+    if value then
+      table.insert(keys, key)
+    end
+  end
+  table.sort(keys)
+  return keys
+end
+
+function M._load_collapsed_files(root)
+  local path = M._ui_state_path(root)
+  local ok_read, lines = pcall(vim.fn.readfile, path)
+  if not ok_read then
+    return {}
+  end
+  if not lines or #lines == 0 then
+    return {}
+  end
+  local ok, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
+  if not ok or type(decoded) ~= "table" or type(decoded[M._UI_STATE_COLLAPSED_FILES]) ~= "table" then
+    return {}
+  end
+  local collapsed = {}
+  for _, file_path in ipairs(decoded[M._UI_STATE_COLLAPSED_FILES]) do
+    if type(file_path) == "string" and file_path ~= "" then
+      collapsed[file_path] = true
+    end
+  end
+  return collapsed
+end
+
+function M._save_collapsed_files(root, collapsed)
+  local peers_dir = root .. "/.peers"
+  vim.fn.mkdir(peers_dir, "p")
+  local encoded = vim.json.encode({
+    [M._UI_STATE_COLLAPSED_FILES] = M._sorted_keys(collapsed),
+  })
+  vim.fn.writefile({ encoded }, M._ui_state_path(root))
 end
 
 local function file_buffer_name(root, path)
@@ -1278,6 +1343,114 @@ clamp_cursor = function(buf, line, col)
   return line, col
 end
 
+function M._file_block_range(rows, path)
+  if not path then
+    return nil, nil
+  end
+  local first = nil
+  for index, row in ipairs(rows or {}) do
+    if row.kind == ROW_KIND_FILE_HEADER and row.path == path then
+      first = index
+      break
+    end
+  end
+  if not first then
+    return nil, nil
+  end
+  local last = #rows
+  for index = first + 1, #rows do
+    local row = rows[index]
+    if row and row.kind == ROW_KIND_FILE_HEADER then
+      last = index - 1
+      break
+    end
+  end
+  return first, last
+end
+
+function M._row_file_path(row)
+  if row and row.path then
+    return row.path
+  end
+  return nil
+end
+
+function M._apply_file_folds(buf, state)
+  if not state or not state.rows then
+    return
+  end
+  local ranges = {}
+  for path in pairs(state.collapsed_files or {}) do
+    if not (state.temporarily_expanded_files and state.temporarily_expanded_files[path]) then
+      local first, last = M._file_block_range(state.rows, path)
+      if first and last and last > first then
+        table.insert(ranges, { first = first, last = last })
+      end
+    end
+  end
+  table.sort(ranges, function(left, right)
+    return left.first < right.first
+  end)
+
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    if vim.api.nvim_win_is_valid(win) then
+      local cursor = vim.api.nvim_win_get_cursor(win)
+      local target_cursor = cursor
+      for _, range in ipairs(ranges) do
+        if cursor[1] >= range.first and cursor[1] <= range.last then
+          target_cursor = { range.first, 0 }
+          break
+        end
+      end
+      vim.api.nvim_win_call(win, function()
+        M._configure_review_window(win)
+        vim.cmd("silent! normal! zE")
+        for _, range in ipairs(ranges) do
+          vim.cmd(string.format("silent! %d,%dfold", range.first, range.last))
+          pcall(vim.api.nvim_win_set_cursor, win, { range.first, 0 })
+          vim.cmd("silent! normal! zc")
+        end
+      end)
+      local line, col = clamp_cursor(buf, target_cursor[1], target_cursor[2])
+      pcall(vim.api.nvim_win_set_cursor, win, { line, col })
+    end
+  end
+end
+
+function M._temporarily_expand_file(buf, path)
+  local state = RENDER_STATES[buf]
+  if not state or not path or not (state.collapsed_files and state.collapsed_files[path]) then
+    return
+  end
+  state.temporarily_expanded_files = state.temporarily_expanded_files or {}
+  state.temporarily_expanded_files[path] = true
+  M._apply_file_folds(buf, state)
+end
+
+function M._collapse_temporary_files_outside_cursor(buf)
+  local state = RENDER_STATES[buf]
+  if not state or not state.temporarily_expanded_files or not state.rows then
+    return
+  end
+  local win = review_window_for(buf)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local row = state.rows[cursor[1]]
+  local current_path = row and row.path or nil
+  local changed = false
+  for path in pairs(state.temporarily_expanded_files) do
+    if path ~= current_path then
+      state.temporarily_expanded_files[path] = nil
+      changed = true
+    end
+  end
+  if changed then
+    M._apply_file_folds(buf, state)
+  end
+end
+
 local function restore_relative_win_view(win, buf, anchor)
   if not anchor or not anchor.view or not vim.api.nvim_win_is_valid(win) then
     return
@@ -1337,6 +1510,14 @@ local function save_current_view(buf)
     return
   end
   state.view = vim.fn.winsaveview()
+end
+
+function M._save_window_view(buf, win)
+  local state = RENDER_STATES[buf]
+  if not state or not win or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
+    return
+  end
+  state.view = save_win_view(win)
 end
 
 local function restore_current_view(buf)
@@ -1641,6 +1822,14 @@ local function setup_mirror_autocmds(buf)
       save_current_view(buf)
     end,
   })
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    group = state.augroup,
+    buffer = buf,
+    callback = function()
+      M._collapse_temporary_files_outside_cursor(buf)
+      sidebar.update_preserving_focus(buf, RENDER_STATES)
+    end,
+  })
   vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, {
     group = state.augroup,
     buffer = buf,
@@ -1892,12 +2081,15 @@ local function confirm_invalidating(input)
   if not input or not input.invalidates_later_activity then
     return true
   end
-  local choice = vim.fn.confirm(
+  local ok, choice = pcall(vim.fn.confirm,
     input.title .. "\n\n" .. input.message,
     COMMENT_CONFIRM_CHOICES,
     COMMENT_CONFIRM_DEFAULT,
     COMMENT_CONFIRM_DANGER
   )
+  if not ok then
+    return false
+  end
   return choice == 1
 end
 
@@ -2209,14 +2401,24 @@ function apply_render(root, buf, render, client_id, opts)
     sidebar_cursor_by_mode = existing and existing.sidebar_cursor_by_mode or {},
     sidebar_augroup = existing and existing.sidebar_augroup or nil,
     sidebar_has_focus = existing and existing.sidebar_has_focus or false,
+    collapsed_files = existing and existing.collapsed_files or M._load_collapsed_files(root),
+    temporarily_expanded_files = existing and existing.temporarily_expanded_files or {},
   }
   if existing == nil then
     RENDER_STATES[buf].sidebar_requested = true
   end
 
   stage_start = timing.now()
+  M._configure_review_windows(buf)
+  local folds_config_ms = timing.ms(stage_start)
+
+  stage_start = timing.now()
   restore_buffer_cursor_anchors(buf, cursor_anchors, render.rows or {})
   local restore_ms = timing.ms(stage_start)
+
+  stage_start = timing.now()
+  M._apply_file_folds(buf, RENDER_STATES[buf])
+  local folds_ms = timing.ms(stage_start)
 
   stage_start = timing.now()
   sidebar.update_preserving_focus(buf, RENDER_STATES)
@@ -2231,14 +2433,16 @@ function apply_render(root, buf, render, client_id, opts)
   local mirror_ms = timing.ms(stage_start)
 
   timing.log(root, "buffer", string.format(
-    "apply_render prepare=%.1fms mask=%.1fms lines=%.1fms highlights=%.1fms diagnostics=%.1fms source_decorations=%.1fms restore=%.1fms sidebar=%.1fms autocmd=%.1fms mirror_schedule=%.1fms total=%.1fms rows=%d lines=%d buf=%s",
+    "apply_render prepare=%.1fms mask=%.1fms lines=%.1fms highlights=%.1fms diagnostics=%.1fms source_decorations=%.1fms fold_config=%.1fms restore=%.1fms folds=%.1fms sidebar=%.1fms autocmd=%.1fms mirror_schedule=%.1fms total=%.1fms rows=%d lines=%d buf=%s",
     prepare_ms,
     mask_ms,
     set_lines_ms,
     highlights_ms,
     diagnostics_ms,
     source_decorations_ms,
+    folds_config_ms,
     restore_ms,
+    folds_ms,
     sidebar_ms,
     autocmd_ms,
     mirror_ms,
@@ -2413,6 +2617,29 @@ function M.delete_comment(buf, input)
   end)
 end
 
+function M.delete_thread(buf, input)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state or not input or not input.thread_id then
+    vim.notify(COMMENT_THREAD_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  if
+    not confirm_invalidating({
+      invalidates_later_activity = true,
+      title = "Delete thread?",
+      message = "Deleting this thread will hide the whole thread from the visible review state.",
+    })
+  then
+    return
+  end
+  lsp.delete_thread(state.client_id, buf, {
+    thread_id = input.thread_id,
+  }, function(render)
+    apply_mutation_render(state, buf, render)
+  end)
+end
+
 function M.resolve_thread(buf, input)
   buf = buf or vim.api.nvim_get_current_buf()
   local state = RENDER_STATES[buf]
@@ -2461,6 +2688,129 @@ function M.toggle_thread_collapsed(buf, input)
   end)
 end
 
+function M.toggle_current_file_collapsed(buf, row, line, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  if line and opts and opts.focus then
+    focus_review_row(buf, line)
+  end
+  row = row or current_review_row(buf)
+  local path = M._row_file_path(row)
+  if not path then
+    vim.notify(M._FILE_COLLAPSE_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+
+  state.collapsed_files = state.collapsed_files or {}
+  if state.collapsed_files[path] then
+    state.collapsed_files[path] = nil
+  else
+    state.collapsed_files[path] = true
+  end
+  M._save_collapsed_files(state.root, state.collapsed_files)
+  M._apply_file_folds(buf, state)
+
+  local first = M._file_block_range(state.rows, path)
+  if first and state.collapsed_files[path] then
+    local win = review_win_for_row(buf, first)
+    if win and (not opts or opts.focus ~= false) then
+      vim.api.nvim_set_current_win(win)
+    end
+    M._save_window_view(buf, win)
+  else
+    save_current_view(buf)
+  end
+end
+
+function M._thread_navigation_targets(state)
+  local targets = {}
+  local seen = {}
+  for index, row in ipairs(state.rows or {}) do
+    if row.thread_id and not seen[row.thread_id] then
+      seen[row.thread_id] = true
+      table.insert(targets, {
+        line = index,
+        row = row,
+        thread_id = row.thread_id,
+      })
+    end
+  end
+  return targets
+end
+
+function M._wrapped_index(index, count)
+  if count == 0 then
+    return nil
+  end
+  return ((index - 1) % count) + 1
+end
+
+function M.navigate_thread(buf, direction, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return nil, nil
+  end
+  opts = opts or {}
+  direction = direction or 1
+  local targets = M._thread_navigation_targets(state)
+  if #targets == 0 then
+    vim.notify("No visible Peers threads", vim.log.levels.WARN)
+    return nil, nil
+  end
+
+  local win = review_window_for(buf)
+  local current_line = opts.current_line
+  if not current_line and win and vim.api.nvim_win_is_valid(win) then
+    current_line = vim.api.nvim_win_get_cursor(win)[1]
+  end
+  current_line = current_line or 1
+  local current_row = state.rows[current_line]
+  local target_index = nil
+  if current_row and current_row.thread_id then
+    for index, target in ipairs(targets) do
+      if target.thread_id == current_row.thread_id then
+        target_index = M._wrapped_index(index + direction, #targets)
+        break
+      end
+    end
+  end
+
+  if not target_index then
+    if direction >= 0 then
+      for index, target in ipairs(targets) do
+        if target.line > current_line then
+          target_index = index
+          break
+        end
+      end
+      target_index = target_index or 1
+    else
+      for index = #targets, 1, -1 do
+        if targets[index].line < current_line then
+          target_index = index
+          break
+        end
+      end
+      target_index = target_index or #targets
+    end
+  end
+
+  local target = targets[target_index]
+  if target.row and target.row.path then
+    M._temporarily_expand_file(buf, target.row.path)
+  end
+  win = review_win_for_row(buf, target.line)
+  if win and opts.focus ~= false then
+    vim.api.nvim_set_current_win(win)
+  end
+  M._save_window_view(buf, win)
+  return target.line, target.row
+end
+
 function M.comment_or_reply(buf, row, line, opts)
   buf = buf or vim.api.nvim_get_current_buf()
   local state = RENDER_STATES[buf]
@@ -2503,6 +2853,25 @@ function M.delete_selected_comment(buf, row, line, opts)
   M.delete_comment(buf, {
     comment_id = row.comment_id,
     invalidates_later_activity = true,
+  })
+end
+
+function M.delete_selected_thread(buf, row, line, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  local state = RENDER_STATES[buf]
+  if not state then
+    return
+  end
+  if line and opts and opts.focus then
+    focus_review_row(buf, line)
+  end
+  row = row or current_review_row(buf)
+  if not row or not row.thread_id then
+    vim.notify(COMMENT_THREAD_UNAVAILABLE_MESSAGE, vim.log.levels.WARN)
+    return
+  end
+  M.delete_thread(buf, {
+    thread_id = row.thread_id,
   })
 end
 
@@ -2904,6 +3273,18 @@ local function set_review_keymaps(buf)
     desc = "Comment or reply in Peers review",
     nowait = true,
   })
+  vim.keymap.set("n", "dd", function()
+    M.delete_selected_comment(buf)
+  end, {
+    buffer = buf,
+    desc = "Delete Peers comment",
+  })
+  vim.keymap.set("n", "dt", function()
+    M.delete_selected_thread(buf)
+  end, {
+    buffer = buf,
+    desc = "Delete Peers thread",
+  })
   vim.keymap.set("x", "c", function()
     M.comment_visual_selection(buf)
   end, {
@@ -2912,10 +3293,17 @@ local function set_review_keymaps(buf)
     nowait = true,
   })
   vim.keymap.set("n", "D", function()
-    M.delete_selected_comment(buf)
+    M.navigate_thread(buf, 1)
   end, {
     buffer = buf,
-    desc = "Delete Peers comment",
+    desc = "Jump to next Peers thread",
+    nowait = true,
+  })
+  vim.keymap.set("n", "U", function()
+    M.navigate_thread(buf, -1)
+  end, {
+    buffer = buf,
+    desc = "Jump to previous Peers thread",
     nowait = true,
   })
   vim.keymap.set("n", "A", function()
@@ -2953,6 +3341,13 @@ local function set_review_keymaps(buf)
     desc = "Collapse or expand Peers thread",
     nowait = true,
   })
+  vim.keymap.set("n", "X", function()
+    M.toggle_current_file_collapsed(buf)
+  end, {
+    buffer = buf,
+    desc = "Collapse or expand Peers file",
+    nowait = true,
+  })
   vim.keymap.set("n", "S", function()
     M.agent_commit_changes(buf)
   end, {
@@ -2976,6 +3371,7 @@ function M.open(root, review_id, session)
   end
 
   set_review_options(buf)
+  M._configure_review_windows(buf)
   set_review_keymaps(buf)
   setup_source_change_autocmds()
   define_highlights()

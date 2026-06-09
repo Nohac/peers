@@ -61,6 +61,7 @@ const COMMAND_ADD_COMMENT: &str = "peers.addComment";
 const COMMAND_REPLY: &str = "peers.reply";
 const COMMAND_EDIT_COMMENT: &str = "peers.editComment";
 const COMMAND_DELETE_COMMENT: &str = "peers.deleteComment";
+const COMMAND_DELETE_THREAD: &str = "peers.deleteThread";
 const COMMAND_RESOLVE_THREAD: &str = "peers.resolveThread";
 const COMMAND_REOPEN_THREAD: &str = "peers.reopenThread";
 const COMMAND_TOGGLE_THREAD_COLLAPSED: &str = "peers.toggleThreadCollapsed";
@@ -72,6 +73,7 @@ const ACTION_ADD_FILE_COMMENT: &str = "Peers: Add comment on file";
 const ACTION_REPLY: &str = "Peers: Reply";
 const ACTION_EDIT_COMMENT: &str = "Peers: Edit comment";
 const ACTION_DELETE_COMMENT: &str = "Peers: Delete comment";
+const ACTION_DELETE_THREAD: &str = "Peers: Delete thread";
 const ACTION_RESOLVE_THREAD: &str = "Peers: Resolve thread";
 const ACTION_REOPEN_THREAD: &str = "Peers: Reopen thread";
 const ACTION_TOGGLE_THREAD_COLLAPSED: &str = "Peers: Toggle collapse";
@@ -82,6 +84,7 @@ const METHOD_CREATE_THREAD: &str = "peers/createThread";
 const METHOD_REPLY_TO_THREAD: &str = "peers/replyToThread";
 const METHOD_EDIT_COMMENT: &str = "peers/editComment";
 const METHOD_DELETE_COMMENT: &str = "peers/deleteComment";
+const METHOD_DELETE_THREAD: &str = "peers/deleteThread";
 const METHOD_RESOLVE_THREAD: &str = "peers/resolveThread";
 const METHOD_REOPEN_THREAD: &str = "peers/reopenThread";
 const METHOD_TOGGLE_THREAD_COLLAPSED: &str = "peers/toggleThreadCollapsed";
@@ -356,6 +359,16 @@ impl PeersDiffLanguageServer {
         Ok(self.render_review_response(review))
     }
 
+    async fn delete_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
+        let request = thread_request(&params)?;
+        let review = self
+            .provider
+            .delete_thread(request)
+            .await
+            .map_err(|_| LspError::internal_error())?;
+        Ok(self.render_review_response(review))
+    }
+
     async fn resolve_thread(&self, params: LSPAny) -> LspResult<LSPAny> {
         let request = thread_request(&params)?;
         let review = self
@@ -424,6 +437,7 @@ impl LanguageServer for PeersDiffLanguageServer {
                         COMMAND_REPLY.to_string(),
                         COMMAND_EDIT_COMMENT.to_string(),
                         COMMAND_DELETE_COMMENT.to_string(),
+                        COMMAND_DELETE_THREAD.to_string(),
                         COMMAND_RESOLVE_THREAD.to_string(),
                         COMMAND_REOPEN_THREAD.to_string(),
                         COMMAND_TOGGLE_THREAD_COLLAPSED.to_string(),
@@ -568,6 +582,7 @@ async fn serve_lsp_connection(stream: TcpStream, provider: ReviewProvider) -> Re
                 METHOD_DELETE_COMMENT,
                 PeersDiffLanguageServer::delete_comment,
             )
+            .custom_method(METHOD_DELETE_THREAD, PeersDiffLanguageServer::delete_thread)
             .custom_method(
                 METHOD_RESOLVE_THREAD,
                 PeersDiffLanguageServer::resolve_thread,
@@ -2783,6 +2798,11 @@ fn comment_row_actions(row: &RenderedRow) -> CodeActionResponse {
         actions.push(command_action(
             ACTION_TOGGLE_THREAD_COLLAPSED.to_string(),
             COMMAND_TOGGLE_THREAD_COLLAPSED,
+            Some(vec![thread_arg(thread_id)]),
+        ));
+        actions.push(command_action(
+            ACTION_DELETE_THREAD.to_string(),
+            COMMAND_DELETE_THREAD,
             Some(vec![thread_arg(thread_id)]),
         ));
     }
