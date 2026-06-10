@@ -693,13 +693,13 @@ local function ensure_highlighter(buf)
     return false
   end
 
-  local ok_start = pcall(vim.treesitter.start, buf, vim.bo[buf].filetype)
+  local ok_start = pcall(vim.treesitter.start, buf)
   if not ok_start then
     return false
   end
 
   local ok_parse = pcall(function()
-    local parser = vim.treesitter.get_parser(buf, vim.bo[buf].filetype)
+    local parser = vim.treesitter.get_parser(buf)
     parser:parse(true)
   end)
   return ok_parse
