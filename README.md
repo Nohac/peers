@@ -61,7 +61,7 @@ peers agent -- codex --remote %addr
 peers thread --agent "Codex (GPT-5)" add --path src/foo.rs --side new --lines 42:47 --body-file -
 ```
 
-Inside Neovim, `:PeersAgent <prompt>` sends a prompt to the active Codex app-server session recorded in `.peers/agent-session.json`.
+Inside Neovim, `:Peers agent <prompt>` sends a prompt to the active Codex app-server session recorded in `.peers/agent-session.json`.
 
 Neovim session usage starts a local Peers session for a repo-scoped projection and writes the `peersdiff` LSP endpoint that the Neovim integration can attach to.
 The same connection details are written to `.peers/session.json` while the session is running.
@@ -70,15 +70,33 @@ Neovim plugin usage:
 
 The bundled Neovim plugin targets Neovim 0.12.
 
+Install the Peers CLI:
+
+```bash
+cargo install --git https://github.com/Nohac/peers
+```
+
+This requires Rust/Cargo and Cargo's bin directory on `PATH`, usually `~/.cargo/bin`.
+
+Install the plugin with `vim.pack`:
+
 ```lua
 vim.pack.add({
-  { src = "https://github.com/<owner>/peers", name = "peers" },
+  { src = "https://github.com/Nohac/peers", name = "peers" },
 })
 
-require("peers").setup({
-  binary = "peers",
-  stop_on_exit = true,
-})
+require("peers").setup()
+```
+
+Or with `lazy.nvim`:
+
+```lua
+{
+  "Nohac/peers",
+  config = function()
+    require("peers").setup()
+  end,
+}
 ```
 
 Then run:
@@ -88,7 +106,29 @@ Then run:
 :Peers diff cached
 :Peers diff all
 :Peers review
-:PeersReview
+:Peers review main
+:Peers review main HEAD
+:Peers comment
+:Peers agent <prompt>
+:Peers stop
+```
+
+Common shortcuts inside a Peers review buffer:
+
+```text
+c      comment or reply
+v + c  comment selected lines
+r      resolve or reopen thread
+x      collapse or expand thread
+X      collapse or expand file
+D / U  next / previous thread
+i      files sidebar
+o      comments sidebar
+p      return to review buffer
+S      ask agent to commit
+A      ask agent to review open threads
+R      ask agent to fix and resolve thread
+C      ask agent to comment without code changes
 ```
 
 During local development from this checkout, point `binary` at Cargo:

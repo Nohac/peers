@@ -78,6 +78,8 @@ local HIGHLIGHT_GROUPS = {
   PeersDiffLineNumber = { link = "LineNr" },
   PeersDiffEmptyTitle = { link = "Title" },
   PeersDiffEmptyText = { link = "Normal" },
+  PeersDiffEmptyCode = { link = "String" },
+  PeersDiffEmptyMuted = { link = "Comment" },
   [HIGHLIGHT_DIRTY_TITLE] = { link = "DiagnosticError" },
   [HIGHLIGHT_DIRTY_TEXT] = { link = "WarningMsg" },
 }
@@ -3428,14 +3430,9 @@ function M.open(root, review_id, session)
   define_highlights()
   define_diff_gutter_highlights()
   set_lines(buf, {
-    "Peers review " .. review_id,
+    "Loading Peers review...",
     "",
-    "LSP: " .. session.nvim_lsp_url,
-    "",
-    "Try:",
-    "  vim.lsp.buf.hover()",
-    "  vim.lsp.buf.code_action()",
-    "  vim.lsp.buf.document_symbol()",
+    "Preparing the current review view.",
   })
 
   lsp.attach_when_ready(buf, root, session, function(client_id)

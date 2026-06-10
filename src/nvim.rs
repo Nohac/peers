@@ -142,15 +142,13 @@ const HIGHLIGHT_THREAD_RAIL_DETACHED: &str = "PeersDiffThreadRailDetached";
 const HIGHLIGHT_THREAD_LOCATION_NOTE: &str = "PeersDiffThreadLocationNote";
 const HIGHLIGHT_EMPTY_TITLE: &str = "PeersDiffEmptyTitle";
 const HIGHLIGHT_EMPTY_TEXT: &str = "PeersDiffEmptyText";
+const HIGHLIGHT_EMPTY_CODE: &str = "PeersDiffEmptyCode";
+const HIGHLIGHT_EMPTY_MUTED: &str = "PeersDiffEmptyMuted";
 const HUNK_HEADER_PREFIX: &str = "@@";
 const FILE_HEADER_PREFIX: &str = "diff -- ";
 const LINE_NUMBER_WIDTH: usize = 5;
 const LINE_PREFIX_WIDTH: u32 = 14;
-const EMPTY_CARD_MARGIN: &str = "  ";
-const EMPTY_CARD_WIDTH: usize = 62;
 const EMPTY_TITLE: &str = "No file changes";
-const EMPTY_BODY: &str = "This review has no diffs to show.";
-const EMPTY_REFRESH: &str = "Run :PeersReview if you expected local edits to appear.";
 const EMPTY_SYMBOL_NAME: &str = "No file changes";
 const EMPTY_SYMBOL_DETAIL: &str = "empty review";
 const THREAD_RAIL_START_COL: u32 = 0;
@@ -2037,39 +2035,12 @@ fn review_thread_visible_in_default_projection(
 }
 
 fn render_empty_review(rendered: &mut RenderedReview) {
-    let start_line = rendered.push_line(empty_border(), RenderedRow::meta(ROW_KIND_EMPTY));
-    rendered.push_line(empty_card_line(""), RenderedRow::meta(ROW_KIND_EMPTY));
-    let title_line = rendered.push_line(
-        empty_card_line(EMPTY_TITLE),
-        RenderedRow::meta(ROW_KIND_EMPTY),
-    );
-    rendered.push_line(
-        empty_card_line(EMPTY_BODY),
-        RenderedRow::meta(ROW_KIND_EMPTY),
-    );
-    rendered.push_line(
-        empty_card_line(EMPTY_REFRESH),
-        RenderedRow::meta(ROW_KIND_EMPTY),
-    );
-    rendered.push_line(empty_card_line(""), RenderedRow::meta(ROW_KIND_EMPTY));
-    let end_line = rendered.push_line(empty_border(), RenderedRow::meta(ROW_KIND_EMPTY));
+    let start_line = render_empty_intro(rendered);
+    render_empty_section_break(rendered);
+    render_empty_session_commands(rendered);
+    render_empty_section_break(rendered);
+    let end_line = render_empty_shortcuts(rendered);
 
-    rendered.push_highlight(
-        title_line,
-        0,
-        rendered.lines[title_line as usize].len() as u32,
-        HIGHLIGHT_EMPTY_TITLE,
-    );
-    for line in start_line..=end_line {
-        if line != title_line {
-            rendered.push_highlight(
-                line,
-                0,
-                rendered.lines[line as usize].len() as u32,
-                HIGHLIGHT_EMPTY_TEXT,
-            );
-        }
-    }
     rendered.symbols.push(RenderedSymbol {
         name: EMPTY_SYMBOL_NAME.to_string(),
         detail: EMPTY_SYMBOL_DETAIL,
@@ -2080,20 +2051,62 @@ fn render_empty_review(rendered: &mut RenderedReview) {
     });
 }
 
-fn empty_border() -> String {
-    format!(
-        "{EMPTY_CARD_MARGIN}+{}+",
-        "-".repeat(EMPTY_CARD_WIDTH.saturating_sub(2))
-    )
+fn render_empty_intro(rendered: &mut RenderedReview) -> u32 {
+    let start_line = push_empty_line(rendered, EMPTY_TITLE, HIGHLIGHT_EMPTY_TITLE);
+    push_empty_line(rendered, "", HIGHLIGHT_EMPTY_TEXT);
+    push_empty_line(
+        rendered,
+        "There are no visible diffs or relevant open threads for this view.",
+        HIGHLIGHT_EMPTY_TEXT,
+    );
+    start_line
 }
 
-fn empty_card_line(text: &str) -> String {
-    let inner_width = EMPTY_CARD_WIDTH.saturating_sub(4);
-    let truncated: String = text.chars().take(inner_width).collect();
-    format!(
-        "{EMPTY_CARD_MARGIN}| {truncated:<inner_width$} |",
-        inner_width = inner_width
-    )
+fn render_empty_session_commands(rendered: &mut RenderedReview) {
+    push_empty_line(rendered, "Start a review session:", HIGHLIGHT_EMPTY_TEXT);
+    for command in [
+        "  :Peers diff          Review unstaged changes",
+        "  :Peers diff cached   Review staged changes",
+        "  :Peers diff all      Review staged and unstaged changes",
+        "  :Peers review        Review HEAD against main",
+        "  :Peers review main   Review HEAD against main",
+        "  :Peers review main HEAD",
+    ] {
+        push_empty_line(rendered, command, HIGHLIGHT_EMPTY_CODE);
+    }
+}
+
+fn render_empty_shortcuts(rendered: &mut RenderedReview) -> u32 {
+    push_empty_line(rendered, "Useful shortcuts:", HIGHLIGHT_EMPTY_TEXT);
+    let mut end_line = 0;
+    for shortcut in [
+        "  c      comment or reply",
+        "  v + c  comment selected lines",
+        "  r      resolve or reopen thread",
+        "  x      collapse or expand thread",
+        "  X      collapse or expand file",
+        "  D / U  next / previous thread",
+        "  i      files sidebar",
+        "  o      comments sidebar",
+        "  p      return to review buffer",
+        "  S      ask agent to commit",
+        "  A      ask agent to review open threads",
+        "  R      ask agent to fix and resolve thread",
+        "  C      ask agent to comment without code changes",
+    ] {
+        end_line = push_empty_line(rendered, shortcut, HIGHLIGHT_EMPTY_MUTED);
+    }
+    end_line
+}
+
+fn render_empty_section_break(rendered: &mut RenderedReview) {
+    push_empty_line(rendered, "", HIGHLIGHT_EMPTY_TEXT);
+}
+
+fn push_empty_line(rendered: &mut RenderedReview, text: &str, highlight: &'static str) -> u32 {
+    let line = rendered.push_line(text.to_string(), RenderedRow::meta(ROW_KIND_EMPTY));
+    rendered.push_highlight(line, 0, text.len() as u32, highlight);
+    line
 }
 
 fn push_source_line(

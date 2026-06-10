@@ -12,9 +12,6 @@ local START_FAILURE_ERROR = "Failed to start Peers"
 local START_TIMEOUT_ERROR = "Peers session did not start"
 local NVIM_VERSION_ERROR_PREFIX = "Peers.nvim requires Neovim "
 local BINARY_NOT_EXECUTABLE_ERROR = "Peers binary is not executable"
-local CARGO_BINARY = "cargo"
-local CARGO_MANIFEST_FILE = "Cargo.toml"
-local CARGO_RUN_ARGS = { "run", "--manifest-path" }
 local COMMAND_SESSION = "session"
 local COMMAND_DIFF = "diff"
 local COMMAND_REVIEW = "review"
@@ -90,26 +87,6 @@ local function command_for_launch(config, root, launch)
   return command
 end
 
-local function plugin_root()
-  local source = debug.getinfo(1, "S").source
-  if source:sub(1, 1) == "@" then
-    source = source:sub(2)
-  end
-  return vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(source)))
-end
-
-local function fallback_cargo_command()
-  local root = plugin_root()
-  local manifest = root .. "/" .. CARGO_MANIFEST_FILE
-  if vim.fn.filereadable(manifest) == 1 and vim.fn.executable(CARGO_BINARY) == 1 then
-    local command = { CARGO_BINARY }
-    vim.list_extend(command, CARGO_RUN_ARGS)
-    vim.list_extend(command, { manifest, "--" })
-    return command
-  end
-  return nil
-end
-
 local function command_binary(command)
   return command and command[1]
 end
@@ -118,11 +95,6 @@ local function executable_command(command)
   local binary = command_binary(command)
   if not binary or vim.fn.executable(binary) == 1 then
     return command
-  end
-
-  local fallback = fallback_cargo_command()
-  if fallback then
-    return fallback
   end
 
   error(BINARY_NOT_EXECUTABLE_ERROR .. ": " .. tostring(binary))

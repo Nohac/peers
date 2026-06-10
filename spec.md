@@ -198,7 +198,7 @@ peers agent attach --addr ws://127.0.0.1:4500
 
 Attach should validate that the local app-server endpoint is reachable before writing `.peers/agent-session.json`. Neovim agent actions should read `.peers/agent-session.json`; if no usable agent session exists, they should show a concise prompt suggesting `peers agent codex` or `peers agent attach --addr <addr>`.
 
-The Neovim integration should route agent engagement through the existing `peersdiff` LSP connection rather than shelling out from Lua. The first narrow surface is a prompt-based `peers/askAgent` custom method exposed as `:PeersAgent <prompt>`. The backend reads `.peers/agent-session.json`, connects to the Codex app-server websocket, finds the most recent loaded thread for the repo working directory, and submits a `turn/start` text input. Codex-specific protocol and websocket details belong in a dedicated Rust module; the higher-level agent/session module should remain responsible for launcher/session metadata. A later refactor should introduce a small generic agent trait before adding non-Codex providers.
+The Neovim integration should route agent engagement through the existing `peersdiff` LSP connection rather than shelling out from Lua. The first narrow surface is a prompt-based `peers/askAgent` custom method exposed as `:Peers agent <prompt>`. The backend reads `.peers/agent-session.json`, connects to the Codex app-server websocket, finds the most recent loaded thread for the repo working directory, and submits a `turn/start` text input. Codex-specific protocol and websocket details belong in a dedicated Rust module; the higher-level agent/session module should remain responsible for launcher/session metadata. A later refactor should introduce a small generic agent trait before adding non-Codex providers.
 
 Future `.peers/config.toml` support should allow local presets without hardcoding one agent:
 
@@ -655,7 +655,7 @@ Peers should provide a first-class Neovim review mode for keyboard-driven code r
 The integration should keep one Peers session process per repository/view attachment. The session process owns repo-scoped comment state, Git watchers, event log watchers, and Neovim-facing services. Launching from either side should attach to the same active repo session:
 
 - hidden `peers session diff` and `peers session review` commands start a repo session and publish local connection information in `.peers/session.json`.
-- `:Peers`/`:PeersReview` in Neovim attaches to an existing session for the current repo when one exists.
+- `:Peers` in Neovim attaches to an existing session for the current repo when one exists.
 - If no session exists, Neovim may start the same Peers process that the CLI would start, then attach to it.
 - Neovim and any future UI must see the same repo-scoped event log, realtime updates, and generated artifacts.
 
@@ -676,7 +676,7 @@ filetype=peersdiff
 Expected behavior:
 
 - The review buffer should appear as a normal listed buffer so users can find it through familiar buffer pickers, including Telescope.
-- The review buffer should be easy to reopen with `:PeersReview` and should remain usable through the jumplist where practical.
+- The review buffer should be easy to reopen with `:Peers` and should remain usable through the jumplist where practical.
 - The buffer should render files, changed hunks, comment-context hunks, added/removed/context lines, inline threads, multiline range markers, file-level comments, review-level conversation entries, and compact unchanged-context placeholders.
 - File context labels, including file header rows and editor breadcrumb/document-symbol context, should include compact Git-style status markers such as `[A]`, `[D]`, `[R]`, `[M]`, `[U]`, or `[B]` for added, deleted, renamed, modified, unchanged, and binary files.
 - When there are no changed files but there are unresolved or otherwise visible comments, the Neovim review buffer should render the relevant commented files/regions as comment-context hunks rather than showing an empty state.
@@ -745,7 +745,7 @@ For current-side rows, Neovim should open the real file in a hidden source buffe
 Because an LSP server cannot directly manipulate Neovim buffers, the Neovim integration will likely also need a small Neovim attachment layer. Keep that layer thin:
 
 - Target Neovim 0.12 as the supported editor version for the bundled plugin.
-- Lua provides the `:PeersReview` bootstrap and attaches the review buffer to the Peers session.
+- Lua provides the `:Peers` bootstrap and attaches the review buffer to the Peers session.
 - The plugin should be installable from this repository as a normal Neovim runtime package with top-level `plugin/` and `lua/` files.
 - The bootstrap should check the `pid` in `session.json`, discard stale session files when the process is gone, start a fresh Peers session, and stop or avoid stale `peersdiff` LSP clients so an old dead port is not reused after a session restart.
 - If Neovim starts the Peers session, quitting Neovim should stop that child process by default. Sessions started outside Neovim must not be stopped by the plugin.
@@ -761,11 +761,11 @@ Neovim commands should stay small:
 :Peers diff cached
 :Peers diff all
 :Peers review
-:PeersReview
-:PeersSubmit
-:PeersAskAgent
-:PeersClose
-:PeersRefresh
+:Peers review main
+:Peers review main HEAD
+:Peers comment
+:Peers agent <prompt>
+:Peers stop
 ```
 
 Most daily review actions should be available through normal LSP hover, definition, references, diagnostics, document symbols, and code actions.
@@ -1155,7 +1155,7 @@ Current status:
 | Author detection and overrides | Complete | Git config, CLI flags, `PEERS_*` env vars, and explicit agent identity are implemented. |
 | CLI comment operations | Partial | List/add/reply/edit/delete/resolve/reopen operate on repo-scoped state; richer projection filtering remains. |
 | `peers clean` | Partial | Cleanup previews and archives resolved candidates with confirmation unless explicitly non-interactive; detached/hidden/age policies remain coarse. |
-| Agent launcher/session wrapper | Partial | `peers agent codex`, `peers agent -- <command>`, `peers agent attach --addr ws://...`, and initial Neovim `:PeersAgent <prompt>` invocation are implemented for loopback websocket Codex app-server sessions. Running `peers agent` without an explicit agent or passthrough command prints help. Rich comment-aware prompts and a generic agent trait remain. |
+| Agent launcher/session wrapper | Partial | `peers agent codex`, `peers agent -- <command>`, `peers agent attach --addr ws://...`, and initial Neovim `:Peers agent <prompt>` invocation are implemented for loopback websocket Codex app-server sessions. Running `peers agent` without an explicit agent or passthrough command prints help. Rich comment-aware prompts and a generic agent trait remain. |
 | Agent comment accept/decline | Planned | Agent-authored comments should expose accept/decline code actions and append explicit disposition events without conflating disposition with thread resolution. |
 | Thread titles | Planned | Agent resolution should set a short thread title so collapsed resolved threads can show a useful reminder without expanding the full conversation. |
 | Anchor relocation and visibility policy | Planned | Rich content/context anchors and aggressive unresolved vs conservative resolved visibility are specified but not implemented. |
@@ -1164,7 +1164,7 @@ Current status:
 | Arborium highlighting | Planned | Not implemented. |
 | LSP RPC service | Partial | The active local RPC surface is `peersdiff` LSP plus custom Peers methods for rendering, mutations, thread collapse, source-buffer code actions, and agent engagement. |
 | Realtime UI updates | Partial | The session broadcasts coarse `review_changed` and `diff_changed` updates through the in-process provider broadcaster, watches `.peers/events.jsonl`, `.peers/threads/`, and the repository tree with debounce plus polling fallback, and refreshes Neovim review buffers through the active `peersdiff` LSP session. |
-| Neovim review mode | Partial | The local Peers session starts a `peersdiff` LSP endpoint using `tower-lsp-server`; hidden `peers session diff` and `peers session review` launch repo-scoped sessions, and Lua `:Peers`/`:PeersReview` open a full-focus synthetic review buffer from `.peers/session.json`. Rust serves `peers/renderReview` with rendered diff rows, row metadata, structural highlights, source-buffer decorations, document symbols for the review buffer, and an empty state when there are no changed files; Lua applies rows, mirrors viewport-scoped Tree-sitter highlights from hidden current-side source buffers, opens floating writable composers for add/reply/edit comment code actions, executes delete/resolve/reopen mutations, shows edit/delete invalidation confirmation through native Neovim prompts, masks file diffs when Neovim has unsaved changes in the corresponding source buffer, publishes diagnostics for those masked files, refreshes through the LSP session while a review session is active, attaches Peers to source buffers as code-actions-only, and proxies hover/definition/declaration/type-definition/implementation/references from mapped current-side rows into hidden source buffer LSP clients. Line comments render inline at their anchor row with range rails and source-buffer gutter rails. Broader relocation diagnostics remain. |
+| Neovim review mode | Partial | The local Peers session starts a `peersdiff` LSP endpoint using `tower-lsp-server`; hidden `peers session diff` and `peers session review` launch repo-scoped sessions, and Lua `:Peers` opens a full-focus synthetic review buffer from `.peers/session.json`. Rust serves `peers/renderReview` with rendered diff rows, row metadata, structural highlights, source-buffer decorations, document symbols for the review buffer, and an empty state when there are no changed files; Lua applies rows, mirrors viewport-scoped Tree-sitter highlights from hidden current-side source buffers, opens floating writable composers for add/reply/edit comment code actions, executes delete/resolve/reopen mutations, shows edit/delete invalidation confirmation through native Neovim prompts, masks file diffs when Neovim has unsaved changes in the corresponding source buffer, publishes diagnostics for those masked files, refreshes through the LSP session while a review session is active, attaches Peers to source buffers as code-actions-only, and proxies hover/definition/declaration/type-definition/implementation/references from mapped current-side rows into hidden source buffer LSP clients. Line comments render inline at their anchor row with range rails and source-buffer gutter rails. Broader relocation diagnostics remain. |
 | Neovim sidebar | Partial | A right-side fixed `winfixbuf` sidebar is specified and initially implemented for visible files and comments; richer grouping, filtering, and presentation polish remain. |
 | Neovim cursor stability | Planned | Live review-buffer refreshes should restore cursor and viewport by semantic row anchors such as comment id, thread id, or source path/line rather than raw Neovim line number. |
 | Comment-context hunks | Planned | Open comments should render relevant unchanged regions even when the current Git diff is otherwise empty; `No file changes` should require no visible relevant comments. |

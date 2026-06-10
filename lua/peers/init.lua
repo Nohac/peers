@@ -1,18 +1,17 @@
 local buffer = require("peers.buffer")
 local lsp_proxy = require("peers.lsp_proxy")
+local onboarding = require("peers.onboarding")
 local session = require("peers.session")
 
 local M = {}
 
 local AUGROUP = "peers-nvim-session"
 local COMMAND = "Peers"
-local COMMAND_REVIEW = "PeersReview"
-local COMMAND_COMMENT = "PeersComment"
-local COMMAND_AGENT = "PeersAgent"
-local COMMAND_STOP = "PeersStop"
 local SUBCOMMAND_DIFF = "diff"
 local SUBCOMMAND_REVIEW = "review"
 local SUBCOMMAND_OPEN = "open"
+local SUBCOMMAND_COMMENT = "comment"
+local SUBCOMMAND_AGENT = "agent"
 local SUBCOMMAND_STOP = "stop"
 local DIFF_MODE_CACHED = "cached"
 local DIFF_MODE_ALL = "all"
@@ -39,7 +38,7 @@ local function peers_complete(arg_lead, command_line)
   if #args <= 2 then
     return vim.tbl_filter(function(item)
       return vim.startswith(item, arg_lead)
-    end, { SUBCOMMAND_DIFF, SUBCOMMAND_REVIEW, SUBCOMMAND_OPEN, SUBCOMMAND_STOP })
+    end, { SUBCOMMAND_DIFF, SUBCOMMAND_REVIEW, SUBCOMMAND_OPEN, SUBCOMMAND_COMMENT, SUBCOMMAND_AGENT, SUBCOMMAND_STOP })
   end
 
   if args[2] == SUBCOMMAND_DIFF then
@@ -57,27 +56,6 @@ local function define_commands()
   end, {
     nargs = "*",
     complete = peers_complete,
-  })
-
-  vim.api.nvim_create_user_command(COMMAND_REVIEW, function(command)
-    M.review({ review = command.args ~= "" and command.args or nil })
-  end, {
-    nargs = "?",
-    complete = "file",
-  })
-
-  vim.api.nvim_create_user_command(COMMAND_STOP, function()
-    session.stop()
-  end, {})
-
-  vim.api.nvim_create_user_command(COMMAND_COMMENT, function()
-    buffer.comment_current()
-  end, {})
-
-  vim.api.nvim_create_user_command(COMMAND_AGENT, function(command)
-    buffer.ask_agent(nil, command.args)
-  end, {
-    nargs = "+",
   })
 end
 
@@ -103,6 +81,27 @@ function M.setup(opts)
   lsp_proxy.setup()
 end
 
+local function configured_binary_name()
+  if type(config.binary) == "table" then
+    return config.binary[1]
+  end
+  return config.binary
+end
+
+local function start_session(root, launch)
+  local ok, err = pcall(session.start, config, root, launch)
+  if ok then
+    return true
+  end
+
+  if tostring(err):find("Peers binary is not executable", 1, true) then
+    onboarding.open_missing_binary(configured_binary_name())
+    return false
+  end
+
+  error(err)
+end
+
 function M.review(opts)
   opts = opts or {}
   local root = session.repo_root()
@@ -114,9 +113,11 @@ function M.review(opts)
     return
   end
 
-  session.start(config, root, {
+  if not start_session(root, {
     mode = SUBCOMMAND_DIFF,
-  })
+  }) then
+    return
+  end
   session.wait_for_session(config, root, review_id, function(started)
     buffer.open(root, review_id, started)
   end)
@@ -125,11 +126,13 @@ end
 function M.diff(opts)
   opts = opts or {}
   local root = session.repo_root()
-  session.start(config, root, {
+  if not start_session(root, {
     mode = SUBCOMMAND_DIFF,
     cached = opts.cached == true,
     all = opts.all == true,
-  })
+  }) then
+    return
+  end
   session.wait_for_current_session(config, root, function(review_id, started)
     buffer.open(root, review_id, started)
   end)
@@ -138,11 +141,13 @@ end
 function M.branch_review(opts)
   opts = opts or {}
   local root = session.repo_root()
-  session.start(config, root, {
+  if not start_session(root, {
     mode = SUBCOMMAND_REVIEW,
     base = opts.base or DEFAULT_REVIEW_BASE,
     head = opts.head or DEFAULT_REVIEW_HEAD,
-  })
+  }) then
+    return
+  end
   session.wait_for_current_session(config, root, function(review_id, started)
     buffer.open(root, review_id, started)
   end)
@@ -171,6 +176,16 @@ function M.command(input)
 
   if subcommand == SUBCOMMAND_OPEN then
     M.review({ review = args[2] })
+    return
+  end
+
+  if subcommand == SUBCOMMAND_COMMENT then
+    buffer.comment_current()
+    return
+  end
+
+  if subcommand == SUBCOMMAND_AGENT then
+    buffer.ask_agent(nil, table.concat(args, " ", 2))
     return
   end
 
