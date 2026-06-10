@@ -1,15 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use facet::Facet;
 use gix_diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use ignore::WalkBuilder;
 
 const DIFF_CONTEXT_LINES: u32 = 3;
 const HEAD_REF: &str = "HEAD";
-const DOT_GIT_DIR: &str = ".git";
-const DOT_PEERS_DIR: &str = ".peers";
 const PATH_SEPARATOR: char = '/';
 const BINARY_NUL: u8 = 0;
 const EMPTY_PATH_ERROR: &str = "repository path is not valid UTF-8";
@@ -426,7 +423,7 @@ fn snapshot_for_source(
 ) -> Result<BTreeMap<String, Vec<u8>>> {
     match source {
         ContentSource::Worktree => {
-            worktree_snapshot(repo_root, extra_worktree_paths, selected_paths)
+            worktree_snapshot(repo_root, repo, extra_worktree_paths, selected_paths)
         }
         ContentSource::Index => index_snapshot(repo, selected_paths),
         ContentSource::Commit { rev, allow_missing } => {
@@ -488,35 +485,11 @@ fn commit_snapshot(
 
 fn worktree_snapshot(
     repo_root: &Path,
+    repo: &gix::Repository,
     extra_paths: &BTreeSet<String>,
     selected_paths: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
-    let mut paths = match selected_paths {
-        Some(selected_paths) => selected_paths.clone(),
-        None => {
-            let mut paths = extra_paths.clone();
-            for entry in WalkBuilder::new(repo_root)
-                .hidden(false)
-                .filter_entry(|entry| !is_internal_entry(entry.path()))
-                .build()
-            {
-                let entry = entry?;
-                if !entry
-                    .file_type()
-                    .is_some_and(|file_type| file_type.is_file())
-                {
-                    continue;
-                }
-                let path = relative_worktree_path(repo_root, entry.path())?;
-                if !path.is_empty() {
-                    paths.insert(path);
-                }
-            }
-            paths
-        }
-    };
-    paths.extend(extra_paths.iter().cloned());
-
+    let paths = worktree_candidate_paths(repo, extra_paths, selected_paths)?;
     let mut snapshot = BTreeMap::new();
     for path in paths {
         let full_path = repo_root.join(path_to_platform(&path));
@@ -531,25 +504,46 @@ fn worktree_snapshot(
     Ok(snapshot)
 }
 
-fn is_internal_entry(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == DOT_GIT_DIR || name == DOT_PEERS_DIR)
+fn worktree_candidate_paths(
+    repo: &gix::Repository,
+    extra_paths: &BTreeSet<String>,
+    selected_paths: Option<&BTreeSet<String>>,
+) -> Result<BTreeSet<String>> {
+    let indexed_paths = index_paths(repo)?;
+    Ok(worktree_candidate_paths_from_index(
+        indexed_paths,
+        extra_paths,
+        selected_paths,
+    ))
 }
 
-fn relative_worktree_path(repo_root: &Path, path: &Path) -> Result<String> {
-    let relative = path.strip_prefix(repo_root).unwrap_or(path);
-    path_to_string(relative)
+fn worktree_candidate_paths_from_index(
+    indexed_paths: BTreeSet<String>,
+    extra_paths: &BTreeSet<String>,
+    selected_paths: Option<&BTreeSet<String>>,
+) -> BTreeSet<String> {
+    let mut paths = match selected_paths {
+        Some(selected_paths) => selected_paths.clone(),
+        None => indexed_paths,
+    };
+    paths.extend(extra_paths.iter().cloned());
+    paths
+}
+
+fn index_paths(repo: &gix::Repository) -> Result<BTreeSet<String>> {
+    let index = repo.index_or_empty()?;
+    let mut paths = BTreeSet::new();
+    for entry in index.entries() {
+        if entry.stage_raw() != 0 {
+            continue;
+        }
+        paths.insert(bstr_path_to_string(entry.path(&index))?);
+    }
+    Ok(paths)
 }
 
 fn path_to_platform(path: &str) -> PathBuf {
     path.split(PATH_SEPARATOR).collect()
-}
-
-fn path_to_string(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
-        .ok_or_else(|| anyhow!(EMPTY_PATH_ERROR))
 }
 
 fn bstr_path_to_string(path: &gix::bstr::BStr) -> Result<String> {
