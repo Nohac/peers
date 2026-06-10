@@ -127,14 +127,9 @@ local COMMENT_EDIT_CONFIRM_TITLE = "Edit comment?"
 local COMMENT_EDIT_CONFIRM_MESSAGE = "Editing this comment will remove later replies and thread status changes from the visible review state."
 local COMMENT_DELETE_CONFIRM_TITLE = "Delete comment?"
 local COMMENT_DELETE_CONFIRM_MESSAGE = "Deleting this comment will remove later replies and thread status changes from the visible review state."
-local MIRROR_DEBOUNCE_MS = 30
-local MIRROR_BATCH_BUDGET_MS = 8
-local MIRROR_BATCH_MIN_ROWS = 8
 local AUTOCMD_GROUP_PREFIX = "peers-review-source-"
 local SOURCE_CHANGE_AUGROUP = "peers-review-source-changes"
 local AUTOCMD_EVENTS = {
-  "BufEnter",
-  "WinEnter",
   "WinResized",
   "WinScrolled",
 }
@@ -156,6 +151,7 @@ local SOURCE_HELPER_BUFFER_VAR = "peers_source_helper"
 local SOURCE_HELPER_SIGNATURE_VAR = "peers_source_signature"
 local SOURCE_SYNTAX_READY_VAR = "peers_source_syntax_ready"
 local RENDER_STATES = {}
+local SOURCE_REFRESHING = {}
 
 M._UI_STATE_FILE = "nvim-ui.json"
 M._UI_STATE_COLLAPSED_FILES = "collapsed_files"
@@ -627,10 +623,7 @@ local function source_file_signature(full_path)
   }, CACHE_KEY_SEPARATOR)
 end
 
-local function reload_source_helper_if_stale(buf, signature)
-  if not vim.b[buf][SOURCE_HELPER_BUFFER_VAR] then
-    return
-  end
+local function reload_source_if_stale(buf, signature)
   if vim.b[buf][SOURCE_HELPER_SIGNATURE_VAR] == signature then
     return
   end
@@ -638,9 +631,19 @@ local function reload_source_helper_if_stale(buf, signature)
     return
   end
 
+  SOURCE_REFRESHING[buf] = true
+  pcall(vim.api.nvim_buf_call, buf, function()
+    vim.cmd("silent! checktime")
+  end)
+  if vim.b[buf][SOURCE_HELPER_SIGNATURE_VAR] == signature then
+    SOURCE_REFRESHING[buf] = nil
+    return
+  end
+
   pcall(vim.api.nvim_buf_call, buf, function()
     vim.cmd("silent! edit!")
   end)
+  SOURCE_REFRESHING[buf] = nil
 end
 
 local function ensure_source_runtime(buf, full_path)
@@ -661,7 +664,7 @@ end
 
 local function ensure_source_signature(root, path, buf)
   local signature = source_file_signature(file_buffer_name(root, path))
-  reload_source_helper_if_stale(buf, signature)
+  reload_source_if_stale(buf, signature)
   vim.b[buf][SOURCE_HELPER_SIGNATURE_VAR] = signature
   return table.concat({
     signature,
@@ -683,7 +686,7 @@ local function source_buffer(root, path)
     vim.bo[buf].buflisted = false
     vim.b[buf][SOURCE_HELPER_BUFFER_VAR] = true
   end
-  reload_source_helper_if_stale(buf, signature)
+  reload_source_if_stale(buf, signature)
   vim.b[buf][SOURCE_HELPER_SIGNATURE_VAR] = signature
 
   ensure_source_runtime(buf, full_path)
@@ -1128,18 +1131,6 @@ local function segments_for_row(state, row)
   return lines[row.source_line]
 end
 
-function M._row_source_text_matches(buf, state, review_row, row)
-  local line = vim.api.nvim_buf_get_lines(buf, review_row, review_row + 1, false)[1]
-  local source_buf = source_for_row(state, row)
-  if not line or not source_buf then
-    return false
-  end
-  local source_line = vim.api.nvim_buf_get_lines(source_buf, row.source_line - 1, row.source_line, false)[1]
-  return source_line ~= nil and line:sub((row.code_start_col or 0) + 1) == source_line
-end
-
-local schedule_visible_mirror
-
 local function apply_line_segments(buf, review_row, code_start_col, segments, base_priority)
   local line = vim.api.nvim_buf_get_lines(buf, review_row, review_row + 1, false)[1]
   if not line then
@@ -1573,84 +1564,28 @@ local function mirror_row(buf, state, review_row)
   if not row_is_mirrorable(row) then
     return false
   end
-  vim.api.nvim_buf_clear_namespace(buf, SOURCE_NAMESPACE, review_row, review_row + 1)
-  if not M._row_source_text_matches(buf, state, review_row, row) then
-    return false
-  end
   apply_line_segments(buf, review_row, row.code_start_col or 0, segments_for_row(state, row), source_tree_priority())
   return true
 end
 
-local function run_mirror_batch(buf)
+function M._mirror_visible_now(buf)
   local state = RENDER_STATES[buf]
   if not state or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
 
-  local batch = state.mirror_batch
-  if not batch then
-    state.mirror_scheduled = false
-    return
-  end
-
   local start = timing.now()
-  local mirrored = 0
-  while batch.index <= #batch.rows do
-    if mirror_row(buf, state, batch.rows[batch.index]) then
-      mirrored = mirrored + 1
-    end
-    batch.index = batch.index + 1
-    if mirrored >= MIRROR_BATCH_MIN_ROWS and timing.ms(start) >= MIRROR_BATCH_BUDGET_MS then
-      break
-    end
+  local rows = visible_mirror_rows(buf, state)
+  for _, review_row in ipairs(rows) do
+    mirror_row(buf, state, review_row)
   end
 
-  if batch.index <= #batch.rows then
-    vim.schedule(function()
-      run_mirror_batch(buf)
-    end)
-    return
-  end
-
-  state.mirror_batch = nil
-  state.mirror_scheduled = false
-  if state.mirror_again then
-    state.mirror_again = false
-    schedule_visible_mirror(buf)
-  end
   timing.log(state.root, "buffer", string.format(
-    "mirror_visible_highlights_async %.1fms rows=%d buf=%s",
-    timing.ms(batch.start),
-    batch.total,
+    "mirror_visible_highlights_sync %.1fms rows=%d buf=%s",
+    timing.ms(start),
+    #rows,
     tostring(buf)
   ))
-end
-
-schedule_visible_mirror = function(buf)
-  local state = RENDER_STATES[buf]
-  if not state then
-    return
-  end
-  if state.mirror_scheduled then
-    state.mirror_again = true
-    return
-  end
-
-  state.mirror_scheduled = true
-  vim.defer_fn(function()
-    local current = RENDER_STATES[buf]
-    if not current then
-      return
-    end
-    current.mirror_batch = {
-      rows = visible_mirror_rows(buf, current),
-      index = 1,
-      total = 0,
-      start = timing.now(),
-    }
-    current.mirror_batch.total = #current.mirror_batch.rows
-    run_mirror_batch(buf)
-  end, MIRROR_DEBOUNCE_MS)
 end
 
 local apply_render
@@ -1805,7 +1740,7 @@ local function mark_repo_mirrors_pending(path)
 
   for buf, state in pairs(RENDER_STATES) do
     if path_is_under(state.root, path) then
-      schedule_visible_mirror(buf)
+      M._mirror_visible_now(buf)
     end
   end
 end
@@ -1835,7 +1770,7 @@ local function setup_mirror_autocmds(buf)
   vim.api.nvim_create_autocmd(AUTOCMD_EVENTS, {
     group = state.augroup,
     callback = function(args)
-      schedule_visible_mirror(buf)
+      M._mirror_visible_now(buf)
       sidebar.update(buf, RENDER_STATES, false, args.event)
     end,
   })
@@ -1912,6 +1847,9 @@ local function setup_source_change_autocmds()
   vim.api.nvim_create_autocmd(SOURCE_CHANGE_EVENTS, {
     group = source_change_augroup,
     callback = function(event)
+      if SOURCE_REFRESHING[event.buf] then
+        return
+      end
       if RENDER_STATES[event.buf] then
         return
       end
@@ -2443,9 +2381,6 @@ function apply_render(root, buf, render, client_id, opts)
     source_buffers = existing and existing.source_buffers or {},
     source_lsp_buffers = existing and existing.source_lsp_buffers or {},
     source_segments = {},
-    mirror_scheduled = false,
-    mirror_batch = nil,
-    mirror_again = existing and existing.mirror_again or false,
     render_in_flight = existing and existing.render_in_flight or false,
     render_again = existing and existing.render_again or false,
     pending_refresh = existing and existing.pending_refresh or false,
@@ -2486,7 +2421,7 @@ function apply_render(root, buf, render, client_id, opts)
   local autocmd_ms = timing.ms(stage_start)
 
   stage_start = timing.now()
-  schedule_visible_mirror(buf)
+  M._mirror_visible_now(buf)
   local mirror_ms = timing.ms(stage_start)
 
   timing.log(root, "buffer", string.format(

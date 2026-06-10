@@ -475,8 +475,7 @@ fn classify_event(
             debug!(kind = ?kind, path = %path.display(), "ignoring gitignored watch path");
             continue;
         }
-        debug!(kind = ?kind, path = %path.display(), "classified watch path as diff change");
-        pending.diff_changed = true;
+        debug!(kind = ?kind, path = %path.display(), "classified watch path as possible diff change");
     }
 }
 
