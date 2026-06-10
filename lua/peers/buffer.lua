@@ -598,6 +598,7 @@ end
 
 local function apply_structural_highlights(buf, highlights, rows)
   vim.api.nvim_buf_clear_namespace(buf, NAMESPACE, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buf, SOURCE_NAMESPACE, 0, -1)
   vim.api.nvim_buf_clear_namespace(buf, M._MARKDOWN_NAMESPACE, 0, -1)
   for _, highlight in ipairs(highlights or {}) do
     vim.api.nvim_buf_set_extmark(buf, NAMESPACE, highlight.line, highlight.start_col, {
@@ -1127,6 +1128,16 @@ local function segments_for_row(state, row)
   return lines[row.source_line]
 end
 
+function M._row_source_text_matches(buf, state, review_row, row)
+  local line = vim.api.nvim_buf_get_lines(buf, review_row, review_row + 1, false)[1]
+  local source_buf = source_for_row(state, row)
+  if not line or not source_buf then
+    return false
+  end
+  local source_line = vim.api.nvim_buf_get_lines(source_buf, row.source_line - 1, row.source_line, false)[1]
+  return source_line ~= nil and line:sub((row.code_start_col or 0) + 1) == source_line
+end
+
 local schedule_visible_mirror
 
 local function apply_line_segments(buf, review_row, code_start_col, segments, base_priority)
@@ -1563,6 +1574,9 @@ local function mirror_row(buf, state, review_row)
     return false
   end
   vim.api.nvim_buf_clear_namespace(buf, SOURCE_NAMESPACE, review_row, review_row + 1)
+  if not M._row_source_text_matches(buf, state, review_row, row) then
+    return false
+  end
   apply_line_segments(buf, review_row, row.code_start_col or 0, segments_for_row(state, row), source_tree_priority())
   return true
 end
@@ -2428,7 +2442,7 @@ function apply_render(root, buf, render, client_id, opts)
     source_decorations = render.source_decorations or {},
     source_buffers = existing and existing.source_buffers or {},
     source_lsp_buffers = existing and existing.source_lsp_buffers or {},
-    source_segments = existing and existing.source_segments or {},
+    source_segments = {},
     mirror_scheduled = false,
     mirror_batch = nil,
     mirror_again = existing and existing.mirror_again or false,

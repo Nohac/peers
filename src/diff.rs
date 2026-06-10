@@ -615,6 +615,8 @@ fn apply_file_contexts(
     new_snapshot: &BTreeMap<String, Vec<u8>>,
     contexts: &[FileContextRequest],
 ) {
+    let mut context_windows = BTreeMap::<(String, FileSideKey), Vec<LineRange>>::new();
+
     for context in contexts {
         ensure_context_file(payload, old_snapshot, new_snapshot, context);
 
@@ -639,8 +641,21 @@ fn apply_file_contexts(
                 .and_then(|bytes| bytes_to_lines(bytes))
                 .map_or(0, |lines| lines.len() as u32),
         };
-        let window = context_window(start_line, end_line, line_count);
-        diff.hunks.push(context_hunk(side.clone(), window));
+        context_windows
+            .entry((context.path.clone(), FileSideKey::from(side)))
+            .or_default()
+            .push(context_window(start_line, end_line, line_count));
+    }
+
+    for ((path, side), windows) in context_windows {
+        let Some(diff) = payload.file_diffs_by_path.get_mut(&path) else {
+            continue;
+        };
+        let covered = hunk_ranges_for_side(diff, side);
+        for window in uncovered_context_windows(windows, &covered) {
+            diff.hunks.push(context_hunk(side.into_file_side(), window));
+        }
+        sort_hunks(diff);
     }
 
     payload
@@ -713,6 +728,116 @@ fn diff_covers_line(diff: &FileDiff, side: &FileSide, line: u32) -> bool {
 
 fn range_contains(range: LineRange, line: u32) -> bool {
     line >= range.start && line <= range.end
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FileSideKey {
+    Old,
+    New,
+}
+
+impl FileSideKey {
+    fn into_file_side(self) -> FileSide {
+        match self {
+            Self::Old => FileSide::Old,
+            Self::New => FileSide::New,
+        }
+    }
+}
+
+impl From<&FileSide> for FileSideKey {
+    fn from(side: &FileSide) -> Self {
+        match side {
+            FileSide::Old => Self::Old,
+            FileSide::New => Self::New,
+        }
+    }
+}
+
+fn hunk_ranges_for_side(diff: &FileDiff, side: FileSideKey) -> Vec<LineRange> {
+    merge_ranges(
+        diff.hunks
+            .iter()
+            .flat_map(|hunk| hunk.sections.iter())
+            .filter_map(|section| match (side, section) {
+                (FileSideKey::New, DiffSection::Context { context }) => Some(context.new),
+                (FileSideKey::New, DiffSection::Added { added }) => Some(added.new),
+                (FileSideKey::Old, DiffSection::Context { context }) => Some(context.old),
+                (FileSideKey::Old, DiffSection::Removed { removed }) => Some(removed.old),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+fn uncovered_context_windows(windows: Vec<LineRange>, covered: &[LineRange]) -> Vec<LineRange> {
+    merge_ranges(windows)
+        .into_iter()
+        .flat_map(|window| subtract_ranges(window, covered))
+        .collect()
+}
+
+fn merge_ranges(mut ranges: Vec<LineRange>) -> Vec<LineRange> {
+    ranges.retain(|range| range.start <= range.end);
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<LineRange> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end.saturating_add(1)
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+fn subtract_ranges(range: LineRange, covered: &[LineRange]) -> Vec<LineRange> {
+    let mut remaining = vec![range];
+    for covered in covered {
+        remaining = remaining
+            .into_iter()
+            .flat_map(|range| subtract_range(range, *covered))
+            .collect();
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    remaining
+}
+
+fn subtract_range(range: LineRange, covered: LineRange) -> Vec<LineRange> {
+    if covered.end < range.start || covered.start > range.end {
+        return vec![range];
+    }
+
+    let mut ranges = Vec::new();
+    if covered.start > range.start {
+        ranges.push(LineRange {
+            start: range.start,
+            end: covered.start - 1,
+        });
+    }
+    if covered.end < range.end {
+        ranges.push(LineRange {
+            start: covered.end + 1,
+            end: range.end,
+        });
+    }
+    ranges
+}
+
+fn sort_hunks(diff: &mut FileDiff) {
+    diff.hunks.sort_by_key(hunk_sort_key);
+}
+
+fn hunk_sort_key(hunk: &DiffHunk) -> (u32, u32) {
+    let range = hunk.new.or(hunk.old);
+    (
+        range.map_or(u32::MAX, |range| range.start),
+        range.map_or(u32::MAX, |range| range.end),
+    )
 }
 
 fn context_window(start_line: u32, end_line: u32, line_count: u32) -> LineRange {
