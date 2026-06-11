@@ -129,7 +129,7 @@ pub async fn run_realtime_watcher(
         let Some(event) = watch_rx.recv().await else {
             return Ok(());
         };
-        classify_watch_result(
+        let mut should_capture_snapshot = classify_watch_result(
             event,
             &events_path,
             &threads_path,
@@ -142,7 +142,7 @@ pub async fn run_realtime_watcher(
 
         time::sleep(Duration::from_millis(WATCH_DEBOUNCE_MS)).await;
         while let Ok(event) = watch_rx.try_recv() {
-            classify_watch_result(
+            should_capture_snapshot |= classify_watch_result(
                 event,
                 &events_path,
                 &threads_path,
@@ -153,11 +153,16 @@ pub async fn run_realtime_watcher(
                 &mut pending,
             );
         }
-        snapshot.capture_changes(&repo_root, &events_path, &mut pending);
-        if pending.diff_changed {
-            if let Err(error) = watch_repo_paths(&mut watcher, &repo_root, &mut watched_dirs) {
-                eprintln!("{WATCH_REFRESH_WARNING}: {error:#}");
+        if should_capture_snapshot {
+            snapshot.capture_changes(&repo_root, &events_path, &mut pending);
+            if pending.diff_changed {
+                if let Err(error) = watch_repo_paths(&mut watcher, &repo_root, &mut watched_dirs) {
+                    eprintln!("{WATCH_REFRESH_WARNING}: {error:#}");
+                }
             }
+        }
+        if !pending.review_changed && !pending.diff_changed {
+            continue;
         }
 
         publish_pending(&repo_root, &updates, pending).await?;
@@ -416,7 +421,7 @@ fn classify_watch_result(
     git_dir: &Path,
     gitignore: &Gitignore,
     pending: &mut PendingUpdate,
-) {
+) -> bool {
     match event {
         Ok(event) => classify_event(
             event,
@@ -428,7 +433,10 @@ fn classify_watch_result(
             gitignore,
             pending,
         ),
-        Err(error) => eprintln!("{WATCH_EVENT_WARNING}: {error:#}"),
+        Err(error) => {
+            eprintln!("{WATCH_EVENT_WARNING}: {error:#}");
+            false
+        }
     }
 }
 
@@ -441,10 +449,10 @@ fn classify_event(
     git_dir: &Path,
     gitignore: &Gitignore,
     pending: &mut PendingUpdate,
-) {
+) -> bool {
     if matches!(event.kind, EventKind::Access(_)) {
         debug!(kind = ?event.kind, "ignoring access watch event");
-        return;
+        return false;
     }
 
     let kind = event.kind.clone();
@@ -477,6 +485,7 @@ fn classify_event(
         }
         debug!(kind = ?kind, path = %path.display(), "classified watch path as possible diff change");
     }
+    true
 }
 
 fn build_gitignore(repo_root: &Path) -> Result<Gitignore, ignore::Error> {
@@ -506,6 +515,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use notify::event::{AccessKind, AccessMode};
 
     const TEST_FILE: &str = "src/cli.rs";
     const TEST_EVENTS: &str = ".peers/events.jsonl";
@@ -519,6 +529,34 @@ mod tests {
         updates.mark_local_review_changed();
 
         assert!(updates.should_suppress_watched_review_changed());
+    }
+
+    #[test]
+    fn access_watch_events_do_not_request_snapshot_refresh() {
+        let root = test_root("access_event");
+        let events_path = root.join(TEST_EVENTS);
+        let threads_path = root.join(".peers/threads");
+        let peers_dir = root.join(DOT_PEERS_DIR);
+        let git_dir = root.join(DOT_GIT_DIR);
+        let gitignore = build_gitignore(&root).unwrap();
+        let event = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+            .add_path(root.join("src"));
+        let mut pending = PendingUpdate::default();
+
+        let should_capture_snapshot = classify_watch_result(
+            Ok(event),
+            &events_path,
+            &threads_path,
+            &root,
+            &peers_dir,
+            &git_dir,
+            &gitignore,
+            &mut pending,
+        );
+
+        assert!(!should_capture_snapshot);
+        assert!(!pending.review_changed);
+        assert!(!pending.diff_changed);
     }
 
     #[tokio::test]
